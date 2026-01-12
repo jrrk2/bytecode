@@ -1,6 +1,8 @@
 #include "Vocaml4142_vm.h"
 #include "verilated.h"
 #include "verilated_vcd_c.h"
+typedef enum
+#include "state.h"
 
 #include <fstream>
 #include <iostream>
@@ -20,6 +22,28 @@ extern "C"
   void caml_bytecode(char *byte_name);
   char *opname(int ix);
   };
+
+const char *statenam(int state)
+{
+  switch(state)
+    {
+    case S_FETCH      : return "S_FETCH      ";
+    case S_DECIDE_IMM: return "S_DECIDE_IMM";
+    case S_FETCH_IMM : return "S_FETCH_IMM ";
+    case S_EXEC      : return "S_EXEC      ";
+
+    // heap write micro-ops
+    case S_HEAP_ALLOC_HDR: return "S_HEAP_ALLOC_HDR";
+    case S_HEAP_ALLOC_FIELDS: return "S_HEAP_ALLOC_FIELDS";
+    case S_CLOSURE_ALLOC_HDR: return "S_CLOSURE_ALLOC_HDR";
+    case S_CLOSURE_WRITE_CODE: return "S_CLOSURE_WRITE_CODE";
+    case S_CLOSURE_WRITE_ENV: return "S_CLOSURE_WRITE_ENV";
+    case S_CLOSURE_DONE: return "S_CLOSURE_DONE";			   
+    // trap / ccall
+    case S_TRAP_WAIT: return "S_TRAP_WAIT";
+    default: return "S_UNKNOWN";
+    }
+}
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
@@ -60,12 +84,13 @@ int main(int argc, char** argv) {
         top->eval();
 
         tfp->dump(cycles);
-        if (top->state_out == 0) oldpc = top->code_addr;
+        if (top->state_out == S_FETCH) oldpc = top->code_addr;
 
         // Trace like ocamlrun -dinstr
-        if (top->state_out == 5) printf(
-            "%08llx pc=%06d rom=%4x op=%s imm=%x nvars=%08x offset=%08x acc=%08x sp=%04x\n",
+        if (top->state_out == S_EXEC) printf(
+            "%08llx %s pc=%06d rom=%4x op=%s imm=%x nvars=%08x offset=%08x acc=%08x sp=%04x\n",
             cycles,
+	    statenam(top->state_out), 
             oldpc,
 	    code_rom[oldpc],
             opname(code_rom[oldpc] & 0xFF),
@@ -75,7 +100,7 @@ int main(int argc, char** argv) {
             top->accu,
             top->sp
         );
-	else if (1) printf("%08llx state=%x pc=%06d\n", cycles, top->state_out, top->code_addr);
+	else if (1) printf("%08llx %s pc=%06d\n", cycles, statenam(top->state_out), top->code_addr);
 
         top->clk = 1;
         top->eval();

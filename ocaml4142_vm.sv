@@ -25,6 +25,9 @@ module ocaml4142_vm #(
   output logic [31:0]	      imm,
   output logic [31:0]	      nvars,
   output logic [31:0]	      offset,
+  output logic [31:0]	      closure_codeptr,
+  output logic [7:0]	      closure_nvars,
+  output logic [7:0]	      closure_i,
   output logic		      halted
 );
 
@@ -112,19 +115,8 @@ module ocaml4142_vm #(
   // ----------------------------
   // FSM
   // ----------------------------
-  typedef enum logic [3:0] {
-    S_FETCH      = 4'd0,
-    S_DECIDE_IMM = 4'd1,
-    S_FETCH_IMM  = 4'd2,
-    S_EXEC       = 4'd5,
-
-    // heap write micro-ops
-    S_HEAP_ALLOC_HDR = 4'd6,
-    S_HEAP_ALLOC_FIELDS = 4'd7,
-
-    // trap / ccall
-    S_TRAP_WAIT  = 4'd8
-  } state_t;
+  typedef enum logic [3:0] 
+`include "state.h"
 
   state_t state;
   assign state_out = state;
@@ -181,6 +173,39 @@ module ocaml4142_vm #(
     else if (opcode == STOP && state == S_EXEC) halted <= 1'b1;
   end
 
+   task push_acc;
+      input [31:0] imm;
+      begin
+	 logic [31:0] old_sp;
+	 old_sp = sp;
+	 stack_mem[old_sp - 1] <= accu;               // push
+	 sp <= old_sp - 1;
+	 accu <= stack_mem[(old_sp - 1) + imm];       // read from *new* sp
+      end
+   endtask; // push_acc
+
+   task push_const;
+      input [31:0] imm;
+      begin
+	 logic [31:0] old_sp;
+	 old_sp = sp;
+	 sp <= old_sp - 1;
+	 stack_mem[old_sp - 1] <= Val_int($signed(imm));               // push
+	 accu <= stack_mem[(old_sp - 1) + $signed(imm)];       // read from *new* sp
+      end
+   endtask; // push_acc
+
+   task push_env;
+      input [31:0] imm;
+      begin
+	 logic [31:0] old_sp;
+	 old_sp = sp;
+	 sp <= old_sp - 1;
+	 stack_mem[old_sp - 1] <= accu;               // push
+	 accu <= heap_mem[Heap_index_of_ptr(env)+1 + $signed(imm)];
+      end
+   endtask; // push_acc
+   
   // ----------------------------
   // Main FSM
   // ----------------------------
@@ -297,25 +322,20 @@ module ocaml4142_vm #(
 
             // ---- PUSH / PUSHACC ----
             PUSH: begin
-              stack_mem[sp] <= accu;
               sp <= sp - 1;
+              stack_mem[sp - 1] <= accu;
             end
 
-            PUSHACC0: begin stack_mem[sp] <= accu; sp <= sp - 1; accu <= stack_mem[sp+0]; end
-            PUSHACC1: begin stack_mem[sp] <= accu; sp <= sp - 1; accu <= stack_mem[sp+1]; end
-            PUSHACC2: begin stack_mem[sp] <= accu; sp <= sp - 1; accu <= stack_mem[sp+2]; end
-            PUSHACC3: begin stack_mem[sp] <= accu; sp <= sp - 1; accu <= stack_mem[sp+3]; end
-            PUSHACC4: begin stack_mem[sp] <= accu; sp <= sp - 1; accu <= stack_mem[sp+4]; end
-            PUSHACC5: begin stack_mem[sp] <= accu; sp <= sp - 1; accu <= stack_mem[sp+5]; end
-            PUSHACC6: begin stack_mem[sp] <= accu; sp <= sp - 1; accu <= stack_mem[sp+6]; end
-            PUSHACC7: begin stack_mem[sp] <= accu; sp <= sp - 1; accu <= stack_mem[sp+7]; end
-
-            PUSHACC: begin
-              stack_mem[sp] <= accu;  // Push current accu
-              sp <= sp - 1;
-              accu <= stack_mem[sp + imm];  // Load from stack offset
-            end
-
+	    PUSHACC0: push_acc(0);
+	    PUSHACC1: push_acc(1);
+	    PUSHACC2: push_acc(2);
+	    PUSHACC3: push_acc(3);
+	    PUSHACC4: push_acc(4);
+	    PUSHACC5: push_acc(5);
+	    PUSHACC6: push_acc(6);
+	    PUSHACC7: push_acc(7);
+	    PUSHACC: push_acc(imm);
+	    
             POP: sp <= sp + imm;
 
             ASSIGN: begin
@@ -341,11 +361,11 @@ module ocaml4142_vm #(
               accu <= heap_mem[Heap_index_of_ptr(env) + 1 + imm];
             end
 
-            PUSHENVACC1: begin stack_mem[sp] <= accu; accu <= heap_mem[Heap_index_of_ptr(env)+1+1]; sp <= sp-1; end
-            PUSHENVACC2: begin stack_mem[sp] <= accu; accu <= heap_mem[Heap_index_of_ptr(env)+1+2]; sp <= sp-1; end
-            PUSHENVACC3: begin stack_mem[sp] <= accu; accu <= heap_mem[Heap_index_of_ptr(env)+1+3]; sp <= sp-1; end
-            PUSHENVACC4: begin stack_mem[sp] <= accu; accu <= heap_mem[Heap_index_of_ptr(env)+1+4]; sp <= sp-1; end
-            PUSHENVACC:  begin stack_mem[sp] <= accu; accu <= heap_mem[Heap_index_of_ptr(env)+1+imm]; sp <= sp-1; end
+            PUSHENVACC1: push_env(1);
+            PUSHENVACC2: push_env(2);
+            PUSHENVACC3: push_env(3);
+            PUSHENVACC4: push_env(4);
+            PUSHENVACC: push_env(imm);
 
             // ---- Constants ----
             CONST0: accu <= Val_int(0);
@@ -355,11 +375,11 @@ module ocaml4142_vm #(
 
             CONSTINT: accu <= Val_int($signed(imm)); // sign extend imm as small int
 
-            PUSHCONST0: begin stack_mem[sp] <= Val_int(0); sp <= sp-1; accu <= Val_int(0); end
-            PUSHCONST1: begin stack_mem[sp] <= Val_int(1); sp <= sp-1; accu <= Val_int(1); end
-            PUSHCONST2: begin stack_mem[sp] <= Val_int(2); sp <= sp-1; accu <= Val_int(2); end
-            PUSHCONST3: begin stack_mem[sp] <= Val_int(3); sp <= sp-1; accu <= Val_int(3); end
-            PUSHCONSTINT: begin stack_mem[sp] <= Val_int($signed(imm)); sp <= sp-1; accu <= Val_int($signed(imm)); end
+            PUSHCONST0: push_const(0);
+            PUSHCONST1: push_const(1);
+            PUSHCONST2: push_const(2);
+            PUSHCONST3: push_const(3);
+            PUSHCONSTINT: push_const(imm);
 
             // ---- Integer ops ----
             NEGINT:  accu <= Val_int(-Int_val(accu));
@@ -453,9 +473,11 @@ module ocaml4142_vm #(
             // ---- Globals ----
             GETGLOBAL: accu <= globals_mem[imm];
             PUSHGETGLOBAL: begin
-              stack_mem[sp] <= globals_mem[imm];
-              sp <= sp - 1;
-              accu <= globals_mem[imm];
+	       logic [31:0] old_sp;
+	       old_sp = sp;
+               sp <= sp - 1;
+               stack_mem[old_sp - 1] <= globals_mem[imm];
+               accu <= globals_mem[imm];
             end
             SETGLOBAL: globals_mem[imm] <= accu;
 
@@ -475,24 +497,18 @@ module ocaml4142_vm #(
             // ---- Closures ----
             // CLOSURE lbl, nfree:
             // listing provides a label, bytecode provides a relative offset; we treat imm as rel offset in bytes.
-            CLOSURE: begin
-              // allocate closure block with 2 fields: codeptr + env
-              alloc_wosize <= 2;
-              alloc_tag    <= TAG_CLOSURE;
-              alloc_fields_left <= 2;
-              // result pointer becomes accu later
-              // store intended fields: field0=pc+offset, field1=env
-              // We'll perform in S_HEAP_ALLOC_* using a small protocol.
-              alloc_result_ptr <= Ptr_of_heap_index(hp);
-              state <= S_HEAP_ALLOC_HDR;
+	    CLOSURE: begin
+	      closure_nvars   <= nvars;
+	      closure_codeptr <= pc + $signed(offset);
 
-              // stash "pending fields" via regs:
-              // field0: code pointer (absolute byte address)
-              // NOTE: pc currently points AFTER immediates; for CLOSURE, offset already fetched and pc advanced.
-              // In OCaml it uses PC-relative; this is close enough for bring-up if you use same encoding.
-              // Cast to signed for arithmetic, then back to unsigned
-              pending_field <= Val_int($signed(pc) + $signed(offset)); // Signed arithmetic
-            end
+	      alloc_wosize <= 1 + nvars;
+	      alloc_tag    <= TAG_CLOSURE;
+
+	      alloc_result_ptr <= Ptr_of_heap_index(hp);
+
+	      closure_i <= 0;
+	      state <= S_CLOSURE_ALLOC_HDR;
+	    end
 
             // CLOSUREREC nvars, offset
             // Creates nvars mutually recursive closures
@@ -528,16 +544,20 @@ module ocaml4142_vm #(
             
             // PUSHOFFSETCLOSURE0: push accu, then load env to accu
             PUSHOFFSETCLOSURE0: begin
-              stack_mem[sp] <= accu;
-              sp <= sp - 1;
-              accu <= env;
+	       logic [31:0] old_sp;
+	       old_sp = sp;
+               sp <= sp - 1;
+               stack_mem[old_sp - 1] <= accu;
+               accu <= env;
             end
 
             // ---- Calls ----
             // PUSH_RETADDR: push current pc as return addr
             PUSH_RETADDR: begin
-              stack_mem[sp] <= Val_int(pc); // store as int for now
-              sp <= sp - 1;
+	       logic [31:0] old_sp;
+	       old_sp = sp;
+               sp <= sp - 1;
+               stack_mem[old_sp - 1] <= Val_int(pc); // store as int for now
             end
 
             APPLY: begin
@@ -556,18 +576,27 @@ module ocaml4142_vm #(
               extra_args <= imm - 1;
             end
 
-            APPLY1: begin
-              // like APPLY 1 without immediate
-              // Push return pc, env, extra_args to distinct stack locations
-              stack_mem[sp]   <= Val_int(pc);
-              stack_mem[sp-1] <= env;
-              stack_mem[sp-2] <= Val_int(extra_args);
-              sp <= sp - 3;
-              // Load closure: heap layout is [header][code_ptr][env_ptr]
-              env <= heap_mem[Heap_index_of_ptr(accu) + 2];  // field1
-              pc  <= Int_val(heap_mem[Heap_index_of_ptr(accu) + 1]); // field0
-              extra_args <= 8'd0;
-            end
+	    APPLY1: begin
+	      logic [31:0] base;
+	      logic [31:0] arg1;
+
+	      // 1) Save argument
+	      arg1 = stack_mem[sp];
+
+	      // 2) Build new frame (after sp -= 3)
+	      stack_mem[sp-3] <= arg1;               // sp[0]
+	      stack_mem[sp-2] <= Val_int(pc);        // sp[1] return pc
+	      stack_mem[sp-1] <= env;                // sp[2] old env (closure)
+	      stack_mem[sp-0] <= Val_int(extra_args);// sp[3]
+
+	      sp <= sp - 3;
+
+	      // 3) Jump to closure
+	      base = Heap_index_of_ptr(accu);
+	      pc  <= Int_val(heap_mem[base + 1]);    // Field(accu,0)
+	      env <= accu;                           // NOT heap_mem[base+2]
+	      extra_args <= 0;
+	    end
 
             APPLY2: begin
               stack_mem[sp]   <= Val_int(pc);
@@ -740,6 +769,34 @@ module ocaml4142_vm #(
           end
         end
 
+	S_CLOSURE_ALLOC_HDR: begin
+	   heap_mem[hp] <= Make_header(1 + closure_nvars, TAG_CLOSURE);
+	   hp <= hp + 1;
+	   state <= S_CLOSURE_WRITE_CODE;
+	end
+
+	S_CLOSURE_WRITE_CODE: begin
+	   heap_mem[hp] <= Val_int(closure_codeptr);
+	   hp <= hp + 1;
+	   closure_i <= 0;
+	   state <= (closure_nvars == 0) ? S_CLOSURE_DONE
+                    : S_CLOSURE_WRITE_ENV;
+	end
+
+	S_CLOSURE_WRITE_ENV: begin
+	   heap_mem[hp] <= stack_mem[sp + closure_i];
+	   hp <= hp + 1;
+	   closure_i <= closure_i + 1;
+	   
+	   if (closure_i + 1 == closure_nvars)
+	     state <= S_CLOSURE_DONE;
+	end
+
+	S_CLOSURE_DONE: begin
+	   accu <= alloc_result_ptr;
+	   state <= S_FETCH;
+	end
+	
         // ----------------------------
         // Trap wait: handshake to external
         // ----------------------------
