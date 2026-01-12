@@ -81,12 +81,20 @@ module ocaml4142_vm #(
   logic [VALUEW-1:0] heap_mem [0:(1<<HEAP_AW)-1];
   logic [HEAP_AW-1:0] hp;         // next free heap word
 
+  function automatic logic [VALUEW-1:0] Make_codeptr(input logic [PCW-1:0] pc);
+     Make_codeptr = {pc, 2'b00}; // or whatever alignment you use
+  endfunction // Make_codeptr
+   
   function automatic logic [VALUEW-1:0] Ptr_of_heap_index(input logic [HEAP_AW-1:0] idx);
     Ptr_of_heap_index = { {(VALUEW-1-HEAP_AW){1'b0}}, idx, 2'b00 };
   endfunction
 
   function automatic logic [HEAP_AW-1:0] Heap_index_of_ptr(input logic [VALUEW-1:0] ptr);
     Heap_index_of_ptr = ptr[HEAP_AW:2];
+  endfunction
+
+  function automatic logic [PCW-1:0] Codeptr_val(input logic [VALUEW-1:0] ptr);
+    Codeptr_val = ptr[PCW+1:2];
   endfunction
 
   // Header pack: [31:16]=wosize, [7:0]=tag (simple)
@@ -184,7 +192,7 @@ module ocaml4142_vm #(
 	 sp <= old_sp - 1;
 	 accu <= stack_mem[(old_sp - 1) + imm];       // read from *new* sp
       end
-   endtask; // push_acc
+   endtask;
 
    task push_const;
       input [31:0] imm;
@@ -193,9 +201,9 @@ module ocaml4142_vm #(
 	 old_sp = sp;
 	 sp <= old_sp - 1;
 	 stack_mem[old_sp - 1] <= Val_int($signed(imm));               // push
-	 accu <= stack_mem[(old_sp - 1) + $signed(imm)];       // read from *new* sp
+         accu <= Val_int($signed(imm));                    // Load same constant to accu
       end
-   endtask; // push_acc
+   endtask;
 
    task push_env;
       input [31:0] imm;
@@ -206,7 +214,7 @@ module ocaml4142_vm #(
 	 stack_mem[old_sp - 1] <= accu;               // push
 	 accu <= heap_mem[Heap_index_of_ptr(env)+1 + $signed(imm)];
       end
-   endtask; // push_acc
+   endtask;
    
   // ----------------------------
   // Main FSM
@@ -250,6 +258,10 @@ module ocaml4142_vm #(
 	  $display("  stack[sp+2]=%08x", stack_mem[sp+2]);
 	  $display("  stack[sp+3]=%08x", stack_mem[sp+3]);
 	  $display("  stack[sp+4]=%08x", stack_mem[sp+4]);
+	  $display("  heap[hp-1]=%08x", heap_mem[hp-1]);
+	  $display("  heap[hp-2]=%08x", heap_mem[hp-2]);
+	  $display("  heap[hp-3]=%08x", heap_mem[hp-3]);
+	  $display("  heap[hp-4]=%08x", heap_mem[hp-4]);
 	   
         end
 
@@ -510,7 +522,7 @@ module ocaml4142_vm #(
 	      closure_nvars   <= nvars;
 	      closure_codeptr <= $signed(pc) + $signed(offset) - 1;  // Fix: subtract 1
 
-	      alloc_wosize <= 1 + nvars;
+	      alloc_wosize <= 2 + nvars;
 	      alloc_tag    <= TAG_CLOSURE;
 
 	      alloc_result_ptr <= Ptr_of_heap_index(hp);
@@ -570,18 +582,12 @@ module ocaml4142_vm #(
             end
 
             APPLY: begin
-              // nargs = imm
-              // calling convention: accu is closure
-              // push return pc, env, extra_args
-              stack_mem[sp]   <= Val_int(pc);
-              stack_mem[sp-1] <= env;
-              stack_mem[sp-2] <= Val_int(extra_args);
-              sp <= sp - 3;
-
-              // set up callee
-              // closure fields: [0]=code(int), [1]=env(value)
-              env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Int_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+              // APPLY just jumps to the closure with nargs already on stack
+              // No stack frame is saved!
+              
+              // Set up callee
+              env <= accu;  // Field(accu, 1)
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);  // Field(accu, 0)
               extra_args <= imm - 1;
             end
 
@@ -594,7 +600,7 @@ module ocaml4142_vm #(
 
 	      // 2) Build new frame (after sp -= 3)
 	      stack_mem[sp-3] <= arg1;               // sp[0]
-	      stack_mem[sp-2] <= Val_int(pc);        // sp[1] return pc
+	      stack_mem[sp-2] <= Make_codeptr(pc);   // sp[1] return pc
 	      stack_mem[sp-1] <= env;                // sp[2] old env (closure)
 	      stack_mem[sp-0] <= Val_int(extra_args);// sp[3]
 
@@ -602,7 +608,7 @@ module ocaml4142_vm #(
 
 	      // 3) Jump to closure
 	      base = Heap_index_of_ptr(accu);
-	      pc  <= Int_val(heap_mem[base + 1]);    // Field(accu,0)
+	      pc  <= Codeptr_val(accu);
 	      env <= accu;                           // NOT heap_mem[base+2]
 	      extra_args <= 0;
 	    end
@@ -613,7 +619,7 @@ module ocaml4142_vm #(
               stack_mem[sp-2] <= Val_int(extra_args);
               sp <= sp - 3;
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Int_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               extra_args <= 8'd1;
             end
 
@@ -623,7 +629,7 @@ module ocaml4142_vm #(
               stack_mem[sp-2] <= Val_int(extra_args);
               sp <= sp - 3;
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Int_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               extra_args <= 8'd2;
             end
 
@@ -633,24 +639,24 @@ module ocaml4142_vm #(
               sp <= sp + imm_b;
 
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Int_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               extra_args <= imm - 1;
             end
 
             APPTERM1: begin
               // framesize is encoded in opcode variant? In OCaml, APPTERM1 n? is specialized; simplify:
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Int_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               extra_args <= 8'd0;
             end
             APPTERM2: begin
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Int_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               extra_args <= 8'd1;
             end
             APPTERM3: begin
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Int_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               extra_args <= 8'd2;
             end
 
@@ -660,13 +666,13 @@ module ocaml4142_vm #(
                 extra_args <= extra_args - 1;
                 // For partial application, reload closure from accu
                 env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-                pc  <= Int_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+                pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               end else begin
                 // pop n locals, then restore extra_args, env, pc from stack
                 // Stack layout after pop: [...][extra_args at sp+imm+1][env at sp+imm+2][pc at sp+imm+3]
                 extra_args <= stack_mem[sp + imm + 1][7:0];
                 env        <= stack_mem[sp + imm + 2];
-                pc         <= Int_val(stack_mem[sp + imm + 3]);
+                pc         <= Codeptr_val(stack_mem[sp + imm + 3]);
                 sp         <= sp + imm + 3;
               end
             end
@@ -779,7 +785,7 @@ module ocaml4142_vm #(
         end
 
 	S_CLOSURE_ALLOC_HDR: begin
-	   heap_mem[hp] <= Make_header(1 + closure_nvars, TAG_CLOSURE);
+	   heap_mem[hp] <= Make_header(2 + closure_nvars, TAG_CLOSURE);
 	   hp <= hp + 1;
 	   state <= S_CLOSURE_WRITE_CODE;
 	end
@@ -787,7 +793,13 @@ module ocaml4142_vm #(
 	S_CLOSURE_WRITE_CODE: begin
 	   $display("CLOSURE: creating closure at heap[%0d] with code=%0d", 
 		    hp, closure_codeptr);
-	   heap_mem[hp] <= Val_int(closure_codeptr);
+	   heap_mem[hp] <= Make_codeptr(closure_codeptr);
+	   hp <= hp + 1;
+	   state <= S_CLOSURE_WRITE_CLOSINFO;
+	end
+
+	S_CLOSURE_WRITE_CLOSINFO: begin
+	   heap_mem[hp] <= 32'd0;
 	   hp <= hp + 1;
 	   closure_i <= 0;
 	   state <= (closure_nvars == 0) ? S_CLOSURE_DONE
@@ -827,6 +839,10 @@ module ocaml4142_vm #(
 	     $display("  stack[sp+2]=%08x", stack_mem[sp+2]);
 	     $display("  stack[sp+3]=%08x", stack_mem[sp+3]);
 	     $display("  stack[sp+4]=%08x", stack_mem[sp+4]);
+	     $display("  heap[hp-1]=%08x", heap_mem[hp-1]);
+	     $display("  heap[hp-2]=%08x", heap_mem[hp-2]);
+	     $display("  heap[hp-3]=%08x", heap_mem[hp-3]);
+	     $display("  heap[hp-4]=%08x", heap_mem[hp-4]);
 	     state <= S_FETCH;
 	  end
 	
