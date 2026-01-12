@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
             top->accu,
             top->sp
         );
-	else if (0) printf("%08llx state=%x pc=%06d\n", cycles, top->state_out, top->code_addr);
+	else if (1) printf("%08llx state=%x pc=%06d\n", cycles, top->state_out, top->code_addr);
 
         top->clk = 1;
         top->eval();
