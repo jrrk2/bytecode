@@ -22,7 +22,9 @@ module ocaml4142_vm #(
   output logic [VALUEW-1:0]   accu,
   output logic [STACK_AW-1:0] sp, // points to next free BELOW top (downward)
   output logic [3:0]	      state_out,
-  output logic [23:0]	      imm,
+  output logic [31:0]	      imm,
+  output logic [31:0]	      nvars,
+  output logic [31:0]	      offset,
   output logic		      halted
 );
 
@@ -189,6 +191,8 @@ module ocaml4142_vm #(
       opcode     <= STOP;
       imm        <= '0;
       imm_b      <= '0;
+      nvars      <= '0;
+      offset     <= '0;
 
       accu       <= VAL_UNIT;
       env        <= '0;
@@ -208,7 +212,9 @@ module ocaml4142_vm #(
         // ----------------------------
         S_FETCH: begin
           opcode <= opcode_t'(code_rdata[7:0]);
-          imm <= code_rdata[31:8];
+          imm <= '0;
+          nvars <= '0;
+          offset <= '0;
           pc     <= pc + 1;
           state  <= S_DECIDE_IMM;
         end
@@ -218,6 +224,10 @@ module ocaml4142_vm #(
         // ----------------------------
         S_DECIDE_IMM: begin
 	   if (needs_imm(opcode)) begin
+	     if (opcode == CLOSURE) begin
+		nvars   <= code_rdata;
+		pc <= pc + 1;
+	     end
             state <= S_FETCH_IMM;
           end else begin
             state <= S_EXEC;
@@ -234,7 +244,8 @@ module ocaml4142_vm #(
             state <= S_EXEC;
           end else if (opcode == CLOSURE) begin
             // first imm
-	    pc <= pc + 2;
+	    offset <= code_rdata;
+	    pc <= pc + 1;
             state <= S_EXEC;
           end else if (opcode == MAKEBLOCK) begin
             // first imm

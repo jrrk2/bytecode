@@ -1,0 +1,11 @@
+a.out
+*.info
+*.cmi
+*.cmo
+*.dinstr
+*~
+*.trace
+obj_dir/
+ocaml-4.14.2/
+*.o
+*.vcd

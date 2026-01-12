@@ -64,12 +64,14 @@ int main(int argc, char** argv) {
 
         // Trace like ocamlrun -dinstr
         if (top->state_out == 5) printf(
-            "%08llx pc=%06d rom=%4x op=%s imm=%x acc=%08x sp=%04x\n",
+            "%08llx pc=%06d rom=%4x op=%s imm=%x nvars=%08x offset=%08x acc=%08x sp=%04x\n",
             cycles,
             oldpc,
 	    code_rom[oldpc],
             opname(code_rom[oldpc] & 0xFF),
 	    top->imm,
+	    top->nvars,
+	    top->offset,
             top->accu,
             top->sp
         );
