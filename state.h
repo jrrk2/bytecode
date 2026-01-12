@@ -12,5 +12,6 @@
     S_CLOSURE_WRITE_ENV,
     S_CLOSURE_DONE,			   
     // trap / ccall
-    S_TRAP_WAIT
+    S_TRAP_WAIT,
+    S_DONE
   } state_t;

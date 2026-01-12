@@ -28,6 +28,7 @@ module ocaml4142_vm #(
   output logic [31:0]	      closure_codeptr,
   output logic [7:0]	      closure_nvars,
   output logic [7:0]	      closure_i,
+  output logic [31:0]	      tos,
   output logic		      halted
 );
 
@@ -81,11 +82,11 @@ module ocaml4142_vm #(
   logic [HEAP_AW-1:0] hp;         // next free heap word
 
   function automatic logic [VALUEW-1:0] Ptr_of_heap_index(input logic [HEAP_AW-1:0] idx);
-    Ptr_of_heap_index = { {(VALUEW-1-HEAP_AW){1'b0}}, idx, 1'b0 };
+    Ptr_of_heap_index = { {(VALUEW-1-HEAP_AW){1'b0}}, idx, 2'b00 };
   endfunction
 
   function automatic logic [HEAP_AW-1:0] Heap_index_of_ptr(input logic [VALUEW-1:0] ptr);
-    Heap_index_of_ptr = ptr[HEAP_AW:1];
+    Heap_index_of_ptr = ptr[HEAP_AW:2];
   endfunction
 
   // Header pack: [31:16]=wosize, [7:0]=tag (simple)
@@ -120,7 +121,7 @@ module ocaml4142_vm #(
 
   state_t state;
   assign state_out = state;
-  
+  assign tos = stack_mem[sp];
   // For heap allocation micro-ops
   int alloc_wosize;
   int alloc_tag;
@@ -178,6 +179,7 @@ module ocaml4142_vm #(
       begin
 	 logic [31:0] old_sp;
 	 old_sp = sp;
+	 $display("PUSHACC4: sp=%04x", sp);
 	 stack_mem[old_sp - 1] <= accu;               // push
 	 sp <= old_sp - 1;
 	 accu <= stack_mem[(old_sp - 1) + imm];       // read from *new* sp
@@ -242,6 +244,13 @@ module ocaml4142_vm #(
           offset <= '0;
           pc     <= pc + 1;
           state  <= S_DECIDE_IMM;
+	  $display("  after fetch, acc=%08x", accu);
+	  $display("  stack[sp+0]=%08x", stack_mem[sp+0]);
+	  $display("  stack[sp+1]=%08x", stack_mem[sp+1]);
+	  $display("  stack[sp+2]=%08x", stack_mem[sp+2]);
+	  $display("  stack[sp+3]=%08x", stack_mem[sp+3]);
+	  $display("  stack[sp+4]=%08x", stack_mem[sp+4]);
+	   
         end
 
         // ----------------------------
@@ -304,7 +313,7 @@ module ocaml4142_vm #(
         S_EXEC: begin
           // Default: return to FETCH after this instruction
           // Opcodes that need multi-cycle operations will override this
-          state <= S_FETCH;
+          state <= S_DONE;
           
           unique case (opcode)
 
@@ -383,26 +392,26 @@ module ocaml4142_vm #(
 
             // ---- Integer ops ----
             NEGINT:  accu <= Val_int(-Int_val(accu));
-            ADDINT:  accu <= Val_int(Int_val(stack_mem[sp+0]) + Int_val(accu)); // expects arg on stack
-            SUBINT:  accu <= Val_int(Int_val(stack_mem[sp+0]) - Int_val(accu));
-            MULINT:  accu <= Val_int(Int_val(stack_mem[sp+0]) * Int_val(accu));
-            DIVINT:  accu <= Val_int(Int_val(stack_mem[sp+0]) / Int_val(accu));
-            MODINT:  accu <= Val_int(Int_val(stack_mem[sp+0]) % Int_val(accu));
-            ANDINT:  accu <= Val_int(Int_val(stack_mem[sp+0]) & Int_val(accu));
-            ORINT:   accu <= Val_int(Int_val(stack_mem[sp+0]) | Int_val(accu));
-            XORINT:  accu <= Val_int(Int_val(stack_mem[sp+0]) ^ Int_val(accu));
-            LSLINT:  accu <= Val_int(Int_val(stack_mem[sp+0]) <<< Int_val(accu));
-            LSRINT:  accu <= Val_int((Int_val(stack_mem[sp+0]) >>> 0) >> Int_val(accu));
-            ASRINT:  accu <= Val_int(Int_val(stack_mem[sp+0]) >>> Int_val(accu));
+            ADDINT:  accu <= Val_int(Int_val(tos) + Int_val(accu)); // expects arg on stack
+            SUBINT:  accu <= Val_int(Int_val(tos) - Int_val(accu));
+            MULINT:  accu <= Val_int(Int_val(tos) * Int_val(accu));
+            DIVINT:  accu <= Val_int(Int_val(tos) / Int_val(accu));
+            MODINT:  accu <= Val_int(Int_val(tos) % Int_val(accu));
+            ANDINT:  accu <= Val_int(Int_val(tos) & Int_val(accu));
+            ORINT:   accu <= Val_int(Int_val(tos) | Int_val(accu));
+            XORINT:  accu <= Val_int(Int_val(tos) ^ Int_val(accu));
+            LSLINT:  accu <= Val_int(Int_val(tos) <<< Int_val(accu));
+            LSRINT:  accu <= Val_int((Int_val(tos) >>> 0) >> Int_val(accu));
+            ASRINT:  accu <= Val_int(Int_val(tos) >>> Int_val(accu));
 
             OFFSETINT: accu <= Val_int(Int_val(accu) + $signed(imm));
 
-            EQ:    accu <= (stack_mem[sp+0] == accu) ? VAL_TRUE : VAL_FALSE;
-            NEQ:   accu <= (stack_mem[sp+0] != accu) ? VAL_TRUE : VAL_FALSE;
-            LTINT: accu <= (Int_val(stack_mem[sp+0]) <  Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
-            LEINT: accu <= (Int_val(stack_mem[sp+0]) <= Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
-            GTINT: accu <= (Int_val(stack_mem[sp+0]) >  Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
-            GEINT: accu <= (Int_val(stack_mem[sp+0]) >= Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
+            EQ:    accu <= (tos == accu) ? VAL_TRUE : VAL_FALSE;
+            NEQ:   accu <= (tos != accu) ? VAL_TRUE : VAL_FALSE;
+            LTINT: accu <= (Int_val(tos) <  Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
+            LEINT: accu <= (Int_val(tos) <= Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
+            GTINT: accu <= (Int_val(tos) >  Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
+            GEINT: accu <= (Int_val(tos) >= Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
 
             BOOLNOT: accu <= (accu == VAL_FALSE) ? VAL_TRUE : VAL_FALSE;
 
@@ -420,7 +429,7 @@ module ocaml4142_vm #(
             end
             
             // Integer comparison branches
-            // These compare accu with stack[sp+0] and branch on condition
+            // These compare accu with tos and branch on condition
             // Format: BEQ offset, const - branches if accu == const
             BEQ: begin
               if (Int_val(accu) == $signed(imm)) begin
@@ -488,18 +497,18 @@ module ocaml4142_vm #(
             GETFIELD3: accu <= heap_mem[Heap_index_of_ptr(accu) + 1 + 3];
             GETFIELD:  accu <= heap_mem[Heap_index_of_ptr(accu) + 1 + imm];
 
-            SETFIELD0: heap_mem[Heap_index_of_ptr(accu) + 1 + 0] <= stack_mem[sp+0];
-            SETFIELD1: heap_mem[Heap_index_of_ptr(accu) + 1 + 1] <= stack_mem[sp+0];
-            SETFIELD2: heap_mem[Heap_index_of_ptr(accu) + 1 + 2] <= stack_mem[sp+0];
-            SETFIELD3: heap_mem[Heap_index_of_ptr(accu) + 1 + 3] <= stack_mem[sp+0];
-            SETFIELD:  heap_mem[Heap_index_of_ptr(accu) + 1 + imm] <= stack_mem[sp+0];
+            SETFIELD0: heap_mem[Heap_index_of_ptr(accu) + 1 + 0] <= tos;
+            SETFIELD1: heap_mem[Heap_index_of_ptr(accu) + 1 + 1] <= tos;
+            SETFIELD2: heap_mem[Heap_index_of_ptr(accu) + 1 + 2] <= tos;
+            SETFIELD3: heap_mem[Heap_index_of_ptr(accu) + 1 + 3] <= tos;
+            SETFIELD:  heap_mem[Heap_index_of_ptr(accu) + 1 + imm] <= tos;
 
             // ---- Closures ----
             // CLOSURE lbl, nfree:
             // listing provides a label, bytecode provides a relative offset; we treat imm as rel offset in bytes.
 	    CLOSURE: begin
 	      closure_nvars   <= nvars;
-	      closure_codeptr <= pc + $signed(offset);
+	      closure_codeptr <= $signed(pc) + $signed(offset) - 1;  // Fix: subtract 1
 
 	      alloc_wosize <= 1 + nvars;
 	      alloc_tag    <= TAG_CLOSURE;
@@ -523,8 +532,8 @@ module ocaml4142_vm #(
                 alloc_result_ptr <= Ptr_of_heap_index(hp);
                 state <= S_HEAP_ALLOC_HDR;
                 
-                // field0: code pointer (pc + offset)
-                pending_field <= Val_int(pc + $signed(offset));
+                // field0: code pointer (pc + offset - 1, like BRANCH and CLOSURE)
+                pending_field <= Val_int($signed(pc) + $signed(offset) - 1);
                 // field1 will be set to point to the closure itself in S_HEAP_ALLOC_FIELDS
               end else begin
                 // Multi-function recursion not yet implemented
@@ -581,7 +590,7 @@ module ocaml4142_vm #(
 	      logic [31:0] arg1;
 
 	      // 1) Save argument
-	      arg1 = stack_mem[sp];
+	      arg1 = tos;
 
 	      // 2) Build new frame (after sp -= 3)
 	      stack_mem[sp-3] <= arg1;               // sp[0]
@@ -765,7 +774,7 @@ module ocaml4142_vm #(
           end else begin
             // done
             accu <= Ptr_of_heap_index(alloc_base);
-            state <= S_FETCH;
+            state <= S_DONE;
           end
         end
 
@@ -776,6 +785,8 @@ module ocaml4142_vm #(
 	end
 
 	S_CLOSURE_WRITE_CODE: begin
+	   $display("CLOSURE: creating closure at heap[%0d] with code=%0d", 
+		    hp, closure_codeptr);
 	   heap_mem[hp] <= Val_int(closure_codeptr);
 	   hp <= hp + 1;
 	   closure_i <= 0;
@@ -794,7 +805,7 @@ module ocaml4142_vm #(
 
 	S_CLOSURE_DONE: begin
 	   accu <= alloc_result_ptr;
-	   state <= S_FETCH;
+	   state <= S_DONE;
 	end
 	
         // ----------------------------
@@ -804,12 +815,26 @@ module ocaml4142_vm #(
           // keep trap_valid asserted via comb in real design; simplified here:
           if (trap_ready) begin
             accu <= trap_result;
-            state <= S_FETCH;
+            state <= S_DONE;
           end
         end
 
-        default: state <= S_FETCH;
-
+	S_DONE:
+	  begin
+	     $display("  instruction done, acc=%08x", accu);
+	     $display("  stack[sp+0]=%08x", stack_mem[sp+0]);
+	     $display("  stack[sp+1]=%08x", stack_mem[sp+1]);
+	     $display("  stack[sp+2]=%08x", stack_mem[sp+2]);
+	     $display("  stack[sp+3]=%08x", stack_mem[sp+3]);
+	     $display("  stack[sp+4]=%08x", stack_mem[sp+4]);
+	     state <= S_FETCH;
+	  end
+	
+        default: 
+	  begin
+	     $display("Invalid state %d", state);
+	     $finish;
+	  end
       endcase
     end
   end

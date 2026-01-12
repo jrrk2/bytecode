@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
 
         // Trace like ocamlrun -dinstr
         if (top->state_out == S_EXEC) printf(
-            "%08llx %s pc=%06d rom=%4x op=%s imm=%x nvars=%08x offset=%08x acc=%08x sp=%04x\n",
+            "%08llx %s pc=%06d rom=%4x op=%s imm=%x nvars=%08x offset=%08x acc=%08x sp=%04x tos=%04x\n",
             cycles,
 	    statenam(top->state_out), 
             oldpc,
@@ -98,9 +98,10 @@ int main(int argc, char** argv) {
 	    top->nvars,
 	    top->offset,
             top->accu,
-            top->sp
+            top->sp,
+	    top->tos
         );
-	else if (1) printf("%08llx %s pc=%06d\n", cycles, statenam(top->state_out), top->code_addr);
+	else if (1) printf("%08llx %s pc=%06d, tos=%04x\n", cycles, statenam(top->state_out), top->code_addr, top->tos);
 
         top->clk = 1;
         top->eval();
