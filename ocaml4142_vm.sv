@@ -612,7 +612,7 @@ module ocaml4142_vm #(
 
 	      // 2) Build new frame (after sp -= 3)
 	      stack_mem[sp-3] <= arg1;               // sp[0]
-	      stack_mem[sp-2] <= Make_codeptr(pc + 1);   // sp[1] return pc (next instruction)
+	      stack_mem[sp-2] <= Make_codeptr(pc + 1);   // sp[1] return pc TEST
 	      stack_mem[sp-1] <= env;                // sp[2] old env (closure)
 	      stack_mem[sp-0] <= Val_int(extra_args);// sp[3]
 
@@ -626,7 +626,7 @@ module ocaml4142_vm #(
 	    end
 
             APPLY2: begin
-              stack_mem[sp]   <= Val_int(pc);
+              stack_mem[sp]   <= Make_codeptr(pc);
               stack_mem[sp-1] <= env;
               stack_mem[sp-2] <= Val_int(extra_args);
               sp <= sp - 3;
@@ -636,7 +636,7 @@ module ocaml4142_vm #(
             end
 
             APPLY3: begin
-              stack_mem[sp]   <= Val_int(pc);
+              stack_mem[sp]   <= Make_codeptr(pc);
               stack_mem[sp-1] <= env;
               stack_mem[sp-2] <= Val_int(extra_args);
               sp <= sp - 3;
