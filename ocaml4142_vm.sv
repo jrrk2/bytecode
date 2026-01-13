@@ -174,7 +174,7 @@ module ocaml4142_vm #(
 	 $display("PUSHACC %d: sp=%04x", imm, sp);
 	 stack_mem[old_sp - 1] <= accu;               // push
 	 sp <= old_sp - 1;
-	 if (imm > 0) accu <= stack_mem[(old_sp - 1) + imm];       // read from *new* sp
+	 if (imm > 0) accu <= stack_mem[(old_sp - 1) + imm];       // read from new_sp + imm
       end
    endtask;
 
@@ -555,6 +555,10 @@ module ocaml4142_vm #(
                 offset <= {{24{code_rdata[7]}}, code_rdata[7:0]};  // Sign-extend
                 pc <= pc + 1;  // Advance past offset byte
                 
+                // Push current accu onto stack (CLOSUREREC pushes)
+                stack_mem[sp] <= accu;
+                sp <= sp - 1;
+                
                 alloc_wosize <= 2;
                 alloc_tag    <= TAG_CLOSURE;
                 alloc_fields_left <= 2;
@@ -868,8 +872,9 @@ module ocaml4142_vm #(
 	end
 
 	S_CLOSUREREC_CALC: begin
-	   // Calculate code pointer now that we have offset
-	   pending_field <= Val_int($signed(pc) + $signed(offset) - 1);
+	   logic [PCW-1:0] tgt;
+	   tgt = $signed(pc) + $signed(offset);     // no "- 1"
+	   pending_field <= Make_codeptr(tgt);      // NOT Val_int(...)
 	   state <= S_HEAP_ALLOC_HDR;
 	end
 	
