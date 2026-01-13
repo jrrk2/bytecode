@@ -662,10 +662,10 @@ module ocaml4142_vm #(
                 pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               end else begin
                 // C code: sp += *pc; pc = sp[0]; env = sp[1]; extra_args = sp[2]; sp += 3;
-                // After popping imm locals, return frame is at sp+imm
-                pc         <= Codeptr_val(stack_mem[sp + imm]);
-                env        <= stack_mem[sp + imm + 1];
-                extra_args <= stack_mem[sp + imm + 2][7:0];
+                // After popping imm locals, return frame is at sp+imm+1 (not sp+imm)
+                pc         <= Codeptr_val(stack_mem[sp + imm + 1]);
+                env        <= stack_mem[sp + imm + 2];
+                extra_args <= stack_mem[sp + imm + 3][7:0];
                 sp         <= sp + imm + 3;
               end
             end
