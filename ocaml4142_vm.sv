@@ -9,7 +9,7 @@ module ocaml4142_vm #(
   input logic		      reset,
 
   // Bytecode ROM interface
-  output logic [PCW-1:0]      code_addr,
+  output logic [PCW-1:0]      pc;
   input logic [31:0]	      code_rdata,
 
   // (Optional) external "C_CALL"/primitive trap interface
@@ -117,7 +117,6 @@ module ocaml4142_vm #(
   // ----------------------------
   // VM registers
   // ----------------------------
-  logic [PCW-1:0]       pc;
   logic [VALUEW-1:0]    env;
   logic [7:0]           extra_args;
 
@@ -166,9 +165,6 @@ module ocaml4142_vm #(
 
   // Globals
   logic [VALUEW-1:0] globals_mem [0:(1<<GLOBALS_AW)-1];
-
-  // Code ROM address
-  assign code_addr = pc;
 
   // Trap interface defaults
   always_comb begin
@@ -275,6 +271,10 @@ module ocaml4142_vm #(
 	     if (opcode == CLOSURE) begin
 		nvars   <= code_rdata;
 		pc <= pc + 1;
+	     end else if (opcode == CLOSUREREC) begin
+		// CLOSUREREC has nfuncs and nvars
+		imm <= code_rdata;  // nfuncs
+		pc <= pc + 1;
 	     end else if (opcode == BEQ || opcode == BNEQ || 
 	                  opcode == BLTINT || opcode == BLEINT ||
 	                  opcode == BGTINT || opcode == BGEINT ||
@@ -294,8 +294,9 @@ module ocaml4142_vm #(
         // ----------------------------
         S_FETCH_IMM: begin
           if (opcode == CLOSUREREC) begin
-            // first imm
-	    pc <= pc + 2 + code_rdata;
+            // Read nvars (second immediate) and skip offset immediates
+            nvars <= code_rdata;
+	    pc <= pc + 1 + imm;  // Skip nvars byte + imm (nfuncs) offset bytes
             state <= S_EXEC;
           end else if (opcode == CLOSURE) begin
             // second imm (offset) - sign extend from byte
@@ -522,7 +523,7 @@ module ocaml4142_vm #(
             // listing provides a label, bytecode provides a relative offset; we treat imm as rel offset in bytes.
 	    CLOSURE: begin
 	      closure_nvars   <= nvars;
-	      closure_codeptr <= $signed(pc) + $signed(offset) - 1;  // Fix: subtract 1
+	      closure_codeptr <= $signed(pc) + $signed(offset) - 1;
 
 	      alloc_wosize <= 2 + nvars;
 	      alloc_tag    <= TAG_CLOSURE;
@@ -530,6 +531,13 @@ module ocaml4142_vm #(
 	      alloc_result_ptr <= Ptr_of_heap_index(hp);
 
 	      closure_i <= 0;
+	      
+	      // If nvars > 0, push accu to stack first (C code: if (nvars > 0) *--sp = accu;)
+	      if (nvars > 0) begin
+	        sp <= sp - 1;
+	        stack_mem[sp - 1] <= accu;
+	      end
+	      
 	      state <= S_CLOSURE_ALLOC_HDR;
 	    end
 
@@ -537,22 +545,24 @@ module ocaml4142_vm #(
             // Creates nvars mutually recursive closures
             // For factorial: CLOSUREREC 1, 0 creates single self-referential closure
             CLOSUREREC: begin
-              if (nvars == 1) begin
-                // Simple case: single recursive function
-                // Create one closure that points to itself as its environment
+              if (imm == 1 && nvars == 0) begin
+                // Simple case: single recursive function with no free variables (CLOSUREREC 1, 0)
+                // After reading nfuncs and nvars, pc points to offset[0]
+                // Read offset from current bytecode position
+                offset <= {{24{code_rdata[7]}}, code_rdata[7:0]};  // Sign-extend
+                pc <= pc + 1;  // Advance past offset
+                
                 alloc_wosize <= 2;
                 alloc_tag    <= TAG_CLOSURE;
                 alloc_fields_left <= 2;
                 alloc_result_ptr <= Ptr_of_heap_index(hp);
-                state <= S_HEAP_ALLOC_HDR;
                 
-                // field0: code pointer (pc + offset - 1, like BRANCH and CLOSURE)
-                pending_field <= Val_int($signed(pc) + $signed(offset) - 1);
-                // field1 will be set to point to the closure itself in S_HEAP_ALLOC_FIELDS
+                // Will calculate code pointer in next state
+                state <= S_CLOSUREREC_CALC;
               end else begin
-                // Multi-function recursion not yet implemented
+                // Multi-function or non-zero nvars not yet implemented
                 trap_valid <= 1'b1;
-                trap_prim  <= 8'hF0; // "multi-CLOSUREREC not implemented"
+                trap_prim  <= 8'hF0; // "complex CLOSUREREC not implemented"
                 state <= S_TRAP_WAIT;
               end
             end
@@ -602,16 +612,16 @@ module ocaml4142_vm #(
 
 	      // 2) Build new frame (after sp -= 3)
 	      stack_mem[sp-3] <= arg1;               // sp[0]
-	      stack_mem[sp-2] <= Make_codeptr(pc);   // sp[1] return pc
+	      stack_mem[sp-2] <= Make_codeptr(pc + 1);   // sp[1] return pc (next instruction)
 	      stack_mem[sp-1] <= env;                // sp[2] old env (closure)
 	      stack_mem[sp-0] <= Val_int(extra_args);// sp[3]
 
 	      sp <= sp - 3;
 
-	      // 3) Jump to closure
+	      // 3) Jump to closure - read code pointer from heap!
 	      base = Heap_index_of_ptr(accu);
-	      pc  <= Codeptr_val(accu);
-	      env <= accu;                           // NOT heap_mem[base+2]
+	      pc  <= Codeptr_val(heap_mem[base + 1]);  // Read from field 1
+	      env <= accu;
 	      extra_args <= 0;
 	    end
 
@@ -670,11 +680,11 @@ module ocaml4142_vm #(
                 env <= heap_mem[Heap_index_of_ptr(accu) + 2];
                 pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               end else begin
-                // pop n locals, then restore extra_args, env, pc from stack
-                // Stack layout after pop: [...][extra_args at sp+imm+1][env at sp+imm+2][pc at sp+imm+3]
-                extra_args <= stack_mem[sp + imm + 1][7:0];
-                env        <= stack_mem[sp + imm + 2];
-                pc         <= Codeptr_val(stack_mem[sp + imm + 3]);
+                // C code: sp += *pc; pc = sp[0]; env = sp[1]; extra_args = sp[2]; sp += 3;
+                // After popping imm locals, return frame is at sp+imm
+                pc         <= Codeptr_val(stack_mem[sp + imm]);
+                env        <= stack_mem[sp + imm + 1];
+                extra_args <= stack_mem[sp + imm + 2][7:0];
                 sp         <= sp + imm + 3;
               end
             end
@@ -819,7 +829,14 @@ module ocaml4142_vm #(
 
 	S_CLOSURE_DONE: begin
 	   accu <= alloc_result_ptr;
+	   sp <= sp + closure_nvars;  // Pop the captured variables (C code: sp += nvars;)
 	   state <= S_DONE;
+	end
+
+	S_CLOSUREREC_CALC: begin
+	   // Calculate code pointer now that we have offset
+	   pending_field <= Val_int($signed(pc) + $signed(offset) - 1);
+	   state <= S_HEAP_ALLOC_HDR;
 	end
 	
         // ----------------------------

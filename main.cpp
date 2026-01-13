@@ -39,6 +39,7 @@ const char *statenam(int state)
     case S_CLOSURE_WRITE_CODE: return "S_CLOSURE_WRITE_CODE";
     case S_CLOSURE_WRITE_ENV: return "S_CLOSURE_WRITE_ENV";
     case S_CLOSURE_DONE: return "S_CLOSURE_DONE";			   
+    case S_CLOSUREREC_CALC: return "S_CLOSUREREC_CALC";
     // trap / ccall
     case S_TRAP_WAIT: return "S_TRAP_WAIT";
     case S_DONE: return "S_DONE";
@@ -74,34 +75,31 @@ int main(int argc, char** argv) {
     top->reset = 0;
 
     uint64_t cycles = 0;
-    uint32_t oldpc = 0;
     
     while (!Verilated::gotFinish()) {
         // Provide instruction byte
-        top->code_rdata = code_rom[top->code_addr];
+        top->code_rdata = code_rom[top->pc];
 
         // Clock tick
         top->clk = 0;
         top->eval();
 
         tfp->dump(cycles);
-        if (top->state_out == S_FETCH) oldpc = top->code_addr;
-
         // Trace like ocamlrun -dinstr
         if (top->state_out == S_EXEC) printf(
             "%08llx %s pc=%06d rom=%4x op=%s imm=%x nvars=%08x offset=%08x acc=%08x sp=%04x\n",
             cycles,
 	    statenam(top->state_out), 
-            oldpc,
-	    code_rom[oldpc],
-            opname(code_rom[oldpc] & 0xFF),
+            top->pc,
+	    code_rom[top->pc],
+            opname(code_rom[top->pc] & 0xFF),
 	    top->imm,
 	    top->nvars,
 	    top->offset,
             top->accu,
             top->sp
         );
-	else if (1) printf("%08llx %s pc=%06d\n", cycles, statenam(top->state_out), top->code_addr);
+	else if (1) printf("%08llx %s pc=%06d\n", cycles, statenam(top->state_out), top->pc);
 
         top->clk = 1;
         top->eval();
