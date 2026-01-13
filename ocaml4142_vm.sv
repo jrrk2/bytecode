@@ -184,8 +184,8 @@ module ocaml4142_vm #(
 	 logic [31:0] old_sp;
 	 old_sp = sp;
 	 sp <= old_sp - 1;
-	 stack_mem[old_sp - 1] <= Val_int($signed(imm));               // push
-         accu <= Val_int($signed(imm));                    // Load same constant to accu
+	 stack_mem[old_sp - 1] <= accu;  // Push OLD accu value!
+         accu <= Val_int($signed(imm));  // Then set NEW constant
       end
    endtask;
 
@@ -199,6 +199,28 @@ module ocaml4142_vm #(
 	 accu <= heap_mem[Heap_index_of_ptr(env)+1 + $signed(imm)];
       end
    endtask;
+
+   task caml_ml_open_descriptor_in;
+      begin
+	 $display("caml_ml_open_descriptor_in");
+	 accu <= Val_int(0);  // Simple success value
+      end
+   endtask // caml_ml_open_descriptor_in
+
+   task caml_ml_open_descriptor_out;
+      begin
+	 $display("caml_ml_open_descriptor_out");
+	 accu <= Val_int(1);  // Simple success value
+      end
+   endtask // caml_ml_open_descriptor_out
+   
+   task caml_ml_output_char;
+      begin
+	 $display("caml_ml_output_char %c (%d)", Int_val(tos), Int_val(tos));
+	 accu <= Val_int(1);  // Simple success value
+      end
+   endtask // caml_ml_output_char
+   
    
   // ----------------------------
   // Main FSM
@@ -711,19 +733,50 @@ module ocaml4142_vm #(
             // ---- C calls / primitives ----
             // For now, C primitives just return dummy values
             // In a real implementation, these would call external C functions
-            C_CALL1: begin
+            C_CALL1:
+	      begin
+		 unique case (imm)
+		      16'h103: caml_ml_open_descriptor_in();
+		      16'h104: caml_ml_open_descriptor_out();
+		   default: $display("Unsupported C_CALL1: 0x%x", imm);
+		   endcase
               // Return a dummy file descriptor value (3 = stdout equivalent)
-              accu <= Val_int(1);  // Simple success value
-            end
+              end
             
-            C_CALL2, C_CALL3, C_CALL4, C_CALL5: begin
+            C_CALL2:
+	      begin
+		 unique case (imm)
+		      16'h108: caml_ml_output_char();
+		   default: $display("Unsupported C_CALL2: 0x%x", imm);
+		   endcase
+		 sp += 1;
+	      end
+            
+            C_CALL3:
+	      begin
               // Return unit value for other C calls
-              accu <= VAL_UNIT;
-            end
+		 accu <= VAL_UNIT;
+		 sp += 2;
+	      end
+            
+            C_CALL4:
+	      begin
+              // Return unit value for other C calls
+		 accu <= VAL_UNIT;
+		 sp += 3;
+	      end
+            
+            C_CALL5:
+	      begin
+              // Return unit value for other C calls
+		 accu <= VAL_UNIT;
+		 sp += 4;
+	      end
             
             C_CALLN: begin
               // Return unit value for CALLN
               accu <= VAL_UNIT;
+		 sp += imm;
             end
 
             STOP: begin
