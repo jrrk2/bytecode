@@ -28,6 +28,7 @@ module ocaml4142_vm #(
   output logic [31:0]	      closure_codeptr,
   output logic [7:0]	      closure_nvars,
   output logic [7:0]	      closure_i,
+  output logic [7:0]	      opcode_out,
   output logic [31:0]	      tos,
   output logic		      halted
 );
@@ -38,7 +39,8 @@ module ocaml4142_vm #(
 
   // For completeness here, assume it's already included externally.
   opcode_t opcode;
-
+  assign opcode_out = opcode;
+   
   // ----------------------------
   // Tagged integer conventions (OCaml style)
   // - integers are (n << 1) | 1
@@ -142,22 +144,6 @@ module ocaml4142_vm #(
   // We’ll pop fields from stack in order and write them.
   logic [VALUEW-1:0] pending_field;
 
-  function automatic bit needs_imm(opcode_t op);
-    unique case (op)
-      BRANCH, BRANCHIF, BRANCHIFNOT,
-      CLOSURE, CLOSUREREC,
-      APPLY, APPTERM, RETURN, GRAB, // in 4.14 listing appterm has 2 immediates; treat specially (imm8 + imm8/16) as needed
-      CONSTINT, PUSHCONSTINT, PUSHACC, OFFSETINT, 
-      C_CALL1, C_CALLN, PUSHTRAP, POPTRAP, SWITCH,
-      BEQ, BNEQ, BLTINT, BLEINT, BGTINT, BGEINT,
-      BULTINT, BUGEINT, POP, GETGLOBAL, PUSHGETGLOBAL, SETGLOBAL, 
-      MAKEBLOCK, MAKEBLOCK2, MAKEBLOCK3
-        : needs_imm = 1'b1;
-      default
-        : needs_imm = 1'b0;
-    endcase
-  endfunction
-
   // For APPTERM in OCaml: APPTERM n, framesize (both are immediates).
   // We'll treat framesize as imm8 for now (common in listings like "appterm 2, 4").
   // If you see larger frames, widen.
@@ -185,10 +171,10 @@ module ocaml4142_vm #(
       begin
 	 logic [31:0] old_sp;
 	 old_sp = sp;
-	 $display("PUSHACC4: sp=%04x", sp);
+	 $display("PUSHACC %d: sp=%04x", imm, sp);
 	 stack_mem[old_sp - 1] <= accu;               // push
 	 sp <= old_sp - 1;
-	 accu <= stack_mem[(old_sp - 1) + imm];       // read from *new* sp
+	 if (imm > 0) accu <= stack_mem[(old_sp - 1) + imm];       // read from *new* sp
       end
    endtask;
 
@@ -267,7 +253,7 @@ module ocaml4142_vm #(
         // Decide how many immediates
         // ----------------------------
         S_DECIDE_IMM: begin
-	   if (needs_imm(opcode)) begin
+	   if (opcode_has_imm8(opcode)) begin
 	     if (opcode == CLOSURE) begin
 		nvars   <= code_rdata;
 		pc <= pc + 1;
@@ -275,10 +261,7 @@ module ocaml4142_vm #(
 		// CLOSUREREC has nfuncs and nvars
 		imm <= code_rdata;  // nfuncs
 		pc <= pc + 1;
-	     end else if (opcode == BEQ || opcode == BNEQ || 
-	                  opcode == BLTINT || opcode == BLEINT ||
-	                  opcode == BGTINT || opcode == BGEINT ||
-	                  opcode == BULTINT || opcode == BUGEINT) begin
+	     end else if (opcode_has_imm8(opcode)) begin
 		// These branch instructions have two immediates: const and offset
 		imm <= code_rdata;  // First immediate is the constant
 		pc <= pc + 1;
@@ -612,7 +595,7 @@ module ocaml4142_vm #(
 
 	      // 2) Build new frame (after sp -= 3)
 	      stack_mem[sp-3] <= arg1;               // sp[0]
-	      stack_mem[sp-2] <= Make_codeptr(pc + 1);   // sp[1] return pc TEST
+	      stack_mem[sp-2] <= Make_codeptr(pc);   // sp[1] return pc TEST
 	      stack_mem[sp-1] <= env;                // sp[2] old env (closure)
 	      stack_mem[sp-0] <= Val_int(extra_args);// sp[3]
 

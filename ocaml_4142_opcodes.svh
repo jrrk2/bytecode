@@ -59,26 +59,18 @@ localparam int unsigned FIRST_UNIMPLEMENTED_OP = int'(GETSTRINGCHAR) + 1;
 
 function automatic bit opcode_has_imm8(opcode_t op);
   unique case (op)
-    // 1-byte immediates
-    ACC, PUSHACC, POP, ASSIGN,
-    ENVACC, PUSHENVACC,
-    PUSH_RETADDR,
-    APPLY, APPTERM, RETURN, GRAB,
-    OFFSETCLOSURE, PUSHOFFSETCLOSURE,
-    GETGLOBAL, PUSHGETGLOBAL, SETGLOBAL,
-    ATOM, PUSHATOM,
-    MAKEBLOCK, GETFIELD, SETFIELD,
-    VECTLENGTH, GETVECTITEM, SETVECTITEM,
-    GETBYTESCHAR, SETBYTESCHAR,
-    BRANCH, BRANCHIF, BRANCHIFNOT, BOOLNOT,
-    C_CALLN,
-    CONSTINT, PUSHCONSTINT,
-    OFFSETINT, OFFSETREF,
-    GETMETHOD,
-    BEQ, BNEQ, BLTINT, BLEINT, BGTINT, BGEINT,
-    BULTINT, BUGEINT,
-    GETPUBMET, GETDYNMET,
-    GETSTRINGCHAR
+    // 1-word immediates
+    PUSHACC, ACC, POP, ASSIGN,
+      PUSHENVACC, ENVACC, PUSH_RETADDR, APPLY,
+      APPTERM1, APPTERM2, APPTERM3, RETURN,
+      GRAB, PUSHGETGLOBAL, GETGLOBAL, SETGLOBAL,
+      PUSHATOM, ATOM, MAKEBLOCK1, MAKEBLOCK2,
+      MAKEBLOCK3, MAKEFLOATBLOCK, GETFIELD,
+      GETFLOATFIELD, SETFIELD, SETFLOATFIELD,
+      BRANCH, BRANCHIF, BRANCHIFNOT, PUSHTRAP,
+      C_CALL1, C_CALL2, C_CALL3, C_CALL4, C_CALL5,
+      CONSTINT, PUSHCONSTINT, OFFSETINT,
+      OFFSETREF, OFFSETCLOSURE, PUSHOFFSETCLOSURE
       : opcode_has_imm8 = 1'b1;
     default
       : opcode_has_imm8 = 1'b0;
@@ -87,9 +79,13 @@ endfunction
 
 function automatic bit opcode_has_imm16(opcode_t op);
   unique case (op)
-    // SWITCH uses 16-bit/word-sized tables in real OCaml; treat as special.
-    SWITCH: opcode_has_imm16 = 1'b1;
-    default: opcode_has_imm16 = 1'b0;
+    APPTERM, CLOSURE, PUSHGETGLOBALFIELD,
+      GETGLOBALFIELD, MAKEBLOCK, C_CALLN,
+      BEQ, BNEQ, BLTINT, BLEINT, BGTINT, BGEINT,
+      BULTINT, BUGEINT, GETPUBMET
+      : opcode_has_imm16 = 1'b0;
+    default
+      : opcode_has_imm16 = 1'b0;
   endcase
 endfunction
 
