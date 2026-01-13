@@ -297,9 +297,9 @@ module ocaml4142_vm #(
         // ----------------------------
         S_FETCH_IMM: begin
           if (opcode == CLOSUREREC) begin
-            // Read nvars (second immediate) and skip offset immediates
+            // Read nvars (second immediate)
             nvars <= code_rdata;
-	    pc <= pc + 1 + imm;  // Skip nvars byte + imm (nfuncs) offset bytes
+	    pc <= pc + 1;  // Advance to offset byte (don't skip it!)
             state <= S_EXEC;
           end else if (opcode == CLOSURE) begin
             // second imm (offset) - sign extend from byte
@@ -550,10 +550,10 @@ module ocaml4142_vm #(
             CLOSUREREC: begin
               if (imm == 1 && nvars == 0) begin
                 // Simple case: single recursive function with no free variables (CLOSUREREC 1, 0)
-                // After reading nfuncs and nvars, pc points to offset[0]
+                // S_FETCH_IMM left pc pointing at offset byte
                 // Read offset from current bytecode position
                 offset <= {{24{code_rdata[7]}}, code_rdata[7:0]};  // Sign-extend
-                pc <= pc + 1;  // Advance past offset
+                pc <= pc + 1;  // Advance past offset byte
                 
                 alloc_wosize <= 2;
                 alloc_tag    <= TAG_CLOSURE;
