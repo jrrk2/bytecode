@@ -86,11 +86,13 @@ module ocaml4142_vm #(
   endfunction // Make_codeptr
    
   function automatic logic [VALUEW-1:0] Ptr_of_heap_index(input logic [HEAP_AW-1:0] idx);
-    Ptr_of_heap_index = { {(VALUEW-1-HEAP_AW){1'b0}}, idx, 2'b00 };
+    // idx goes in bits [HEAP_AW+1:2], so padding is VALUEW-2-HEAP_AW bits
+    Ptr_of_heap_index = { {(VALUEW-2-HEAP_AW){1'b0}}, idx, 2'b00 };
   endfunction
 
   function automatic logic [HEAP_AW-1:0] Heap_index_of_ptr(input logic [VALUEW-1:0] ptr);
-    Heap_index_of_ptr = ptr[HEAP_AW:2];
+    // idx is in bits [HEAP_AW+1:2], extract all of it
+    Heap_index_of_ptr = ptr[HEAP_AW+1:2];
   endfunction
 
   function automatic logic [PCW-1:0] Codeptr_val(input logic [VALUEW-1:0] ptr);
