@@ -139,6 +139,7 @@ module ocaml4142_vm #(
   int alloc_fields_left;
   logic [HEAP_AW-1:0] alloc_base;        // heap index of header
   logic [VALUEW-1:0]  alloc_result_ptr;  // returned pointer
+  logic               closurerec_push;   // flag to push closure for CLOSUREREC
 
   // For MAKEBLOCK / CLOSURE etc: store pending field source list
   // We’ll pop fields from stack in order and write them.
@@ -238,6 +239,7 @@ module ocaml4142_vm #(
       accu       <= VAL_UNIT;
       env        <= '0;
       extra_args <= 8'd0;
+      closurerec_push <= 1'b0;
 
       // stack init: sp starts at top of RAM (downward growth)
       sp         <= (1<<STACK_AW) - 1;
@@ -555,9 +557,8 @@ module ocaml4142_vm #(
                 offset <= {{24{code_rdata[7]}}, code_rdata[7:0]};  // Sign-extend
                 pc <= pc + 1;  // Advance past offset byte
                 
-                // Push current accu onto stack (CLOSUREREC pushes)
-                stack_mem[sp] <= accu;
-                sp <= sp - 1;
+                // Set flag to push closure after allocation
+                closurerec_push <= 1'b1;
                 
                 alloc_wosize <= 2;
                 alloc_tag    <= TAG_CLOSURE;
@@ -633,9 +634,9 @@ module ocaml4142_vm #(
 	    end
 
             APPLY2: begin
-              stack_mem[sp]   <= Make_codeptr(pc);
-              stack_mem[sp-1] <= env;
-              stack_mem[sp-2] <= Val_int(extra_args);
+              stack_mem[sp-1]   <= Make_codeptr(pc);
+              stack_mem[sp-2] <= env;
+              stack_mem[sp-3] <= Val_int(extra_args);
               sp <= sp - 3;
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
               pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
@@ -643,9 +644,9 @@ module ocaml4142_vm #(
             end
 
             APPLY3: begin
-              stack_mem[sp]   <= Make_codeptr(pc);
-              stack_mem[sp-1] <= env;
-              stack_mem[sp-2] <= Val_int(extra_args);
+              stack_mem[sp-1]   <= Make_codeptr(pc);
+              stack_mem[sp-2] <= env;
+              stack_mem[sp-3] <= Val_int(extra_args);
               sp <= sp - 3;
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
               pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
@@ -717,8 +718,9 @@ module ocaml4142_vm #(
             // ---- Exceptions (minimal) ----
             PUSHTRAP: begin
               // push current trapsp + handler pc
-              stack_mem[sp] <= Val_int(trapsp); sp <= sp - 1;
-              stack_mem[sp] <= Val_int(pc + $signed(imm)); sp <= sp - 1;
+              stack_mem[sp-1] <= Val_int(trapsp);
+              stack_mem[sp-2] <= Val_int(pc + $signed(imm));
+	      sp <= sp - 2;
               trapsp <= sp; // new trapsp points at this frame (approx)
             end
 
@@ -830,6 +832,12 @@ module ocaml4142_vm #(
           end else begin
             // done
             accu <= Ptr_of_heap_index(alloc_base);
+            // For CLOSUREREC, push the newly created closure onto stack
+            if (closurerec_push) begin
+              stack_mem[sp - 1] <= Ptr_of_heap_index(alloc_base);
+              sp <= sp - 1;
+              closurerec_push <= 1'b0;
+            end
             state <= S_DONE;
           end
         end
