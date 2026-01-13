@@ -255,7 +255,7 @@ module ocaml4142_vm #(
         S_DECIDE_IMM: begin
 	   if (opcode_has_imm8(opcode)) begin
             state <= S_FETCH_IMM;
-	   end else if (opcode_has_imm16(opcode)) begin
+	   end else if (opcode_has_imm16(opcode) || opcode == CLOSUREREC) begin
               state <= S_FETCH_IMM;
 	      if (opcode == CLOSURE) begin
 		 nvars   <= code_rdata;
@@ -263,9 +263,6 @@ module ocaml4142_vm #(
 	      end else if (opcode == CLOSUREREC) begin
 		 // CLOSUREREC has nfuncs and nvars
 		 imm <= code_rdata;  // nfuncs
-		 pc <= pc + 1;
-		 // These branch instructions have two immediates: const and offset
-		 imm <= code_rdata;  // First immediate is the constant
 		 pc <= pc + 1;
 	      end
            end else begin
