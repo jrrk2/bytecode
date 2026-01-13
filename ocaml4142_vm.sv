@@ -9,7 +9,7 @@ module ocaml4142_vm #(
   input logic		      reset,
 
   // Bytecode ROM interface
-  output logic [PCW-1:0]      pc;
+  output logic [PCW-1:0]      pc,
   input logic [31:0]	      code_rdata,
 
   // (Optional) external "C_CALL"/primitive trap interface
