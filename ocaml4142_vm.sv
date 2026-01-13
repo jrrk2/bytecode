@@ -254,22 +254,23 @@ module ocaml4142_vm #(
         // ----------------------------
         S_DECIDE_IMM: begin
 	   if (opcode_has_imm8(opcode)) begin
-	     if (opcode == CLOSURE) begin
-		nvars   <= code_rdata;
-		pc <= pc + 1;
-	     end else if (opcode == CLOSUREREC) begin
-		// CLOSUREREC has nfuncs and nvars
-		imm <= code_rdata;  // nfuncs
-		pc <= pc + 1;
-	     end else if (opcode_has_imm8(opcode)) begin
-		// These branch instructions have two immediates: const and offset
-		imm <= code_rdata;  // First immediate is the constant
-		pc <= pc + 1;
-	     end
             state <= S_FETCH_IMM;
-          end else begin
-            state <= S_EXEC;
-          end
+	   end else if (opcode_has_imm16(opcode)) begin
+              state <= S_FETCH_IMM;
+	      if (opcode == CLOSURE) begin
+		 nvars   <= code_rdata;
+		 pc <= pc + 1;
+	      end else if (opcode == CLOSUREREC) begin
+		 // CLOSUREREC has nfuncs and nvars
+		 imm <= code_rdata;  // nfuncs
+		 pc <= pc + 1;
+		 // These branch instructions have two immediates: const and offset
+		 imm <= code_rdata;  // First immediate is the constant
+		 pc <= pc + 1;
+	      end
+           end else begin
+              state <= S_EXEC;
+           end
         end
 
         // ----------------------------
@@ -543,7 +544,7 @@ module ocaml4142_vm #(
                 // Will calculate code pointer in next state
                 state <= S_CLOSUREREC_CALC;
               end else begin
-                // Multi-function or non-zero nvars not yet implemented
+                $display("Multi-function or non-zero nvars not yet implemented");
                 trap_valid <= 1'b1;
                 trap_prim  <= 8'hF0; // "complex CLOSUREREC not implemented"
                 state <= S_TRAP_WAIT;
@@ -683,7 +684,7 @@ module ocaml4142_vm #(
               if (extra_args >= imm) begin
                 extra_args <= extra_args - imm;
               end else begin
-                // partial application: trap for now
+                $display("partial application: trap for now");
                 trap_valid <= 1'b1;
                 trap_prim  <= 8'hF1; // "partial apply not implemented"
                 state <= S_TRAP_WAIT;
@@ -733,7 +734,7 @@ module ocaml4142_vm #(
             end
 
             default: begin
-              // For “almost complete”, unhandled ops go to trap instead of silently wrong behavior.
+              $display("almost complete, unhandled ops go to trap instead of silently wrong behavior.");
               trap_valid <= 1'b1;
               trap_prim  <= 8'hFF; // illegal/unimplemented
               trap_arg0  <= Val_int(opcode);
@@ -826,6 +827,7 @@ module ocaml4142_vm #(
         // Trap wait: handshake to external
         // ----------------------------
         S_TRAP_WAIT: begin
+	   $finish;
           // keep trap_valid asserted via comb in real design; simplified here:
           if (trap_ready) begin
             accu <= trap_result;

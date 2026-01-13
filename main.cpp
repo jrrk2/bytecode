@@ -37,6 +37,7 @@ const char *statenam(int state)
     case S_HEAP_ALLOC_FIELDS: return "S_HEAP_ALLOC_FIELDS";
     case S_CLOSURE_ALLOC_HDR: return "S_CLOSURE_ALLOC_HDR";
     case S_CLOSURE_WRITE_CODE: return "S_CLOSURE_WRITE_CODE";
+    case S_CLOSURE_WRITE_CLOSINFO: return "S_CLOSURE_WRITE_CLOSINFO";
     case S_CLOSURE_WRITE_ENV: return "S_CLOSURE_WRITE_ENV";
     case S_CLOSURE_DONE: return "S_CLOSURE_DONE";			   
     case S_CLOSUREREC_CALC: return "S_CLOSUREREC_CALC";
@@ -47,18 +48,23 @@ const char *statenam(int state)
     }
 }
 
+typedef char linbuf[256];
+
+linbuf trace[30];
+
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
-    if (argc < 2) {
-        std::cerr << "usage: " << argv[0] << " program.bc\n";
+    if (argc < 3) {
+        std::cerr << "usage: " << argv[0] << " program.bc trace_file\n";
         return 1;
     }
 
     caml_bytecode(argv[1]);
-
     auto* top = new Vocaml4142_vm;
-
+    FILE *tracef = fopen(argv[2], "r");
+    fgets(trace[0], sizeof(linbuf), tracef);
+    
     // Optional waveform
     VerilatedVcdC* tfp = nullptr;
     Verilated::traceEverOn(true);
@@ -75,18 +81,28 @@ int main(int argc, char** argv) {
     top->reset = 0;
 
     uint64_t cycles = 0;
+    const char *op;
+    linbuf opcode;
+    uint32_t addr, op1, cnt, oldpc, cycle,  oldcycle = 0;
+    int matching = 1;
     
-    while (!Verilated::gotFinish()) {
+    while (matching && !Verilated::gotFinish()) {
         // Provide instruction byte
         top->code_rdata = code_rom[top->pc];
-
         // Clock tick
         top->clk = 0;
         top->eval();
-
         tfp->dump(cycles);
-        // Trace like ocamlrun -dinstr
-        if (top->state_out == S_EXEC) printf(
+	
+	switch(top->state_out)
+	  {
+	  case S_FETCH:
+	    oldpc = top->pc;
+	    op = opname(top->code_rdata);
+	    printf("Fetch PC=%d ROM = 0x%x, instruction = %s\n", top->pc, top->code_rdata, op);
+	    break;
+	    // Trace like ocamlrun -dinstr
+	  case S_EXEC: printf(
             "%08llx %s pc=%06d rom=%4x op=%s imm=%x nvars=%08x offset=%08x acc=%08x sp=%04x\n",
             cycles,
 	    statenam(top->state_out), 
@@ -97,10 +113,44 @@ int main(int argc, char** argv) {
 	    top->nvars,
 	    top->offset,
             top->accu,
-            top->sp
-        );
-	else if (1) printf("%08llx %s pc=%06d\n", cycles, statenam(top->state_out), top->pc);
-
+            top->sp);
+	    break;
+	  case S_DONE:
+	    printf("%08llx %s pc=%06d\n", cycles, statenam(top->state_out), top->pc);
+	    cnt = 0;
+	    do {
+	      fgets(trace[cnt], sizeof(linbuf), tracef);
+	      printf("Trace %s", trace[cnt]);
+	    } while (cnt < sizeof(trace)/sizeof(*trace) && strlen(trace[cnt++]) > 1);
+	    
+	    cnt = sscanf(trace[0], "##%d", &cycle);
+	    if (!cnt || cycle != oldcycle+1)
+	      {
+	      printf("Trace mismatch\n");
+	      matching = 0;
+	      }
+	    oldcycle = cycle;
+	    cnt = sscanf(trace[1], " %d %s %d", &addr, opcode, &op1);
+	    printf("Trace cnt=%d: %s\n", cnt, trace[1]);
+	    if (cnt >= 2 && matching)
+	      {
+		if (strcmp(op, opcode))
+		  matching = 0;
+		if (!matching)
+		  printf("Stopped due to instruction mismatch %s vs %s\n", op, opcode);
+		if (oldpc != addr)
+		  {
+		    printf("Stopped due to PC mismatch %d vs %d\n", oldpc, addr);
+		    matching = 0;
+		  }
+		    
+	      }
+	    break;
+	  default:
+	    printf("%08llx %s pc=%06d\n", cycles, statenam(top->state_out), top->pc);
+	    break;
+	  }
+	
         top->clk = 1;
         top->eval();
 

@@ -83,7 +83,7 @@ function automatic bit opcode_has_imm16(opcode_t op);
       GETGLOBALFIELD, MAKEBLOCK, C_CALLN,
       BEQ, BNEQ, BLTINT, BLEINT, BGTINT, BGEINT,
       BULTINT, BUGEINT, GETPUBMET
-      : opcode_has_imm16 = 1'b0;
+      : opcode_has_imm16 = 1'b1;
     default
       : opcode_has_imm16 = 1'b0;
   endcase
