@@ -459,49 +459,49 @@ module ocaml4142_vm #(
             // These compare accu with tos and branch on condition
             // Format: BEQ offset, const - branches if accu == const
             BEQ: begin
-              if (Int_val(accu) == $signed(imm)) begin
+              if ($signed(imm) == Int_val(accu)) begin
                 pc <= pc + $signed(offset) - 1;
               end
             end
             
             BNEQ: begin
-              if (Int_val(accu) != $signed(imm)) begin
+              if ($signed(imm) != Int_val(accu)) begin
                 pc <= pc + $signed(offset) - 1;
               end
             end
             
             BLTINT: begin
-              if (Int_val(accu) < $signed(imm)) begin
+              if ($signed(imm) < Int_val(accu)) begin
                 pc <= pc + $signed(offset) - 1;
               end
             end
             
             BLEINT: begin
-              if (Int_val(accu) <= $signed(imm)) begin
+              if ($signed(imm) <= Int_val(accu)) begin
                 pc <= pc + $signed(offset) - 1;
               end
             end
             
             BGTINT: begin
-              if (Int_val(accu) > $signed(imm)) begin
+              if ($signed(imm) > Int_val(accu)) begin
                 pc <= pc + $signed(offset) - 1;
               end
             end
             
             BGEINT: begin
-              if (Int_val(accu) >= $signed(imm)) begin
+              if ($signed(imm) >= Int_val(accu)) begin
                 pc <= pc + $signed(offset) - 1;
               end
             end
             
             BULTINT: begin
-              if ($unsigned(Int_val(accu)) < $unsigned($signed(imm))) begin
+              if ($unsigned($signed(imm)) < $unsigned(Int_val(accu))) begin
                 pc <= pc + $signed(offset) - 1;
               end
             end
             
             BUGEINT: begin
-              if ($unsigned(Int_val(accu)) >= $unsigned($signed(imm))) begin
+              if ($unsigned($signed(imm)) >= $unsigned(Int_val(accu))) begin
                 pc <= pc + $signed(offset) - 1;
               end
             end
@@ -706,8 +706,7 @@ module ocaml4142_vm #(
               stack_mem[sp + imm - 1] <= arg1;
               
               env <= accu;
-              pc  <= Codeptr_val(accu);
-              extra_args <= 8'd0;
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
             end // case: APPTERM1
 	    
             APPTERM2: begin
@@ -720,7 +719,7 @@ module ocaml4142_vm #(
               stack_mem[sp + imm - 1] <= arg2;
               
               env <= accu;
-              pc  <= Codeptr_val(accu);
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               extra_args <= extra_args + 8'd1;
             end // case: APPTERM2
 	    
@@ -736,7 +735,7 @@ module ocaml4142_vm #(
               stack_mem[sp + imm - 1] <= arg3;
               
               env <= accu;
-              pc  <= Codeptr_val(accu);
+              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
               extra_args <= extra_args + 8'd2;
             end
 
@@ -955,16 +954,23 @@ module ocaml4142_vm #(
             // All fields written, finalize
             accu <= Ptr_of_heap_index(alloc_base);
             
-            // For CLOSUREREC, push the newly created closure onto stack
-            if (closurerec_push) begin
+            // For CLOSUREREC: pop captured variables first, then push new closure
+            if (opcode == CLOSUREREC) begin
+              if (closure_nvars > 0) begin
+                // Pop captured variables, then push closure: net effect is sp = sp + nvars - 1
+                sp <= sp + closure_nvars - 1;
+                stack_mem[sp + closure_nvars - 1] <= Ptr_of_heap_index(alloc_base);
+              end else begin
+                // No captured vars, just push closure
+                sp <= sp - 1;
+                stack_mem[sp - 1] <= Ptr_of_heap_index(alloc_base);
+              end
+              closurerec_push <= 1'b0;
+            end else if (closurerec_push) begin
+              // Regular CLOSUREREC push (should not happen, but keep for safety)
               stack_mem[sp - 1] <= Ptr_of_heap_index(alloc_base);
               sp <= sp - 1;
               closurerec_push <= 1'b0;
-            end
-            
-            // Pop captured variables from stack (if any)
-            if (opcode == CLOSUREREC && closure_nvars > 0) begin
-              sp <= sp + closure_nvars;
             end
             
             state <= S_DONE;
