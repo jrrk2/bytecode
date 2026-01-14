@@ -172,7 +172,7 @@ void byte_caml_load_code(int fd, asize_t len)
   fprintf(stderr, "Loaded %zu bytes\n", caml_code_size);
 }
 
-CAMLexport void caml_bytecode(char *byte_name)
+CAMLexport int caml_bytecode(char *byte_name)
 {
   int fd;
   struct exec_trailer trail;
@@ -226,4 +226,5 @@ CAMLexport void caml_bytecode(char *byte_name)
   Unlock(chan);
   caml_close_channel(chan); /* this also closes fd */
   caml_stat_free(trail.section);
+  return caml_code_size;
 }

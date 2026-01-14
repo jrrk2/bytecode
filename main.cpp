@@ -19,7 +19,7 @@ uint32_t code_rom[1 << 20];
 
 extern "C"
 {
-  void caml_bytecode(char *byte_name);
+  int caml_bytecode(char *byte_name);
   char *opname(int ix);
   };
 
@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    caml_bytecode(argv[1]);
+    int prog_length = caml_bytecode(argv[1]);
     auto* top = new Vocaml4142_vm;
     FILE *tracef = fopen(argv[2], "r");
     fgets(trace[0], sizeof(linbuf), tracef);
@@ -83,10 +83,17 @@ int main(int argc, char** argv) {
     uint64_t cycles = 0;
     const char *op;
     linbuf opcode;
-    uint32_t addr, op1, cnt, oldpc, cycle,  oldcycle = 0;
+    uint32_t addr, op1, cnt, oldpc, oldsp, cycle, accu, spaddr, items, oldcycle = 0;
     int matching = 1;
-    
+
+    printf("Program length %d\n", prog_length);
+
     while (matching && !Verilated::gotFinish()) {
+      if (top->pc >= prog_length)
+	{
+	  printf("Terminating on PC %d out of %d range\n", top->pc, prog_length);
+	  matching = 0;
+	}
         // Provide instruction byte
         top->code_rdata = code_rom[top->pc];
         // Clock tick
@@ -94,10 +101,11 @@ int main(int argc, char** argv) {
         top->eval();
         tfp->dump(cycles);
 	
-	switch(top->state_out)
+	if (matching) switch(top->state_out)
 	  {
 	  case S_FETCH:
 	    oldpc = top->pc;
+	    oldsp = top->sp;
 	    op = opname(top->code_rdata);
 	    printf("Fetch PC=%d ROM = 0x%x, instruction = %s\n", top->pc, top->code_rdata, op);
 	    break;
@@ -116,7 +124,7 @@ int main(int argc, char** argv) {
             top->sp);
 	    break;
 	  case S_DONE:
-	    printf("%08llx %s pc=%06d\n", cycles, statenam(top->state_out), top->pc);
+	    printf("%08llx %s pc=%06d sp=%x\n", cycles, statenam(top->state_out), top->pc, top->sp);
 	    cnt = 0;
 	    do {
 	      fgets(trace[cnt], sizeof(linbuf), tracef);
@@ -145,9 +153,27 @@ int main(int argc, char** argv) {
 		  }
 		    
 	      }
+	    cnt = sscanf(trace[3], "accu=%x", &accu);
+	    if (cnt > 0)
+	      {
+		if (accu != top->accu)
+		  {
+		    printf("ACCU mismatch %x vs %x\n", accu, top->accu);
+		  }
+	      }
+	    cnt = sscanf(trace[4], " sp=0x%x @%d", &spaddr, &items);
+	    if (cnt >= 2)
+	      {
+		uint32_t vitems = 0xffff - oldsp;
+		if (items != vitems)
+		  {
+		    printf("SP mismatch %x vs %x\n", items, vitems);
+		  }
+	      }
+	    else printf("Failed to parse SP: %s\n", trace[4]);
 	    break;
 	  default:
-	    printf("%08llx %s pc=%06d\n", cycles, statenam(top->state_out), top->pc);
+	    printf("%08llx %s pc=%06d sp=%x\n", cycles, statenam(top->state_out), top->pc, top->sp);
 	    break;
 	  }
 	

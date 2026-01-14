@@ -312,7 +312,7 @@ module ocaml4142_vm #(
             state <= S_EXEC;
           end else if (opcode == CLOSURE) begin
             // second imm (offset) - sign extend from byte
-	    offset <= {{24{code_rdata[7]}}, code_rdata[7:0]};  // Sign-extend byte to 32 bits
+	    offset <= code_rdata;
 	    pc <= pc + 1;
             state <= S_EXEC;
           end else if (opcode == BEQ || opcode == BNEQ || 
@@ -320,7 +320,7 @@ module ocaml4142_vm #(
                        opcode == BGTINT || opcode == BGEINT ||
                        opcode == BULTINT || opcode == BUGEINT) begin
             // Second immediate is the offset - sign extend from byte
-	    offset <= {{24{code_rdata[7]}}, code_rdata[7:0]};  // Sign-extend byte to 32 bits
+	    offset <= code_rdata;
 	    pc <= pc + 1;
             state <= S_EXEC;
           end else if (opcode == MAKEBLOCK) begin
@@ -555,27 +555,38 @@ module ocaml4142_vm #(
 
             // CLOSUREREC nvars, offset
             // Creates nvars mutually recursive closures
-            // For factorial: CLOSUREREC 1, 0 creates single self-referential closure
+            // Example: CLOSUREREC 1, 0 creates single self-referential closure with no free vars
+            // Example: CLOSUREREC 1, 1 creates single self-referential closure with 1 free var
             CLOSUREREC: begin
-              if (imm == 1 && nvars == 0) begin
-                // Simple case: single recursive function with no free variables (CLOSUREREC 1, 0)
+              if (imm == 1) begin
+                // Single recursive function (nfuncs=1) with nvars free variables
                 // S_FETCH_IMM left pc pointing at offset byte
                 // Read offset from current bytecode position
-                offset <= {{24{code_rdata[7]}}, code_rdata[7:0]};  // Sign-extend
+                offset <= code_rdata;
                 pc <= pc + 1;  // Advance past offset byte
+                
+                // Save nvars for later use in field writing
+                closure_nvars <= nvars;
+                
+                // If nvars > 0, push accu to stack to save it as captured variable
+                if (nvars > 0) begin
+                  sp <= sp - 1;
+                  stack_mem[sp - 1] <= accu;
+                end
                 
                 // Set flag to push closure after allocation
                 closurerec_push <= 1'b1;
                 
-                alloc_wosize <= 2;
+                // Allocate closure block: size = (nfuncs * 3 - 1) + nvars = 2 + nvars
+                alloc_wosize <= 2 + nvars;
                 alloc_tag    <= TAG_CLOSURE;
-                alloc_fields_left <= 2;
+                alloc_fields_left <= 2 + nvars;
                 alloc_result_ptr <= Ptr_of_heap_index(hp);
                 
                 // Will calculate code pointer in next state
                 state <= S_CLOSUREREC_CALC;
               end else begin
-                $display("Multi-function or non-zero nvars not yet implemented");
+                $display("Multi-function CLOSUREREC (nfuncs > 1) not yet implemented");
                 trap_valid <= 1'b1;
                 trap_prim  <= 8'hF0; // "complex CLOSUREREC not implemented"
                 state <= S_TRAP_WAIT;
@@ -674,6 +685,9 @@ module ocaml4142_vm #(
             end
 
             APPTERM: begin
+	       $display("APPTERM is TBD");
+	       $finish;
+	       
               // imm = nargs, imm_b = framesize
               // pop framesize slots, tailcall to closure in accu
               sp <= sp + imm_b;
@@ -684,20 +698,46 @@ module ocaml4142_vm #(
             end
 
             APPTERM1: begin
-              // framesize is encoded in opcode variant? In OCaml, APPTERM1 n? is specialized; simplify:
-              env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+              // C code: value arg1 = sp[0]; sp = sp + imm - 1; sp[0] = arg1;
+              // Save arg, adjust sp, restore arg
+              logic [31:0] arg1;
+              arg1 = stack_mem[sp];
+              sp <= sp + imm - 1;
+              stack_mem[sp + imm - 1] <= arg1;
+              
+              env <= accu;
+              pc  <= Codeptr_val(accu);
               extra_args <= 8'd0;
-            end
+            end // case: APPTERM1
+	    
             APPTERM2: begin
-              env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
-              extra_args <= 8'd1;
-            end
+              // C code: value arg1 = sp[0]; value arg2 = sp[1]; sp = sp + imm - 2; sp[0] = arg1; sp[1] = arg2;
+              logic [31:0] arg1, arg2;
+              arg1 = stack_mem[sp];
+              arg2 = stack_mem[sp + 1];
+              sp <= sp + imm - 2;
+              stack_mem[sp + imm - 2] <= arg1;
+              stack_mem[sp + imm - 1] <= arg2;
+              
+              env <= accu;
+              pc  <= Codeptr_val(accu);
+              extra_args <= extra_args + 8'd1;
+            end // case: APPTERM2
+	    
             APPTERM3: begin
-              env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
-              extra_args <= 8'd2;
+              // C code: sp = sp + imm - 3; (with arg shuffling)
+              logic [31:0] arg1, arg2, arg3;
+              arg1 = stack_mem[sp];
+              arg2 = stack_mem[sp + 1];
+              arg3 = stack_mem[sp + 2];
+              sp <= sp + imm - 3;
+              stack_mem[sp + imm - 3] <= arg1;
+              stack_mem[sp + imm - 2] <= arg2;
+              stack_mem[sp + imm - 1] <= arg3;
+              
+              env <= accu;
+              pc  <= Codeptr_val(accu);
+              extra_args <= extra_args + 8'd2;
             end
 
             RETURN: begin
@@ -806,6 +846,48 @@ module ocaml4142_vm #(
 		 sp += imm;
             end
 
+	    MAKEBLOCK:
+	      begin
+		 alloc_base <= hp;
+		 heap_mem[hp] <= Make_header(1, imm);
+		 heap_mem[hp+1] <= accu;
+		 hp <= hp + 2;
+		 accu <= alloc_base;
+		 $display("MAKEBLOCK placeholder");
+	      end
+
+	    MAKEBLOCK1:
+	      begin
+		 alloc_base <= hp;
+		 heap_mem[hp] <= Make_header(1, imm);
+		 heap_mem[hp+1] <= accu;
+		 hp <= hp + 2;
+		 accu <= alloc_base;
+	      end
+
+	    MAKEBLOCK2:
+	      begin
+		 alloc_base <= hp;
+		 heap_mem[hp] <= Make_header(2, imm);
+		 heap_mem[hp+1] <= accu;
+		 heap_mem[hp+2] <= stack_mem[sp + 0];
+		 hp <= hp + 3;
+		 sp <= sp + 1;
+		 accu <= alloc_base;
+	      end
+
+	    MAKEBLOCK3:
+	      begin
+		 alloc_base <= hp;
+		 heap_mem[hp] <= Make_header(3, imm);
+		 heap_mem[hp+1] <= accu;
+		 heap_mem[hp+2] <= stack_mem[sp + 0];
+		 heap_mem[hp+3] <= stack_mem[sp + 1];
+		 hp <= hp + 4;
+		 sp <= sp + 2;
+		 accu <= alloc_base;
+	      end
+	    
             STOP: begin
               // halted is set outside
             end
@@ -836,11 +918,13 @@ module ocaml4142_vm #(
         end
 
         S_HEAP_ALLOC_FIELDS: begin
-          // For the closure case: write field0 then field1.
+          // For the closure case: write field0, then field1, then optional env vars.
           if (alloc_fields_left == alloc_wosize) begin
-            heap_mem[hp] <= pending_field; // field0 (code pointer)
+            // field0: code pointer
+            heap_mem[hp] <= pending_field;
             hp <= hp + 1;
             alloc_fields_left <= alloc_fields_left - 1;
+            
           end else if (alloc_fields_left == alloc_wosize - 1) begin
             // field1: for CLOSUREREC, point to self; for CLOSURE, use env
             if (opcode == CLOSUREREC) begin
@@ -850,15 +934,39 @@ module ocaml4142_vm #(
             end
             hp <= hp + 1;
             alloc_fields_left <= alloc_fields_left - 1;
+            
+            // Initialize closure_i for environment variable copying
+            closure_i <= 0;
+            
+          end else if (alloc_fields_left > 0) begin
+            // Remaining fields: environment variables (if any)
+            // For CLOSUREREC with nvars > 0, copy from stack
+            if (opcode == CLOSUREREC && closure_nvars > 0 && closure_i < closure_nvars) begin
+              heap_mem[hp] <= stack_mem[sp + closure_i];
+              hp <= hp + 1;
+              closure_i <= closure_i + 1;
+              alloc_fields_left <= alloc_fields_left - 1;
+            end else begin
+              // No more fields to write, we're done
+              alloc_fields_left <= 0;
+            end
+            
           end else begin
-            // done
+            // All fields written, finalize
             accu <= Ptr_of_heap_index(alloc_base);
+            
             // For CLOSUREREC, push the newly created closure onto stack
             if (closurerec_push) begin
               stack_mem[sp - 1] <= Ptr_of_heap_index(alloc_base);
               sp <= sp - 1;
               closurerec_push <= 1'b0;
             end
+            
+            // Pop captured variables from stack (if any)
+            if (opcode == CLOSUREREC && closure_nvars > 0) begin
+              sp <= sp + closure_nvars;
+            end
+            
             state <= S_DONE;
           end
         end
