@@ -315,9 +315,9 @@ module ocaml4142_vm #(
 	    offset <= code_rdata;
 	    pc <= pc + 1;
             state <= S_EXEC;
-          end else if (opcode == BEQ || opcode == BNEQ || 
-                       opcode == BLTINT || opcode == BLEINT ||
-                       opcode == BGTINT || opcode == BGEINT ||
+          end else if (opcode == BEQ || opcode == BNEQ || opcode == BRANCHIF ||
+                       opcode == BLTINT || opcode == BLEINT || opcode == BRANCHIFNOT ||
+                       opcode == BGTINT || opcode == BGEINT || opcode == BRANCH ||
                        opcode == BULTINT || opcode == BUGEINT) begin
             // Second immediate is the offset - sign extend from byte
 	    offset <= code_rdata;
@@ -444,15 +444,15 @@ module ocaml4142_vm #(
 
             // ---- Branching (imm signed) ----
             BRANCH: begin
-              pc <= pc + $signed(imm) - 1;
+              pc <= pc + $signed(offset) - 1;
             end
 
             BRANCHIF: begin
-              if (accu != VAL_FALSE) pc <= pc + $signed(imm) - 1;
+              if (accu != VAL_FALSE) pc <= pc + $signed(offset) - 1;
             end
 
             BRANCHIFNOT: begin
-              if (accu == VAL_FALSE) pc <= pc + $signed(imm) - 1;
+              if (accu == VAL_FALSE) pc <= pc + $signed(offset) - 1;
             end
             
             // Integer comparison branches
