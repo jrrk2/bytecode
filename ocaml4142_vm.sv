@@ -601,13 +601,24 @@ module ocaml4142_vm #(
 
             // ---- Calls ----
             // PUSH_RETADDR: push current pc as return addr
-            PUSH_RETADDR: begin
-	       logic [31:0] old_sp;
-	       old_sp = sp;
-               sp <= sp - 1;
-               stack_mem[old_sp - 1] <= Val_int(pc); // store as int for now
-            end
+	    PUSH_RETADDR: begin
+	      logic [31:0] old_sp;
+	      logic [PCW-1:0] retpc;
 
+	      old_sp = sp;
+
+	      // NOTE: choose the correct base for retpc depending on where `pc` points in your pipeline.
+	      // If `pc` is already advanced past the immediate, retpc = pc + signext(imm).
+	      // If `pc` still points at the immediate byte, retpc = (pc + 1) + signext(imm).
+	      retpc = $signed(pc) + $signed(imm);
+
+	      stack_mem[old_sp - 3] <= Make_codeptr(retpc);   // sp[0]
+	      stack_mem[old_sp - 2] <= env;                   // sp[1]
+	      stack_mem[old_sp - 1] <= Val_int(extra_args);   // sp[2]   (Val_long)
+
+	      sp <= old_sp - 3;
+	    end // case: PUSH_RETADDR
+	    
             APPLY: begin
               // APPLY just jumps to the closure with nargs already on stack
               // No stack frame is saved!
@@ -702,7 +713,7 @@ module ocaml4142_vm #(
                 // Normal return: pop locals, then restore frame
                 pc         <= Codeptr_val(stack_mem[sp + imm]);
                 env        <= stack_mem[sp + imm + 1];
-                extra_args <= stack_mem[sp + imm + 2][7:0];
+                extra_args <= Int_val(stack_mem[sp + imm + 2])[7:0];
                 sp         <= sp + imm + 3;  // Pop locals + frame
               end
             end
