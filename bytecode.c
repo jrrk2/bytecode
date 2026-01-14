@@ -166,7 +166,7 @@ void byte_caml_load_code(int fd, asize_t len)
 #endif
   for (int i = 0; i < caml_code_size; i++)
     {
-    if (i < 16) fprintf(stderr, "Dumping caml_start_code[%d] = %d\n", i, caml_start_code[i]);
+      //    if (i < 16) fprintf(stderr, "Dumping caml_start_code[%d] = %d\n", i, caml_start_code[i]);
     code_rom[i] = (uint32_t) caml_start_code[i];
     }
   fprintf(stderr, "Loaded %zu bytes\n", caml_code_size);

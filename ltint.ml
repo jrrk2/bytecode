@@ -32,11 +32,11 @@ let stdin = open_descriptor_in 0
 let stdout = open_descriptor_out 1
 let print_char c = output_char stdout c
 
-let rec print_int_100000 i = print_char (char_of_int (i mod 10 + int_of_char('0')))
-let rec print_int_10000 i = print_int_100000 (i/10); print_char (char_of_int (i mod 10 + int_of_char('0')))
-let rec print_int_1000 i = print_int_10000 (i/10); print_char (char_of_int (i mod 10 + int_of_char('0')))
-let rec print_int_100 i = print_int_1000 (i/10); print_char (char_of_int (i mod 10 + int_of_char('0')))
-let rec print_int_10 i = print_int_100 (i/10); print_char (char_of_int (i mod 10 + int_of_char('0')))
+let print_int_100000 i = print_char (char_of_int (i mod 10 + int_of_char('0')))
+let print_int_10000 i = print_int_100000 (i/10); print_char (char_of_int (i mod 10 + int_of_char('0')))
+let print_int_1000 i = print_int_10000 (i/10); print_char (char_of_int (i mod 10 + int_of_char('0')))
+let print_int_100 i = print_int_1000 (i/10); print_char (char_of_int (i mod 10 + int_of_char('0')))
+let print_int_10 i = print_int_100 (i/10); print_char (char_of_int (i mod 10 + int_of_char('0')))
 let print_int i = if i < 0 then begin print_char '-'; print_int_10 (-i); end else print_int_10 i
 
 let () =
