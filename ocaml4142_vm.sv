@@ -466,7 +466,7 @@ module ocaml4142_vm #(
             
             BNEQ: begin
               if (Int_val(accu) != $signed(imm)) begin
-                pc <= pc + $signed(offset);
+                pc <= pc + $signed(offset) - 1;
               end
             end
             
