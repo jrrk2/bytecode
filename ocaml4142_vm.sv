@@ -288,6 +288,13 @@ module ocaml4142_vm #(
 		 // CLOSUREREC has nfuncs and nvars
 		 imm <= code_rdata;  // nfuncs
 		 pc <= pc + 1;
+	      end else if (opcode == BEQ || opcode == BNEQ || 
+                           opcode == BLTINT || opcode == BLEINT ||
+                           opcode == BGTINT || opcode == BGEINT ||
+                           opcode == BULTINT || opcode == BUGEINT) begin
+		 // Branch instructions: read first immediate (const)
+		 imm <= code_rdata;
+		 pc <= pc + 1;
 	      end
            end else begin
               state <= S_EXEC;
