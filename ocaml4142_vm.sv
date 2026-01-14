@@ -459,7 +459,7 @@ module ocaml4142_vm #(
             
             BNEQ: begin
               if (Int_val(accu) != $signed(imm)) begin
-                pc <= pc + $signed(offset) - 1;
+                pc <= pc + $signed(offset);
               end
             end
             
@@ -881,8 +881,8 @@ module ocaml4142_vm #(
 
 	S_CLOSUREREC_CALC: begin
 	   logic [PCW-1:0] tgt;
-	   tgt = $signed(pc) + $signed(offset);     // no "- 1"
-	   pending_field <= Make_codeptr(tgt);      // NOT Val_int(...)
+	   tgt = $signed(pc) + $signed(offset) - 1;  // Need -1 correction
+	   pending_field <= Make_codeptr(tgt);       // NOT Val_int(...)
 	   state <= S_HEAP_ALLOC_HDR;
 	end
 	
