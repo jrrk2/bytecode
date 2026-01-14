@@ -428,65 +428,66 @@ module ocaml4142_vm #(
             NEGINT:  accu <= Val_int(-Int_val(accu));
             
             // Binary operations - all pop the stack after reading TOS
+            // C semantics: accu = accu OP tos (then pop tos)
             ADDINT: begin
-              accu <= Val_int(Int_val(tos) + Int_val(accu));
+              accu <= Val_int(Int_val(accu) + Int_val(tos));
               sp <= sp + 1;
             end
             
             SUBINT: begin
-              accu <= Val_int(Int_val(tos) - Int_val(accu));
+              accu <= Val_int(Int_val(accu) - Int_val(tos));
               sp <= sp + 1;
             end
             
             MULINT: begin
-              accu <= Val_int(Int_val(tos) * Int_val(accu));
+              accu <= Val_int(Int_val(accu) * Int_val(tos));
               sp <= sp + 1;
             end
             
             DIVINT: begin
-              accu <= Val_int(Int_val(tos) / Int_val(accu));
+              accu <= Val_int(Int_val(accu) / Int_val(tos));
               sp <= sp + 1;
             end
             
             MODINT: begin
-              accu <= Val_int(Int_val(tos) % Int_val(accu));
+              accu <= Val_int(Int_val(accu) % Int_val(tos));
               sp <= sp + 1;
             end
             
             ANDINT: begin
-              accu <= Val_int(Int_val(tos) & Int_val(accu));
+              accu <= Val_int(Int_val(accu) & Int_val(tos));
               sp <= sp + 1;
             end
             
             ORINT: begin
-              accu <= Val_int(Int_val(tos) | Int_val(accu));
+              accu <= Val_int(Int_val(accu) | Int_val(tos));
               sp <= sp + 1;
             end
             
             XORINT: begin
-              accu <= Val_int(Int_val(tos) ^ Int_val(accu));
+              accu <= Val_int(Int_val(accu) ^ Int_val(tos));
               sp <= sp + 1;
             end
             
             LSLINT: begin
-              accu <= Val_int(Int_val(tos) <<< Int_val(accu));
+              accu <= Val_int(Int_val(accu) <<< Int_val(tos));
               sp <= sp + 1;
             end
             
             LSRINT: begin
-              accu <= Val_int((Int_val(tos) >>> 0) >> Int_val(accu));
+              accu <= Val_int((Int_val(accu) >>> 0) >> Int_val(tos));
               sp <= sp + 1;
             end
             
             ASRINT: begin
-              accu <= Val_int(Int_val(tos) >>> Int_val(accu));
+              accu <= Val_int(Int_val(accu) >>> Int_val(tos));
               sp <= sp + 1;
             end
 
             OFFSETINT: accu <= Val_int(Int_val(accu) + $signed(imm));
 
-            EQ:    begin accu <= (tos == accu) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
-            NEQ:   begin accu <= (tos != accu) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
+            EQ:    begin accu <= (accu == tos) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
+            NEQ:   begin accu <= (accu != tos) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
             LTINT: begin accu <= (Int_val(accu) <  Int_val(tos)) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
             LEINT: begin accu <= (Int_val(accu) <= Int_val(tos)) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
             GTINT: begin accu <= (Int_val(accu) >  Int_val(tos)) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
