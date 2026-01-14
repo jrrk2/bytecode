@@ -221,6 +221,13 @@ module ocaml4142_vm #(
 	 accu <= Val_int(1);  // Simple success value
       end
    endtask // caml_ml_output_char
+      
+   task caml_string_get;
+      begin
+	 $display("caml_string_get %x %x", accu, Int_val(tos));
+	 accu <= Val_int(1);  // Simple success value
+      end
+   endtask // caml_ml_output_char
    
    
   // ----------------------------
@@ -419,17 +426,62 @@ module ocaml4142_vm #(
 
             // ---- Integer ops ----
             NEGINT:  accu <= Val_int(-Int_val(accu));
-            ADDINT:  accu <= Val_int(Int_val(tos) + Int_val(accu)); // expects arg on stack
-            SUBINT:  accu <= Val_int(Int_val(tos) - Int_val(accu));
-            MULINT:  accu <= Val_int(Int_val(tos) * Int_val(accu));
-            DIVINT:  accu <= Val_int(Int_val(tos) / Int_val(accu));
-            MODINT:  accu <= Val_int(Int_val(tos) % Int_val(accu));
-            ANDINT:  accu <= Val_int(Int_val(tos) & Int_val(accu));
-            ORINT:   accu <= Val_int(Int_val(tos) | Int_val(accu));
-            XORINT:  accu <= Val_int(Int_val(tos) ^ Int_val(accu));
-            LSLINT:  accu <= Val_int(Int_val(tos) <<< Int_val(accu));
-            LSRINT:  accu <= Val_int((Int_val(tos) >>> 0) >> Int_val(accu));
-            ASRINT:  accu <= Val_int(Int_val(tos) >>> Int_val(accu));
+            
+            // Binary operations - all pop the stack after reading TOS
+            ADDINT: begin
+              accu <= Val_int(Int_val(tos) + Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            SUBINT: begin
+              accu <= Val_int(Int_val(tos) - Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            MULINT: begin
+              accu <= Val_int(Int_val(tos) * Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            DIVINT: begin
+              accu <= Val_int(Int_val(tos) / Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            MODINT: begin
+              accu <= Val_int(Int_val(tos) % Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            ANDINT: begin
+              accu <= Val_int(Int_val(tos) & Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            ORINT: begin
+              accu <= Val_int(Int_val(tos) | Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            XORINT: begin
+              accu <= Val_int(Int_val(tos) ^ Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            LSLINT: begin
+              accu <= Val_int(Int_val(tos) <<< Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            LSRINT: begin
+              accu <= Val_int((Int_val(tos) >>> 0) >> Int_val(accu));
+              sp <= sp + 1;
+            end
+            
+            ASRINT: begin
+              accu <= Val_int(Int_val(tos) >>> Int_val(accu));
+              sp <= sp + 1;
+            end
 
             OFFSETINT: accu <= Val_int(Int_val(accu) + $signed(imm));
 
@@ -813,6 +865,7 @@ module ocaml4142_vm #(
 	      begin
 		 unique case (imm)
 		      16'h108: caml_ml_output_char();
+		      16'h15b: caml_string_get();
 		   default: $display("Unsupported C_CALL2: 0x%x", imm);
 		   endcase
 		 sp += 1;
@@ -886,7 +939,15 @@ module ocaml4142_vm #(
 		 sp <= sp + 2;
 		 accu <= alloc_base;
 	      end
-	    
+
+	    ATOM0:
+	      begin
+	      end
+
+	    CHECK_SIGNALS:
+	      begin
+	      end
+		   
             STOP: begin
               // halted is set outside
             end
