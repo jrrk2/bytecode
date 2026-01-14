@@ -688,19 +688,20 @@ module ocaml4142_vm #(
             end
 
             RETURN: begin
-              // if extra_args > 0, treat as "restart" with decremented extra_args
+              // C code: sp += *pc++; (happens first, always)
+              // Then check extra_args
               if (extra_args != 0) begin
                 extra_args <= extra_args - 1;
                 // For partial application, reload closure from accu
                 env <= heap_mem[Heap_index_of_ptr(accu) + 2];
                 pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+                sp  <= sp + imm;  // Pop locals
               end else begin
-                // C code: sp += *pc; pc = sp[0]; env = sp[1]; extra_args = sp[2]; sp += 3;
-                // After popping imm locals, return frame is at sp+imm
+                // Normal return: pop locals, then restore frame
                 pc         <= Codeptr_val(stack_mem[sp + imm]);
                 env        <= stack_mem[sp + imm + 1];
                 extra_args <= stack_mem[sp + imm + 2][7:0];
-                sp         <= sp + imm + 3;
+                sp         <= sp + imm + 3;  // Pop locals + frame
               end
             end
 
