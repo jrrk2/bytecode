@@ -433,12 +433,12 @@ module ocaml4142_vm #(
 
             OFFSETINT: accu <= Val_int(Int_val(accu) + $signed(imm));
 
-            EQ:    accu <= (tos == accu) ? VAL_TRUE : VAL_FALSE;
-            NEQ:   accu <= (tos != accu) ? VAL_TRUE : VAL_FALSE;
-            LTINT: accu <= (Int_val(tos) <  Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
-            LEINT: accu <= (Int_val(tos) <= Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
-            GTINT: accu <= (Int_val(tos) >  Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
-            GEINT: accu <= (Int_val(tos) >= Int_val(accu)) ? VAL_TRUE : VAL_FALSE;
+            EQ:    begin accu <= (tos == accu) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
+            NEQ:   begin accu <= (tos != accu) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
+            LTINT: begin accu <= (Int_val(accu) <  Int_val(tos)) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
+            LEINT: begin accu <= (Int_val(accu) <= Int_val(tos)) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
+            GTINT: begin accu <= (Int_val(accu) >  Int_val(tos)) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
+            GEINT: begin accu <= (Int_val(accu) >= Int_val(tos)) ? VAL_TRUE : VAL_FALSE; sp <= sp + 1; end
 
             BOOLNOT: accu <= (accu == VAL_FALSE) ? VAL_TRUE : VAL_FALSE;
 
