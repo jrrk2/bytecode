@@ -622,20 +622,22 @@ module ocaml4142_vm #(
 	      logic [31:0] base;
 	      logic [31:0] arg1;
 
-	      // 1) Save argument
-	      arg1 = tos;
+	      // C code: arg1 = sp[0]; sp -= 3; sp[0]=arg1; sp[1]=pc; sp[2]=env; sp[3]=extra_args
+	      // Reads argument from sp, moves sp down by 3, then writes 4 values
+	      // The 4th value (sp[3]) goes to old sp position (overwrites argument location)
+	      
+	      arg1 = tos;  // Read argument from current top
 
-	      // 2) Build new frame (after sp -= 3)
-	      stack_mem[sp-3] <= arg1;               // sp[0]
-	      stack_mem[sp-2] <= Make_codeptr(pc);   // sp[1] return pc TEST
-	      stack_mem[sp-1] <= env;                // sp[2] old env (closure)
-	      stack_mem[sp-0] <= Val_int(extra_args);// sp[3]
-
+	      // After sp -= 3, write frame:
 	      sp <= sp - 3;
+	      stack_mem[sp-3] <= arg1;               // new sp[0]
+	      stack_mem[sp-2] <= Make_codeptr(pc);   // new sp[1] 
+	      stack_mem[sp-1] <= env;                // new sp[2]
+	      stack_mem[sp-0] <= Val_int(extra_args);// new sp[3] = old sp[0]
 
-	      // 3) Jump to closure - read code pointer from heap!
+	      // Jump to closure
 	      base = Heap_index_of_ptr(accu);
-	      pc  <= Codeptr_val(heap_mem[base + 1]);  // Read from field 1
+	      pc  <= Codeptr_val(heap_mem[base + 1]);
 	      env <= accu;
 	      extra_args <= 0;
 	    end
