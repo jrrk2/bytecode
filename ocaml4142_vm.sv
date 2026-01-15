@@ -673,7 +673,7 @@ module ocaml4142_vm #(
 	      // NOTE: choose the correct base for retpc depending on where `pc` points in your pipeline.
 	      // If `pc` is already advanced past the immediate, retpc = pc + signext(imm).
 	      // If `pc` still points at the immediate byte, retpc = (pc + 1) + signext(imm).
-	      retpc = $signed(pc) + $signed(imm);
+	      retpc = $signed(pc-1) + $signed(imm);
 
 	      stack_mem[old_sp - 3] <= Make_codeptr(retpc);   // sp[0]
 	      stack_mem[old_sp - 2] <= env;                   // sp[1]
@@ -993,7 +993,7 @@ module ocaml4142_vm #(
           end else if (alloc_fields_left == alloc_wosize - 1) begin
             // field1: for CLOSUREREC, point to self; for CLOSURE, use env
             if (opcode == CLOSUREREC) begin
-              heap_mem[hp] <= Ptr_of_heap_index(alloc_base);
+              heap_mem[hp] <= Val_int(2);
             end else begin
               heap_mem[hp] <= env; // normal CLOSURE case
             end
