@@ -137,7 +137,6 @@ module ocaml4142_vm #(
   assign tos = stack_mem[sp];
   // For heap allocation micro-ops
   int alloc_fields_left;
-  logic [HEAP_AW-1:0] alloc_base;        // heap index of header
   logic [VALUEW-1:0]  alloc_result_ptr;  // returned pointer
   logic               closurerec_push;   // flag to push closure for CLOSUREREC
 
@@ -961,29 +960,27 @@ module ocaml4142_vm #(
 
 	    MAKEBLOCK1:
 	      begin
-		 alloc_base <= hp;
+		 accu <= Ptr_of_heap_index(hp);
 		 heap_mem[hp] <= Make_header(1, imm);
 		 heap_mem[hp+1] <= accu;
 		 heap_mem[hp+2] <= 32'hDEADBEEF;
 		 hp <= hp + 3;
-		 accu <= alloc_base;
 	      end
 
 	    MAKEBLOCK2:
 	      begin
-		 alloc_base <= hp;
+		 accu <= Ptr_of_heap_index(hp);
 		 heap_mem[hp] <= Make_header(2, imm);
 		 heap_mem[hp+1] <= accu;
 		 heap_mem[hp+2] <= stack_mem[sp + 0];
 		 heap_mem[hp+3] <= 32'hDEADBEEF;
 		 hp <= hp + 4;
 		 sp <= sp + 1;
-		 accu <= alloc_base;
 	      end
 
 	    MAKEBLOCK3:
 	      begin
-		 alloc_base <= hp;
+		 accu <= Ptr_of_heap_index(hp);
 		 heap_mem[hp] <= Make_header(3, imm);
 		 heap_mem[hp+1] <= accu;
 		 heap_mem[hp+2] <= stack_mem[sp + 0];
@@ -991,7 +988,6 @@ module ocaml4142_vm #(
 		 heap_mem[hp+4] <= 32'hDEADBEEF;
 		 hp <= hp + 5;
 		 sp <= sp + 2;
-		 accu <= alloc_base;
 	      end
 
 	    ATOM0:
@@ -1022,7 +1018,7 @@ module ocaml4142_vm #(
         // Used for CLOSURE / MAKEBLOCK etc.
         // ----------------------------
         S_HEAP_ALLOC_HDR: begin
-          alloc_base <= hp;
+          accu <= Ptr_of_heap_index(hp);
           heap_mem[hp] <= Make_header(alloc_wosize, alloc_tag);
           hp <= hp + 1;
 
@@ -1080,24 +1076,21 @@ module ocaml4142_vm #(
 	    end
             
           end else begin
-            // All fields written, finalize
-            accu <= Ptr_of_heap_index(alloc_base);
-            
             // For CLOSUREREC: pop captured variables first, then push new closure
             if (opcode == CLOSUREREC) begin
               if (closure_nvars > 0) begin
                 // Pop captured variables, then push closure: net effect is sp = sp + nvars - 1
                 sp <= sp + closure_nvars - 1;
-                stack_mem[sp + closure_nvars - 1] <= Ptr_of_heap_index(alloc_base);
+                stack_mem[sp + closure_nvars - 1] <= (accu);
               end else begin
                 // No captured vars, just push closure
                 sp <= sp - 1;
-                stack_mem[sp - 1] <= Ptr_of_heap_index(alloc_base);
+                stack_mem[sp - 1] <= (accu);
               end
               closurerec_push <= 1'b0;
             end else if (closurerec_push) begin
               // Regular CLOSUREREC push (should not happen, but keep for safety)
-              stack_mem[sp - 1] <= Ptr_of_heap_index(alloc_base);
+              stack_mem[sp - 1] <= (accu);
               sp <= sp - 1;
               closurerec_push <= 1'b0;
             end
@@ -1182,6 +1175,9 @@ module ocaml4142_vm #(
 	     $display("  heap[hp-2]=0x%08x", heap_mem[hp-2]);
 	     $display("  heap[hp-3]=0x%08x", heap_mem[hp-3]);
 	     $display("  heap[hp-4]=0x%08x", heap_mem[hp-4]);
+	     if (accu == 32'h00000043) begin
+		$display("[TRACK] accu=0x43 set by %s at PC=%d", opcode.name(), pc);
+	     end
 	     state <= S_FETCH;
 	  end
 	
