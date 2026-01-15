@@ -85,10 +85,10 @@ int main(int argc, char** argv) {
     linbuf opcode;
     uint32_t addr, op1, cnt, oldpc, oldsp, cycle, accu, spaddr, items, oldcycle = 0;
     int matching = 1;
-
+    int windup = 10;
     printf("Program length %d\n", prog_length);
 
-    while (matching && !Verilated::gotFinish()) {
+    while (windup && !Verilated::gotFinish()) {
       if (top->pc >= prog_length)
 	{
 	  printf("Terminating on PC %d out of %d range\n", top->pc, prog_length);
@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
         top->eval();
         tfp->dump(cycles);
 	
-	if (matching) switch(top->state_out)
+	switch(top->state_out)
 	  {
 	  case S_FETCH:
 	    oldpc = top->pc;
@@ -189,6 +189,8 @@ int main(int argc, char** argv) {
             std::cerr << "Timeout\n";
             break;
         }
+
+	windup -= !matching;
     }
 
     tfp->close();

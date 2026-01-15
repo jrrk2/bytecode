@@ -265,19 +265,18 @@ module ocaml4142_vm #(
           imm <= '0;
           nvars <= '0;
           offset <= '0;
+	  $display("  at fetch, acc=0x%08x, pc=%d, bytecode=%d", accu, pc, code_rdata);
+	  $display("  stack[sp+0]=0x%08x", stack_mem[sp+0]);
+	  $display("  stack[sp+1]=0x%08x", stack_mem[sp+1]);
+	  $display("  stack[sp+2]=0x%08x", stack_mem[sp+2]);
+	  $display("  stack[sp+3]=0x%08x", stack_mem[sp+3]);
+	  $display("  stack[sp+4]=0x%08x", stack_mem[sp+4]);
+	  $display("  heap[hp-1]=0x%08x", heap_mem[hp-1]);
+	  $display("  heap[hp-2]=0x%08x", heap_mem[hp-2]);
+	  $display("  heap[hp-3]=0x%08x", heap_mem[hp-3]);
+	  $display("  heap[hp-4]=0x%08x", heap_mem[hp-4]);
           pc     <= pc + 1;
-          state  <= S_DECIDE_IMM;
-	  $display("  after fetch, acc=%08x", accu);
-	  $display("  stack[sp+0]=%08x", stack_mem[sp+0]);
-	  $display("  stack[sp+1]=%08x", stack_mem[sp+1]);
-	  $display("  stack[sp+2]=%08x", stack_mem[sp+2]);
-	  $display("  stack[sp+3]=%08x", stack_mem[sp+3]);
-	  $display("  stack[sp+4]=%08x", stack_mem[sp+4]);
-	  $display("  heap[hp-1]=%08x", heap_mem[hp-1]);
-	  $display("  heap[hp-2]=%08x", heap_mem[hp-2]);
-	  $display("  heap[hp-3]=%08x", heap_mem[hp-3]);
-	  $display("  heap[hp-4]=%08x", heap_mem[hp-4]);
-	   
+          state  <= S_DECIDE_IMM;	   
         end
 
         // ----------------------------
@@ -694,8 +693,7 @@ module ocaml4142_vm #(
             end
 
 	    APPLY1: begin
-	      logic [31:0] base;
-	      logic [31:0] arg1;
+	      logic [31:0] base, arg1, code_ptr, target_pc;
 
 	      // C code: arg1 = sp[0]; sp -= 3; sp[0]=arg1; sp[1]=pc; sp[2]=env; sp[3]=extra_args
 	      // Reads argument from sp, moves sp down by 3, then writes 4 values
@@ -704,15 +702,21 @@ module ocaml4142_vm #(
 	      arg1 = tos;  // Read argument from current top
 
 	      // After sp -= 3, write frame:
-	      sp <= sp - 3;
+	      $display("Write frame, arg1=0x%x, pc=%d, env=0x%x, extra=%d", arg1, pc, env, extra_args);
 	      stack_mem[sp-3] <= arg1;               // new sp[0]
 	      stack_mem[sp-2] <= Make_codeptr(pc);   // new sp[1] 
 	      stack_mem[sp-1] <= env;                // new sp[2]
 	      stack_mem[sp-0] <= Val_int(extra_args);// new sp[3] = old sp[0]
+	      sp <= sp - 3;
 
 	      // Jump to closure
 	      base = Heap_index_of_ptr(accu);
-	      pc  <= Codeptr_val(heap_mem[base + 1]);
+	       code_ptr = heap_mem[base + 1];
+	       target_pc = Codeptr_val(code_ptr);
+  
+	       $display("APPLY1: code_ptr=0x%08x -> PC=%d", code_ptr, target_pc);
+  
+	       pc <= target_pc;
 	      env <= accu;
 	      extra_args <= 0;
 	    end
@@ -1097,16 +1101,16 @@ module ocaml4142_vm #(
 
 	S_DONE:
 	  begin
-	     $display("  instruction done, acc=%08x", accu);
-	     $display("  stack[sp+0]=%08x", stack_mem[sp+0]);
-	     $display("  stack[sp+1]=%08x", stack_mem[sp+1]);
-	     $display("  stack[sp+2]=%08x", stack_mem[sp+2]);
-	     $display("  stack[sp+3]=%08x", stack_mem[sp+3]);
-	     $display("  stack[sp+4]=%08x", stack_mem[sp+4]);
-	     $display("  heap[hp-1]=%08x", heap_mem[hp-1]);
-	     $display("  heap[hp-2]=%08x", heap_mem[hp-2]);
-	     $display("  heap[hp-3]=%08x", heap_mem[hp-3]);
-	     $display("  heap[hp-4]=%08x", heap_mem[hp-4]);
+	     $display("  instruction done, acc=0x%08x, pc=%d", accu, pc);
+	     $display("  stack[sp+0]=0x%08x", stack_mem[sp+0]);
+	     $display("  stack[sp+1]=0x%08x", stack_mem[sp+1]);
+	     $display("  stack[sp+2]=0x%08x", stack_mem[sp+2]);
+	     $display("  stack[sp+3]=0x%08x", stack_mem[sp+3]);
+	     $display("  stack[sp+4]=0x%08x", stack_mem[sp+4]);
+	     $display("  heap[hp-1]=0x%08x", heap_mem[hp-1]);
+	     $display("  heap[hp-2]=0x%08x", heap_mem[hp-2]);
+	     $display("  heap[hp-3]=0x%08x", heap_mem[hp-3]);
+	     $display("  heap[hp-4]=0x%08x", heap_mem[hp-4]);
 	     state <= S_FETCH;
 	  end
 	
