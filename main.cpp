@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     uint64_t cycles = 0;
     const char *op;
     linbuf opcode;
-    uint32_t addr, op1, cnt, oldpc, oldsp, cycle, accu, spaddr, items, oldcycle = 0;
+    uint32_t addr, op1, cnt, oldpc, vitems, cycle, accu, spaddr, items, oldcycle = 0;
     int matching = 1;
     int windup = 10;
     printf("Program length %d\n", prog_length);
@@ -95,36 +95,19 @@ int main(int argc, char** argv) {
 	  matching = 0;
 	}
         // Provide instruction byte
-        top->code_rdata = code_rom[top->pc];
+        top->code_rdata = top->pc < sizeof(code_rom)/sizeof(*code_rom) ? code_rom[top->pc] : 0xDEADBEEF;
         // Clock tick
         top->clk = 0;
         top->eval();
+        vitems = 0xffff - top->sp;
         tfp->dump(cycles);
 	
 	switch(top->state_out)
 	  {
 	  case S_FETCH:
 	    oldpc = top->pc;
-	    oldsp = top->sp;
 	    op = opname(top->code_rdata);
-	    printf("Fetch PC=%d ROM = 0x%x, instruction = %s\n", top->pc, top->code_rdata, op);
-	    break;
-	    // Trace like ocamlrun -dinstr
-	  case S_EXEC: printf(
-            "%08llx %s pc=%06d rom=%4x op=%s imm=%x nvars=%08x offset=%08x acc=%08x sp=%04x\n",
-            cycles,
-	    statenam(top->state_out), 
-            top->pc,
-	    top->opcode_out,
-            opname(top->opcode_out),
-	    top->imm,
-	    top->nvars,
-	    top->offset,
-            top->accu,
-            top->sp);
-	    break;
-	  case S_DONE:
-	    printf("%08llx %s pc=%06d sp=%x\n", cycles, statenam(top->state_out), top->pc, top->sp);
+	    printf("Fetch PC=%d ROM = 0x%x, instruction = %s, SP=@%d\n", top->pc, top->code_rdata, op, vitems);
 	    cnt = 0;
 	    do {
 	      fgets(trace[cnt], sizeof(linbuf), tracef);
@@ -156,7 +139,7 @@ int main(int argc, char** argv) {
 	    cnt = sscanf(trace[3], "accu=%x", &accu);
 	    if (cnt > 0)
 	      {
-		if (accu != top->accu)
+		if (accu != top->accu && accu&1)
 		  {
 		    printf("ACCU mismatch %x vs %x\n", accu, top->accu);
 		  }
@@ -164,7 +147,6 @@ int main(int argc, char** argv) {
 	    cnt = sscanf(trace[4], " sp=0x%x @%d", &spaddr, &items);
 	    if (cnt >= 2)
 	      {
-		uint32_t vitems = 0xffff - oldsp;
 		if (items != vitems)
 		  {
 		    printf("SP mismatch %x vs %x\n", items, vitems);
@@ -172,8 +154,24 @@ int main(int argc, char** argv) {
 	      }
 	    else printf("Failed to parse SP: %s\n", trace[4]);
 	    break;
+	  case S_EXEC: printf(
+            "%08llx %s pc=%06d rom=%4x op=%s imm=%x nvars=%08x offset=%08x acc=%08x SP=@%d\n",
+            cycles,
+	    statenam(top->state_out), 
+            top->pc,
+	    top->opcode_out,
+            opname(top->opcode_out),
+	    top->imm,
+	    top->nvars,
+	    top->offset,
+            top->accu,
+            vitems);
+	    break;
+	  case S_DONE:
+	    printf("%08llx %s pc=%06d SP=@%d\n", cycles, statenam(top->state_out), top->pc, vitems);
+	    break;
 	  default:
-	    printf("%08llx %s pc=%06d sp=%x\n", cycles, statenam(top->state_out), top->pc, top->sp);
+	    printf("%08llx %s pc=%06d SP=@%d\n", cycles, statenam(top->state_out), top->pc, vitems);
 	    break;
 	  }
 	

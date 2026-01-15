@@ -7,6 +7,7 @@
     // heap write micro-ops
     S_HEAP_ALLOC_HDR,
     S_HEAP_ALLOC_FIELDS,
+    S_HEAP_DONE,
     S_CLOSURE_ALLOC_HDR,
     S_CLOSURE_WRITE_CODE,
     S_CLOSURE_WRITE_CLOSINFO,

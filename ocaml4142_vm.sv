@@ -25,6 +25,8 @@ module ocaml4142_vm #(
   output logic [31:0]	      imm,
   output logic [31:0]	      nvars,
   output logic [31:0]	      offset,
+  output logic [31:0]	      alloc_wosize,
+  output logic [31:0]	      alloc_tag,
   output logic [31:0]	      closure_codeptr,
   output logic [7:0]	      closure_nvars,
   output logic [7:0]	      closure_i,
@@ -134,8 +136,6 @@ module ocaml4142_vm #(
   assign state_out = state;
   assign tos = stack_mem[sp];
   // For heap allocation micro-ops
-  int alloc_wosize;
-  int alloc_tag;
   int alloc_fields_left;
   logic [HEAP_AW-1:0] alloc_base;        // heap index of header
   logic [VALUEW-1:0]  alloc_result_ptr;  // returned pointer
@@ -190,6 +190,42 @@ module ocaml4142_vm #(
       end
    endtask;
 
+   task read_acc_from_heap;
+      input [31:0] ptr_value, offset_used;
+      begin
+      logic [VALUEW-1:0] read_value;
+      // Before the read
+      $display("  [HEAP_READ] op=%s ptr=0x%08x heap_idx=%d offset=%d", 
+	       opcode.name(), ptr_value, Heap_index_of_ptr(ptr_value), offset_used);
+
+      // After the read
+      read_value = heap_mem[Heap_index_of_ptr(ptr_value) + offset_used];
+      $display("  [HEAP_READ] addr=%d value=0x%08x is_header=%b", 
+	       Heap_index_of_ptr(ptr_value) + offset_used,
+	       read_value,
+	       (offset_used == 0));
+      accu <= read_value;
+      end
+   endtask // read_acc_from_heap
+
+   task read_pc_from_heap;
+      input [31:0] ptr_value, offset_used;
+      begin
+      logic [VALUEW-1:0] read_value;
+      // Before the read
+      $display("  [HEAP_READ] op=%s ptr=0x%08x heap_idx=%d offset=%d", 
+	       opcode.name(), ptr_value, Heap_index_of_ptr(ptr_value), offset_used);
+
+      // After the read
+      read_value = heap_mem[Heap_index_of_ptr(ptr_value) + offset_used];
+      $display("  [HEAP_READ] addr=%d value=0x%08x is_header=%b", 
+	       Heap_index_of_ptr(ptr_value) + offset_used,
+	       read_value,
+	       (offset_used == 0));
+      pc <= Codeptr_val(read_value);
+      end
+   endtask // read_acc_from_heap
+   
    task push_env;
       input [31:0] imm;
       begin
@@ -197,28 +233,35 @@ module ocaml4142_vm #(
 	 old_sp = sp;
 	 sp <= old_sp - 1;
 	 stack_mem[old_sp - 1] <= accu;               // push
-	 accu <= heap_mem[Heap_index_of_ptr(env)+1 + $signed(imm)];
+	 read_acc_from_heap(env, 1 + $signed(imm));
       end
    endtask;
 
    task caml_ml_open_descriptor_in;
       begin
 	 $display("caml_ml_open_descriptor_in");
-	 accu <= Val_int(0);  // Simple success value
+	 accu <= 32'hC0010000;  // Opaque pointer
       end
    endtask // caml_ml_open_descriptor_in
 
    task caml_ml_open_descriptor_out;
       begin
 	 $display("caml_ml_open_descriptor_out");
-	 accu <= Val_int(1);  // Simple success value
+	 accu <= 32'hF00D0000;  // Opaque pointer
       end
    endtask // caml_ml_open_descriptor_out
    
    task caml_ml_output_char;
       begin
 	 $display("caml_ml_output_char %c (%d)", Int_val(tos), Int_val(tos));
-	 accu <= Val_int(1);  // Simple success value
+	 accu <= Val_int(0);  // Unit value
+      end
+   endtask // caml_ml_output_char
+   
+   task caml_ml_flush;
+      begin
+	 $display("caml_ml_flush");
+	 accu <= Val_int(0);  // Unit value
       end
    endtask // caml_ml_output_char
       
@@ -242,7 +285,8 @@ module ocaml4142_vm #(
       imm_b      <= '0;
       nvars      <= '0;
       offset     <= '0;
-
+      alloc_wosize     <= '0;
+      alloc_tag  <= '0;
       accu       <= VAL_UNIT;
       env        <= '0;
       extra_args <= 8'd0;
@@ -265,6 +309,9 @@ module ocaml4142_vm #(
           imm <= '0;
           nvars <= '0;
           offset <= '0;
+	  alloc_wosize <= '0;
+	  alloc_tag <= '0;
+	   
 	  $display("  at fetch, acc=0x%08x, pc=%d, bytecode=%d", accu, pc, code_rdata);
 	  $display("  stack[sp+0]=0x%08x", stack_mem[sp+0]);
 	  $display("  stack[sp+1]=0x%08x", stack_mem[sp+1]);
@@ -294,6 +341,10 @@ module ocaml4142_vm #(
 		 // CLOSUREREC has nfuncs and nvars
 		 imm <= code_rdata;  // nfuncs
 		 pc <= pc + 1;
+	      end else if (opcode == MAKEBLOCK) begin
+		 // MAKEBLOCK has wosize and tag
+		 alloc_wosize <= code_rdata;  // wosize
+		 pc <= pc + 1;
 	      end else if (opcode == BEQ || opcode == BNEQ || 
                            opcode == BLTINT || opcode == BLEINT ||
                            opcode == BGTINT || opcode == BGEINT ||
@@ -321,6 +372,11 @@ module ocaml4142_vm #(
 	    offset <= code_rdata;
 	    pc <= pc + 1;
             state <= S_EXEC;
+          end else if (opcode == MAKEBLOCK) begin
+            // second imm (tag)
+	    alloc_tag <= code_rdata;
+	    pc <= pc + 1;
+            state <= S_EXEC;
           end else if (opcode == BEQ || opcode == BNEQ || opcode == BRANCHIF ||
                        opcode == BLTINT || opcode == BLEINT || opcode == BRANCHIFNOT ||
                        opcode == BGTINT || opcode == BGEINT || opcode == BRANCH ||
@@ -328,10 +384,6 @@ module ocaml4142_vm #(
             // Second immediate is the offset - sign extend from byte
 	    offset <= code_rdata;
 	    pc <= pc + 1;
-            state <= S_EXEC;
-          end else if (opcode == MAKEBLOCK) begin
-            // first imm
-	    pc <= pc + 2;
             state <= S_EXEC;
           end else begin
             imm   <= code_rdata;
@@ -388,19 +440,19 @@ module ocaml4142_vm #(
             // ---- ENVACC ----
             // env is a pointer to a block: field[k] is at heap[base+1+k]
             ENVACC1: begin
-              accu <= heap_mem[Heap_index_of_ptr(env) + 1 + 1];
+	       read_acc_from_heap(env, 1 + 1);
             end
             ENVACC2: begin
-              accu <= heap_mem[Heap_index_of_ptr(env) + 1 + 2];
+	       read_acc_from_heap(env, 1 + 2);
             end
             ENVACC3: begin
-              accu <= heap_mem[Heap_index_of_ptr(env) + 1 + 3];
+	       read_acc_from_heap(env, 1 + 3);
             end
             ENVACC4: begin
-              accu <= heap_mem[Heap_index_of_ptr(env) + 1 + 4];
+	       read_acc_from_heap(env, 1 + 4);
             end
             ENVACC: begin
-              accu <= heap_mem[Heap_index_of_ptr(env) + 1 + imm];
+	       read_acc_from_heap(env, 1 + imm);
             end
 
             PUSHENVACC1: push_env(1);
@@ -567,14 +619,18 @@ module ocaml4142_vm #(
                stack_mem[old_sp - 1] <= globals_mem[imm];
                accu <= globals_mem[imm];
             end
-            SETGLOBAL: globals_mem[imm] <= accu;
+            SETGLOBAL:
+	      begin
+		 globals_mem[imm] <= accu;
+		 accu = Val_int(0);
+	      end
 
             // ---- Field ops ----
-            GETFIELD0: accu <= heap_mem[Heap_index_of_ptr(accu) + 1 + 0];
-            GETFIELD1: accu <= heap_mem[Heap_index_of_ptr(accu) + 1 + 1];
-            GETFIELD2: accu <= heap_mem[Heap_index_of_ptr(accu) + 1 + 2];
-            GETFIELD3: accu <= heap_mem[Heap_index_of_ptr(accu) + 1 + 3];
-            GETFIELD:  accu <= heap_mem[Heap_index_of_ptr(accu) + 1 + imm];
+            GETFIELD0: read_acc_from_heap(accu, 1 + 0);
+            GETFIELD1: read_acc_from_heap(accu, 1 + 1);
+            GETFIELD2: read_acc_from_heap(accu, 1 + 2);
+            GETFIELD3: read_acc_from_heap(accu, 1 + 3);
+            GETFIELD:  read_acc_from_heap(accu, 1 + imm);
 
             SETFIELD0: heap_mem[Heap_index_of_ptr(accu) + 1 + 0] <= tos;
             SETFIELD1: heap_mem[Heap_index_of_ptr(accu) + 1 + 1] <= tos;
@@ -649,9 +705,9 @@ module ocaml4142_vm #(
             // In real OCaml closures are blocks; OFFSETCLOSUREk loads env[k] / closure pointer arithmetic.
             // Here we interpret OFFSETCLOSURE0 as "accu := env"
             OFFSETCLOSURE0: accu <= env;
-            OFFSETCLOSURE3: accu <= heap_mem[Heap_index_of_ptr(env) + 1 + 3];
-            OFFSETCLOSUREM3: accu <= heap_mem[Heap_index_of_ptr(env) + 1 + ( -3 )]; // likely invalid; keep placeholder
-            OFFSETCLOSURE: accu <= heap_mem[Heap_index_of_ptr(env) + 1 + imm];
+            OFFSETCLOSURE3: read_acc_from_heap(env, 1 + 3);
+            OFFSETCLOSUREM3: read_acc_from_heap(env, 1 - 3); // likely invalid; keep placeholder
+            OFFSETCLOSURE: read_acc_from_heap(env, 1 + imm);
             
             // PUSHOFFSETCLOSURE0: push accu, then load env to accu
             PUSHOFFSETCLOSURE0: begin
@@ -688,7 +744,7 @@ module ocaml4142_vm #(
               
               // Set up callee
               env <= accu;  // Field(accu, 1)
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);  // Field(accu, 0)
+               read_pc_from_heap(accu, 1 + 0); // Field(accu, 0)
               extra_args <= imm - 1;
             end
 
@@ -710,13 +766,7 @@ module ocaml4142_vm #(
 	      sp <= sp - 3;
 
 	      // Jump to closure
-	      base = Heap_index_of_ptr(accu);
-	       code_ptr = heap_mem[base + 1];
-	       target_pc = Codeptr_val(code_ptr);
-  
-	       $display("APPLY1: code_ptr=0x%08x -> PC=%d", code_ptr, target_pc);
-  
-	       pc <= target_pc;
+	      read_pc_from_heap(accu, 1);
 	      env <= accu;
 	      extra_args <= 0;
 	    end
@@ -727,7 +777,7 @@ module ocaml4142_vm #(
               stack_mem[sp-3] <= Val_int(extra_args);
               sp <= sp - 3;
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+	      read_pc_from_heap(accu, 1);
               extra_args <= 8'd1;
             end
 
@@ -737,7 +787,7 @@ module ocaml4142_vm #(
               stack_mem[sp-3] <= Val_int(extra_args);
               sp <= sp - 3;
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+	      read_pc_from_heap(accu, 1);
               extra_args <= 8'd2;
             end
 
@@ -750,7 +800,7 @@ module ocaml4142_vm #(
               sp <= sp + imm_b;
 
               env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+	      read_pc_from_heap(accu, 1);
               extra_args <= imm - 1;
             end
 
@@ -763,7 +813,7 @@ module ocaml4142_vm #(
               stack_mem[sp + imm - 1] <= arg1;
               
               env <= accu;
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+	      read_pc_from_heap(accu, 1);
             end // case: APPTERM1
 	    
             APPTERM2: begin
@@ -776,7 +826,7 @@ module ocaml4142_vm #(
               stack_mem[sp + imm - 1] <= arg2;
               
               env <= accu;
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+	      read_pc_from_heap(accu, 1);
               extra_args <= extra_args + 8'd1;
             end // case: APPTERM2
 	    
@@ -792,7 +842,7 @@ module ocaml4142_vm #(
               stack_mem[sp + imm - 1] <= arg3;
               
               env <= accu;
-              pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+	      read_pc_from_heap(accu, 1);
               extra_args <= extra_args + 8'd2;
             end
 
@@ -803,7 +853,7 @@ module ocaml4142_vm #(
                 extra_args <= extra_args - 1;
                 // For partial application, reload closure from accu
                 env <= heap_mem[Heap_index_of_ptr(accu) + 2];
-                pc  <= Codeptr_val(heap_mem[Heap_index_of_ptr(accu) + 1]);
+		read_pc_from_heap(accu, 1);
                 sp  <= sp + imm;  // Pop locals
               end else begin
                 // Normal return: pop locals, then restore frame
@@ -859,11 +909,11 @@ module ocaml4142_vm #(
             C_CALL1:
 	      begin
 		 unique case (imm)
+		      16'h0fd: caml_ml_flush();
 		      16'h103: caml_ml_open_descriptor_in();
 		      16'h104: caml_ml_open_descriptor_out();
 		   default: $display("Unsupported C_CALL1: 0x%x", imm);
 		   endcase
-              // Return a dummy file descriptor value (3 = stdout equivalent)
               end
             
             C_CALL2:
@@ -905,12 +955,8 @@ module ocaml4142_vm #(
 
 	    MAKEBLOCK:
 	      begin
-		 alloc_base <= hp;
-		 heap_mem[hp] <= Make_header(1, imm);
-		 heap_mem[hp+1] <= accu;
-		 hp <= hp + 2;
-		 accu <= alloc_base;
-		 $display("MAKEBLOCK placeholder");
+		 $display("MAKEBLOCK %d,%d", alloc_wosize, alloc_tag);
+		 state <= S_HEAP_ALLOC_HDR;
 	      end
 
 	    MAKEBLOCK1:
@@ -918,7 +964,8 @@ module ocaml4142_vm #(
 		 alloc_base <= hp;
 		 heap_mem[hp] <= Make_header(1, imm);
 		 heap_mem[hp+1] <= accu;
-		 hp <= hp + 2;
+		 heap_mem[hp+2] <= 32'hDEADBEEF;
+		 hp <= hp + 3;
 		 accu <= alloc_base;
 	      end
 
@@ -928,7 +975,8 @@ module ocaml4142_vm #(
 		 heap_mem[hp] <= Make_header(2, imm);
 		 heap_mem[hp+1] <= accu;
 		 heap_mem[hp+2] <= stack_mem[sp + 0];
-		 hp <= hp + 3;
+		 heap_mem[hp+3] <= 32'hDEADBEEF;
+		 hp <= hp + 4;
 		 sp <= sp + 1;
 		 accu <= alloc_base;
 	      end
@@ -940,7 +988,8 @@ module ocaml4142_vm #(
 		 heap_mem[hp+1] <= accu;
 		 heap_mem[hp+2] <= stack_mem[sp + 0];
 		 heap_mem[hp+3] <= stack_mem[sp + 1];
-		 hp <= hp + 4;
+		 heap_mem[hp+4] <= 32'hDEADBEEF;
+		 hp <= hp + 5;
 		 sp <= sp + 2;
 		 accu <= alloc_base;
 	      end
@@ -983,10 +1032,18 @@ module ocaml4142_vm #(
         end
 
         S_HEAP_ALLOC_FIELDS: begin
+//	  $display("Alloc fields left = %d/%d", alloc_fields_left, alloc_wosize);
           // For the closure case: write field0, then field1, then optional env vars.
           if (alloc_fields_left == alloc_wosize) begin
             // field0: code pointer
-            heap_mem[hp] <= pending_field;
+            if (opcode == CLOSUREREC) begin
+               heap_mem[hp] <= pending_field;
+            end else if (opcode == CLOSURE) begin
+               heap_mem[hp] <= pending_field;
+            end else begin
+	       heap_mem[hp] <= tos;
+	       sp <= sp + 1;
+	    end	     
             hp <= hp + 1;
             alloc_fields_left <= alloc_fields_left - 1;
             
@@ -994,9 +1051,11 @@ module ocaml4142_vm #(
             // field1: for CLOSUREREC, point to self; for CLOSURE, use env
             if (opcode == CLOSUREREC) begin
               heap_mem[hp] <= Val_int(2);
-            end else begin
+            end else if (opcode == CLOSURE) begin
               heap_mem[hp] <= env; // normal CLOSURE case
-            end
+            end else begin // MAKEBLOCK and friends
+	       heap_mem[hp] <= Val_int(0); // TBD
+	    end
             hp <= hp + 1;
             alloc_fields_left <= alloc_fields_left - 1;
             
@@ -1011,10 +1070,14 @@ module ocaml4142_vm #(
               hp <= hp + 1;
               closure_i <= closure_i + 1;
               alloc_fields_left <= alloc_fields_left - 1;
-            end else begin
+            end else if (opcode == CLOSURE) begin
               // No more fields to write, we're done
               alloc_fields_left <= 0;
-            end
+            end else begin
+	       heap_mem[hp] <= tos;
+	       sp <= sp + 1;
+               alloc_fields_left <= alloc_fields_left - 1;
+	    end
             
           end else begin
             // All fields written, finalize
@@ -1039,9 +1102,15 @@ module ocaml4142_vm #(
               closurerec_push <= 1'b0;
             end
             
-            state <= S_DONE;
+            state <= S_HEAP_DONE;
           end
         end
+
+	S_HEAP_DONE: begin
+	   heap_mem[hp] <= 32'hDEADBEEF;
+	   hp <= hp + 1;
+	   state <= S_DONE;
+	end
 
 	S_CLOSURE_ALLOC_HDR: begin
 	   heap_mem[hp] <= Make_header(2 + closure_nvars, TAG_CLOSURE);
@@ -1077,6 +1146,8 @@ module ocaml4142_vm #(
 	S_CLOSURE_DONE: begin
 	   accu <= alloc_result_ptr;
 	   sp <= sp + closure_nvars;  // Pop the captured variables (C code: sp += nvars;)
+	   heap_mem[hp] <= 32'hDEADBEEF;
+	   hp <= hp + 1;
 	   state <= S_DONE;
 	end
 
