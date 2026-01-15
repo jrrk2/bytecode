@@ -50,7 +50,7 @@ const char *statenam(int state)
 
 typedef char linbuf[256];
 
-linbuf trace[30];
+linbuf trace[4096];
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
@@ -112,7 +112,8 @@ int main(int argc, char** argv) {
 	    do {
 	      fgets(trace[cnt], sizeof(linbuf), tracef);
 	      printf("Trace %s", trace[cnt]);
-	    } while (cnt < sizeof(trace)/sizeof(*trace) && strlen(trace[cnt++]) > 1);
+	      
+	    } while (cnt < sizeof(trace)/sizeof(*trace) && ((cnt == 0 && trace[cnt][0] != '#') || strlen(trace[cnt++]) > 1));
 	    
 	    cnt = sscanf(trace[0], "##%d", &cycle);
 	    if (!cnt || cycle != oldcycle+1)
