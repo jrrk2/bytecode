@@ -12,6 +12,6 @@ obj_dir/Vocaml4142_vm.mk: bytecode.o prims.o main.cpp ocaml4142_vm.sv ocaml_4142
 obj_dir/Vocaml4142_vm_rtl: bytecode.o prims.o obj_dir/Vocaml4142_vm_rtl.mk
 	make -C obj_dir -f Vocaml4142_vm_rtl.mk
 
-obj_dir/Vocaml4142_vm_rtl.mk: bytecode.o prims.o main_rtl.cpp ocaml4142_vm_rtl.sv ocaml_4142_opcodes.svh
+obj_dir/Vocaml4142_vm_rtl.mk: bytecode.o prims.o main_rtl.cpp ocaml4142_vm_rtl.sv ocaml_4142_opcodes.svh state_rtl_complete.h
 	verilator -CFLAGS -g --exe --trace --Wno-widthtrunc --Wno-widthexpand --Wno-multidriven --Wno-BLKANDNBLK --cc -I. -Irtl_instructions ocaml4142_vm_rtl.sv main_rtl.cpp ../bytecode.o ../prims.o ../ocaml-4.14.2/runtime/libcamlrund.a
 

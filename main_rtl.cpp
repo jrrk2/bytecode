@@ -123,6 +123,8 @@ const char *statenam(int state)
     case S_CLOSURE_DONE: return "S_CLOSURE_DONE";
     case S_CLOSUREREC_CALC: return "S_CLOSUREREC_CALC";
 
+    case S_PUSH_RETADDR_WRITE_FRAME: return "S_PUSH_RETADDR_WRITE_FRAME";   // Write return frame
+
     // Trap / ccall
     case S_TRAP_WAIT: return "S_TRAP_WAIT";
 
@@ -132,7 +134,7 @@ const char *statenam(int state)
     case S_OFFSETCLOSURE_ADD: return "S_OFFSETCLOSURE_ADD";
     // Unknown state for debugging
     case S_UNKNOWN: return "S_UNKNOWN";
-    default: return "S_NOT_SUPPORTED";
+    default: return "S_NOT_DOCUMENTED";
     }
 }
 

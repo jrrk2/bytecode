@@ -96,6 +96,7 @@
     S_CLOSURE_DONE,
     S_CLOSUREREC_CALC,
 
+    S_PUSH_RETADDR_WRITE_FRAME,
     // Trap / ccall
     S_TRAP_WAIT,
 

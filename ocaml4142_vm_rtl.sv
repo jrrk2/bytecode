@@ -224,115 +224,7 @@ endfunction
    
    
   typedef enum logic [6:0] 
- 
-{
-     
-    S_FETCH,
-    S_DECIDE_IMM,
-    S_FETCH_IMM,
-    S_EXEC,
-    S_DONE,
-
-     
-    S_STACK_READ,            
-    S_HEAP_READ,             
-    S_GLOBALS_READ,          
-
-     
-    S_PUSHACC_WRITE,         
-    S_PUSHACC_READ,          
-    
-     
-    S_ENVACC_DONE,           
-    S_GETFIELD_DONE,         
-    S_OFFSETREF_ADD,         
-    S_OFFSETCLOSURE_CALC,    
-    
-     
-    S_MAKEBLOCK_READ_STACK,  
-    S_MAKEBLOCK_WRITE_HDR,        
-    S_MAKEBLOCK_WRITE_FIELD,     
-    
-     
-    S_MAKEBLOCK1_FIELD,      
-    
-     
-    S_MAKEBLOCK2_HDR,        
-    S_MAKEBLOCK2_FIELDS,     
-    
-     
-    S_MAKEBLOCK3_READ_STACK,  
-    S_MAKEBLOCK3_HDR,        
-    S_MAKEBLOCK3_FIELDS,     
-    
-     
-    S_APPTERM_READ_CODE,     
-    S_APPTERM_READ_ARGS,     
-    S_APPTERM_WRITE_ARGS,    
-    S_APPTERM_SET_PC,        
-    
-     
-    S_APPTERM1_ADJUST,       
-    S_APPTERM1_WRITE,        
-    S_APPTERM1_SETPC,        
-    
-     
-    S_APPTERM2_READ_ARGS,    
-    S_APPTERM2_WRITE_ARGS,   
-    S_APPTERM2_SETPC,        
-    
-     
-    S_APPTERM3_READ_ARGS,    
-    S_APPTERM3_WRITE_ARGS,   
-    S_APPTERM3_SETPC,        
-    
-     
-    S_APPLY_READ_CODE,       
-    S_APPLY_WRITE_FRAME,     
-    S_APPLY_SET_PC,          
-    
-     
-    S_APPLY1_WRITE_FRAME,    
-    S_APPLY1_SETPC,          
-    
-     
-    S_APPLY2_WRITE_FRAME,    
-    S_APPLY2_SETPC,          
-    
-     
-    S_APPLY3_WRITE_FRAME,    
-    S_APPLY3_SETPC,          
-    
-     
-    S_RETURN_READ_FRAME,     
-    S_RETURN_RESTORE,        
-    S_RETURN_READ_PC,        
-    S_RETURN_READ_ENV,       
-    S_RETURN_READ_EXTRA,       
-    S_RETURN_SET_STATE,      
-    
-     
-    S_HEAP_ALLOC_HDR,        
-    S_HEAP_ALLOC_FIELDS,     
-    
-     
-    S_CLOSURE_ALLOC_HDR,
-    S_CLOSURE_WRITE_CODE,
-    S_CLOSURE_WRITE_CLOSINFO,
-    S_CLOSURE_WRITE_ENV,
-    S_CLOSURE_DONE,
-    S_CLOSUREREC_CALC,
-
-     
-    S_TRAP_WAIT,
-
-     
-    S_HEAP_DONE,
-    S_OFFSETCLOSURE_READ,
-    S_OFFSETCLOSURE_ADD,
-     
-    S_UNKNOWN
-} state_t;
+`include "state_rtl_complete.h" 
 
   state_t state;
   assign state_out = state;
@@ -704,6 +596,13 @@ end
 
 	  
  
+
+APPLY: begin
+   extra_args <= imm - 1;
+   state <= S_HEAP_READ;
+   next_state_after_mem <= S_APPLY1_SETPC;
+end
+ 
  
 
 APPLY1: begin
@@ -712,6 +611,11 @@ APPLY1: begin
    state <= S_APPLY1_WRITE_FRAME;
 end
 
+
+PUSH_RETADDR: begin
+   op_cycle_count <= 0;
+   state <= S_PUSH_RETADDR_WRITE_FRAME;
+end
  
  
  
@@ -1696,13 +1600,6 @@ end
 	    ATOM0:
 	      begin
 	      end
-
-	    PUSH_RETADDR:
-	      begin
-	      end
-	    
-             
-             
              
             CLOSURE: begin
               closure_nvars   <= nvars;
@@ -2366,6 +2263,26 @@ end
  
  
  
+
+
+S_PUSH_RETADDR_WRITE_FRAME: begin
+  case (op_cycle_count)
+    0: begin
+      stack_mem[sp - 3] <= Make_codeptr($signed(pc-1) + $signed(imm));
+      op_cycle_count <= 1;
+    end
+    1: begin
+      stack_mem[sp - 2] <= env;
+      op_cycle_count <= 2;
+    end
+    2: begin
+      stack_mem[sp - 1] <= Val_int(extra_args);
+      sp <= sp - 3;
+      state <= S_DONE;
+    end
+  endcase
+end
+	    
 
 	
 	S_DONE:
