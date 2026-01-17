@@ -155,6 +155,14 @@ endfunction
     Is_int = v[0];
   endfunction
 
+  function automatic logic [VALUEW-1:0] Wosize_hd(input logic [VALUEW-1:0] hdr);
+    Wosize_hd = hdr[VALUEW-1:10];  // Extract size from header bits [31:10]
+  endfunction
+
+  function automatic logic [VALUEW-1:0] Val_long(input logic [VALUEW-1:0] n);
+    Val_long = (n << 1) | 1;  // Tag as OCaml integer
+  endfunction
+   
   localparam logic [VALUEW-1:0] VAL_FALSE = Val_int(0);
   localparam logic [VALUEW-1:0] VAL_TRUE  = Val_int(1);
   localparam logic [VALUEW-1:0] VAL_UNIT  = Val_int(0);  
@@ -247,6 +255,10 @@ endfunction
   logic [VALUEW-1:0] temp_field1, temp_field2, temp_field3;
   logic [VALUEW-1:0] temp_stack_val;
   logic [VALUEW-1:0] temp_heap_val;
+  logic [VALUEW-1:0] temp_value;
+  logic [VALUEW-1:0] temp_index;
+  logic [VALUEW-1:0] temp_array_ptr;
+  logic [VALUEW-1:0] temp_base_ptr;
   logic [VALUEW-1:0] temp_return_pc, temp_return_env;
   logic [7:0] temp_extra_args;
   
@@ -599,6 +611,7 @@ end
 
 APPLY: begin
    extra_args <= imm - 1;
+   temp_heap_addr <= Heap_index_of_ptr(accu) + 1;  // Read closure[1]
    state <= S_HEAP_READ;
    next_state_after_mem <= S_APPLY1_SETPC;
 end
@@ -1545,10 +1558,29 @@ SETFIELD: begin
   heap_mem[Heap_index_of_ptr(accu) + 1 + imm] <= tos;
   state <= S_DONE;
 end
-
 	    
+VECTLENGTH: begin
+  temp_heap_addr <= Heap_index_of_ptr(accu);
+  state <= S_HEAP_READ;
+  next_state_after_mem <= S_VECTLENGTH_CALC;
+end
+
+S_VECTLENGTH_CALC: begin
+  // temp_heap_val now contains the header
+  // Header format: [31:10] = wosize, [9:2] = color, [1:0] = tag low bits
+  accu <= Val_long(Wosize_hd(temp_heap_val));
+  state <= S_DONE;
+end
              
-             
+GETVECTITEM: begin
+  temp_index <= Int_val(stack_mem[sp]);  // Get index from stack
+  temp_array_ptr <= accu;  // Save array pointer
+  sp <= sp + 1;  // Pop index from stack
+  // Read from array[index + 1] (skip header at index 0)
+  temp_heap_addr <= Heap_index_of_ptr(accu) + Int_val(stack_mem[sp]) + 1;
+  state <= S_HEAP_READ;
+  next_state_after_mem <= S_GETVECTITEM_DONE;
+end
              
             C_CALL1:
 	      begin
@@ -2284,6 +2316,26 @@ S_PUSH_RETADDR_WRITE_FRAME: begin
 end
 	    
 
+S_GETVECTITEM_DONE: begin
+  accu <= temp_heap_val;  // Array element now in accu
+  state <= S_DONE;
+end
+
+SETVECTITEM: begin
+  temp_index <= Int_val(stack_mem[sp]);
+  temp_value <= stack_mem[sp + 1];
+  temp_base_ptr <= accu;
+  state <= S_SETVECTITEM_WRITE;
+end
+
+S_SETVECTITEM_WRITE: begin
+  // Write to array[index + 1] (skip header)
+  heap_mem[Heap_index_of_ptr(temp_base_ptr) + temp_index + 1] <= temp_value;
+  sp <= sp + 2;  // Pop index and value
+  accu <= VAL_UNIT;
+  state <= S_DONE;
+end
+             
 	
 	S_DONE:
 	  begin

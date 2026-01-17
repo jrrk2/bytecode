@@ -19,6 +19,7 @@ old/
 stubs.ml
 *.py
 .DS_Store
+array
 fact
 hellofor
 print

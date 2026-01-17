@@ -61,6 +61,16 @@ module ocaml4142_vm #(
     Is_int = v[0];
   endfunction
 
+  function automatic logic [VALUEW-1:0] Wosize_hd(input logic [VALUEW-1:0] hdr);
+    Wosize_hd = hdr[VALUEW-1:10];  // Extract size from header bits [31:10]
+  endfunction
+
+  function automatic logic [VALUEW-1:0] Val_long(input logic [VALUEW-1:0] n);
+    Val_long = (n << 1) | 1;  // Tag as OCaml integer
+  endfunction
+
+  parameter Val_unit = 1;  // OCaml unit value
+
   localparam logic [VALUEW-1:0] VAL_FALSE = Val_int(0);
   localparam logic [VALUEW-1:0] VAL_TRUE  = Val_int(1);
   localparam logic [VALUEW-1:0] VAL_UNIT  = Val_int(0); // acceptable for now
@@ -106,9 +116,10 @@ module ocaml4142_vm #(
   // Header pack: [31:16]=wosize, [7:0]=tag (simple)
   function automatic logic [VALUEW-1:0] Make_header(input int wosize, input int tag);
      logic [7:0]      tag8 = tag;
+     logic [1:0]      color = 0;
      logic [15:0]     wosize16 = wosize;
      
-    Make_header = { wosize16, 8'd0, tag8 };
+    Make_header = { wosize16, color, tag8 };
   endfunction
 
   // Closure representation (simplified):
@@ -262,15 +273,42 @@ module ocaml4142_vm #(
 	 $display("caml_ml_flush");
 	 accu <= Val_int(0);  // Unit value
       end
-   endtask // caml_ml_output_char
+   endtask // caml_ml_flush
       
    task caml_string_get;
       begin
 	 $display("caml_string_get %x %x", accu, Int_val(tos));
 	 accu <= Val_int(1);  // Simple success value
       end
+   endtask // caml_string_get
+      
+   task caml_obj_dup;
+      begin
+	 logic [31:0] hdr, len, i;
+	 $display("caml_obj_dup");
+	 hdr = heap_mem[Heap_index_of_ptr(accu)];
+	 $display("obj header is %x", hdr);
+	 accu <= Ptr_of_heap_index(hp);
+	 len = Wosize_hd(hdr);
+	 for (i = 0; i < len; i=i+1)
+	   begin
+	   heap_mem[hp+i] <= heap_mem[hdr+i];
+	   end
+      end
    endtask // caml_ml_output_char
    
+   task caml_array_get_addr;
+      begin
+	 logic [31:0] array, index, idx;
+	 array = stack_mem[sp];
+	 index = stack_mem[sp+1];
+	 
+	 $display("caml_array_get_addr(%x,%x)", array, index);
+	 idx = Int_val(index);
+	 read_acc_from_heap(array, idx+1);
+	 accu <= Val_int(0);  // Unit value
+      end
+   endtask // caml_array_get_addr
    
   // ----------------------------
   // Main FSM
@@ -902,6 +940,32 @@ module ocaml4142_vm #(
               trapsp <= stack_mem[trapsp][STACK_AW-1:0];
             end
 
+	    VECTLENGTH: begin
+	      // accu is ptr to block. Read header, extract size.
+	      logic [31:0] hdr;
+	      hdr = heap_mem[Heap_index_of_ptr(accu)];
+	      $display("vector header is %x", hdr);
+	      accu <= Val_int(Wosize_hd(hdr));
+	    end
+
+	    GETVECTITEM: begin
+	      logic [31:0] idx, vec;
+	      vec = accu;
+	      idx = Int_val(stack_mem[sp]);
+	      sp <= sp + 1;
+	      accu <= heap_mem[Heap_index_of_ptr(vec) + idx + 1];
+	    end
+
+	    SETVECTITEM: begin
+	      logic [31:0] idx, vec, val;
+	      vec = accu;
+	      idx = Int_val(stack_mem[sp]);
+	      val = stack_mem[sp + 1];
+	      sp <= sp + 2;
+	      heap_mem[Heap_index_of_ptr(vec) + idx + 1] <= val;
+	      accu <= Val_unit;
+	    end
+
             // ---- C calls / primitives ----
             // For now, C primitives just return dummy values
             // In a real implementation, these would call external C functions
@@ -911,7 +975,12 @@ module ocaml4142_vm #(
 		      16'h0fd: caml_ml_flush();
 		      16'h103: caml_ml_open_descriptor_in();
 		      16'h104: caml_ml_open_descriptor_out();
-		   default: $display("Unsupported C_CALL1: 0x%x", imm);
+		      16'h136: caml_obj_dup();
+		   default:
+		     begin
+			$display("Unsupported C_CALL1: 0x%x", imm);
+			$finish;
+		     end
 		   endcase
               end
             
@@ -920,35 +989,60 @@ module ocaml4142_vm #(
 		 unique case (imm)
 		      16'h108: caml_ml_output_char();
 		      16'h15b: caml_string_get();
-		   default: $display("Unsupported C_CALL2: 0x%x", imm);
+		      16'h00d: caml_array_get_addr();
+		   default:
+		     begin
+			$display("Unsupported C_CALL2: 0x%x", imm);
+			$finish;
+		     end
 		   endcase
 		 sp += 1;
 	      end
             
             C_CALL3:
 	      begin
-              // Return unit value for other C calls
-		 accu <= VAL_UNIT;
+		 unique case (imm)
+		   default:
+		     begin
+			$display("Unsupported C_CALL3: 0x%x", imm);
+			$finish;
+		     end
+		   endcase
 		 sp += 2;
 	      end
             
             C_CALL4:
 	      begin
-              // Return unit value for other C calls
-		 accu <= VAL_UNIT;
+		 unique case (imm)
+		   default:
+		     begin
+			$display("Unsupported C_CALL4: 0x%x", imm);
+			$finish;
+		     end
+		   endcase
 		 sp += 3;
 	      end
             
             C_CALL5:
 	      begin
-              // Return unit value for other C calls
-		 accu <= VAL_UNIT;
+		 unique case (imm)
+		   default:
+		     begin
+			$display("Unsupported C_CALL5: 0x%x", imm);
+			$finish;
+		     end
+		   endcase
 		 sp += 4;
 	      end
             
             C_CALLN: begin
-              // Return unit value for CALLN
-              accu <= VAL_UNIT;
+		 unique case (imm)
+		   default:
+		     begin
+			$display("Unsupported C_CALLN: 0x%x", imm);
+			$finish;
+		     end
+		   endcase
 		 sp += imm;
             end
 
@@ -1003,7 +1097,7 @@ module ocaml4142_vm #(
             end
 
             default: begin
-              $display("almost complete, unhandled ops go to trap instead of silently wrong behavior.");
+              $display("Unhandled op %d goes to trap instead of silently wrong behavior.", opcode);
               trap_valid <= 1'b1;
               trap_prim  <= 8'hFF; // illegal/unimplemented
               trap_arg0  <= Val_int(opcode);

@@ -97,6 +97,11 @@
     S_CLOSUREREC_CALC,
 
     S_PUSH_RETADDR_WRITE_FRAME,
+    // arrays
+    S_VECTLENGTH_CALC,
+    S_GETVECTITEM_DONE,
+    S_SETVECTITEM_WRITE,
+
     // Trap / ccall
     S_TRAP_WAIT,
 
