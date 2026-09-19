@@ -338,6 +338,7 @@ module ocaml4142_vm_rtl #(
   logic [2:0] gc_phase;
   localparam logic [2:0] GC_ACCU = 0, GC_ENV = 1, GC_STACK = 2, GC_GLOBALS = 3, GC_SCAN = 4;
   logic gc_return_to_scan;  // where S_GC_FWD's result goes
+  logic [15:0] gc_infix_off;  // gc_val pointed at an infix header this many words into its block
   localparam logic [7:0] GC_FORWARDED = 8'hFF;  // header colour of a copied block
   localparam int NO_SCAN_TAG = 251;             // strings, floats, custom: no pointers inside
   int gc_count;
@@ -428,13 +429,23 @@ module ocaml4142_vm_rtl #(
   // The remaining fields are accu (if alloc_use_accu), then sp[0], sp[1], ...
   // (OCaml 4.14's MAKEBLOCK, CLOSURE, which pushes accu first, and GRAB).
   logic [15:0] alloc_i;        // the field being written
-  logic [ 1:0] alloc_prefix;   // 0 for blocks, 2 for closures, 3 for GRAB
+  logic [15:0] alloc_prefix;   // 0 for blocks, 2 for closures, 3 for GRAB, 3f-1 for CLOSUREREC
+  // CLOSUREREC with f functions: one block of f closures -- code, closinfo,
+  // then for each further function an infix header, code and closinfo --
+  // and the shared variables.  alloc_table is the offset table after the
+  // instruction; alloc_fn_i/alloc_phase track the triple being written.
+  logic [ 7:0] alloc_nfuncs;   // 0: not a CLOSUREREC
+  logic [PCW-1:0] alloc_table;
+  logic [ 7:0] alloc_fn_i;
+  logic [ 1:0] alloc_phase;    // (field + 1) mod 3: 0 infix header, 1 code, 2 closinfo
+  logic [ 7:0] alloc_push_i;   // CLOSUREREC: results pushed so far
+  localparam int INFIX_TAG = 249;
   logic        alloc_use_accu;
   logic [PCW-1:0] alloc_code;  // a closure's code
   logic        alloc_push_result;  // CLOSUREREC pushes the closure too
   logic        alloc_then_return;  // GRAB returns the closure to its caller
   logic [ 7:0] restart_n;          // RESTART: arguments saved in the closure
-  localparam logic [VALUEW-1:0] CLOSINFO = 32'h5;  // Make_closinfo(0, 2): env from field 2  // second operand of APPTERM, (PUSH)GETGLOBALFIELD, C_CALLN, GETPUBMET
+  localparam logic [VALUEW-1:0] CLOSINFO = 32'h5;  // Make_closinfo(0, 2): env from field 2
 
   logic [VALUEW-1:0] temp_arg1, temp_arg2, temp_arg3;
   logic [VALUEW-1:0] temp_field1, temp_field2, temp_field3;
@@ -458,6 +469,10 @@ module ocaml4142_vm_rtl #(
 
   logic [15:0] str_words;  // caml_ml_string_length: the string's wosize
   logic [ 1:0] str_byte;   // caml_string_get: byte within the word
+  logic [ 7:0] byte_value;   // SETBYTESCHAR / caml_bytes_set: the byte to store
+  logic        streq_negate; // caml_string_notequal: invert the answer
+  logic [HEAP_AW-1:0] str2_addr;  // caml_string_equal: the second string's header
+  localparam int STRING_TAG = 252;
 
   // Sequential divider for DIVINT/MODINT: restoring division of the
   // magnitudes, one quotient bit per cycle, signs applied at the end so the
@@ -688,6 +703,15 @@ module ocaml4142_vm_rtl #(
   // forwarded, and every pointer in them, in the live stack and in the
   // globals must land on a block header in to-space or in the image below
   // heap_lo -- never in from-space.
+  function automatic bit gc_valid_target(input logic [VALUEW-1:0] v, input bit is_block[int]);
+    int p;
+    logic [VALUEW-1:0] h;
+    p = int'(v >> 2);
+    if (p < heap_lo || is_block.exists(p)) return 1;
+    h = heap_mem[p];
+    return h[7:0] == INFIX_TAG && is_block.exists(p - int'(h[31:16]));
+  endfunction
+
   task automatic gc_check_to_space();
     bit is_block[int];
     int idx, bad, f;
@@ -703,16 +727,16 @@ module ocaml4142_vm_rtl #(
       if (hdr[7:0] < NO_SCAN_TAG)
         for (f = 1; f <= hdr[31:16]; f++) begin
           v = heap_mem[idx+f];
-          if (!v[0] && !v[VALUEW-1] && !((v >> 2) < heap_lo || is_block.exists(int'(v >> 2)))) bad++;
+          if (!v[0] && !v[VALUEW-1] && !gc_valid_target(v, is_block)) bad++;
         end
     end
     for (idx = sp; idx < (1 << STACK_AW) - 1; idx++) begin
       v = stack_mem[idx];
-      if (!v[0] && !v[VALUEW-1] && !((v >> 2) < heap_lo || is_block.exists(int'(v >> 2)))) bad++;
+      if (!v[0] && !v[VALUEW-1] && !gc_valid_target(v, is_block)) bad++;
     end
     for (idx = 0; idx < (1 << GLOBALS_AW); idx++) begin
       v = globals_mem[idx];
-      if (!v[0] && !v[VALUEW-1] && !((v >> 2) < heap_lo || is_block.exists(int'(v >> 2)))) bad++;
+      if (!v[0] && !v[VALUEW-1] && !gc_valid_target(v, is_block)) bad++;
     end
     $display("GC %0d: %0d words live, semi-space %0d%s", gc_count + 1, gc_free - to_lo, gc_semi,
              bad ? " -- HEAP CHECK FAILED" : "");
@@ -726,8 +750,10 @@ module ocaml4142_vm_rtl #(
       MAKEBLOCK2: alloc_need = 3;
       MAKEBLOCK3: alloc_need = 4;
       MAKEBLOCK: alloc_need = alloc_wosize + 1;
-      CLOSURE, CLOSUREREC: alloc_need = 3 + nvars;
+      CLOSURE: alloc_need = 3 + nvars;
+      CLOSUREREC: alloc_need = 3 * imm + nvars;  // header + 3f - 1 + nvars
       GRAB: alloc_need = (extra_args < imm) ? 5 + extra_args : 0;
+      C_CALL1: alloc_need = (imm == 16'h052) ? (Int_val(accu) >> 2) + 2 : 0;  // caml_create_bytes
       default: alloc_need = 0;
     endcase
   end
@@ -1226,6 +1252,14 @@ module ocaml4142_vm_rtl #(
 
 
 
+            // APPTERM nargs, slotsize: the nargs arguments slide up over the
+            // slotsize - nargs slots of the current frame, top one first
+            // (the destination is never below the source), then a jump.
+            APPTERM: begin
+              op_cycle_count <= imm - 1;
+              state <= S_APPTERM_COPY;
+            end
+
             APPTERM3: begin
               temp_stack_addr <= sp;
               imm_b <= 3;
@@ -1501,6 +1535,8 @@ module ocaml4142_vm_rtl #(
 
 
 
+            BOOLNOT: accu <= (accu == VAL_FALSE) ? VAL_TRUE : VAL_FALSE;
+
             BRANCH: begin
               pc <= pc + $signed(offset) - 1;
             end
@@ -1593,6 +1629,7 @@ module ocaml4142_vm_rtl #(
               alloc_wosize <= 3 + 1 + extra_args;
               alloc_tag <= TAG_CLOSURE;
               alloc_prefix <= 3;
+              alloc_nfuncs <= 0;
               alloc_use_accu <= 1'b0;
               alloc_code <= pc - 3;  // the RESTART before this GRAB
               alloc_push_result <= 1'b0;
@@ -1709,6 +1746,7 @@ module ocaml4142_vm_rtl #(
                 alloc_tag    <= imm;
               end
               alloc_prefix <= 0;
+              alloc_nfuncs <= 0;
               alloc_use_accu <= 1'b1;
               alloc_push_result <= 1'b0;
               alloc_then_return <= 1'b0;
@@ -1764,11 +1802,6 @@ module ocaml4142_vm_rtl #(
 
 
 
-            OFFSETCLOSURE: begin
-              temp_heap_addr <= Heap_index_of_ptr(env) + offset;
-              state <= S_HEAP_READ;
-              next_state_after_mem <= S_OFFSETCLOSURE_CALC;
-            end
 
 
 
@@ -1915,9 +1948,7 @@ module ocaml4142_vm_rtl #(
             PUSHOFFSETCLOSURE: begin
               sp <= sp - 1;
               stack_write(sp-1, accu);
-              temp_heap_addr <= Heap_index_of_ptr(env) + offset;
-              state <= S_HEAP_READ;
-              next_state_after_mem <= S_OFFSETCLOSURE_CALC;
+              accu <= env + (imm << 2);
             end
 
 
@@ -2029,6 +2060,33 @@ module ocaml4142_vm_rtl #(
               next_state_after_mem <= S_VECTLENGTH_CALC;
             end
 
+            // GETSTRINGCHAR / GETBYTESCHAR: accu = the byte at Int_val sp[0]; pops it
+            GETSTRINGCHAR, GETBYTESCHAR:
+            if (!rd_phase) begin
+              stack_read_a(sp);  // index
+              hold_for_read();
+            end else begin
+              temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW+2:3];
+              str_byte <= st_rd_a[2:1];
+              sp <= sp + 1;
+              state <= S_STRGET_READ;
+            end
+
+            // SETBYTESCHAR: accu.[Int_val sp[0]] <- Int_val sp[1]; pops both; accu = unit
+            SETBYTESCHAR:
+            if (!rd_phase) begin
+              stack_read_a(sp);  // index
+              stack_read_b(sp + 1);  // the char
+              hold_for_read();
+            end else begin
+              temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW+2:3];
+              str_byte <= st_rd_a[2:1];
+              byte_value <= st_rd_b[8:1];
+              sp <= sp + 2;
+              accu <= VAL_UNIT;
+              state <= S_BYTESET_RMW;
+            end
+
             // SETVECTITEM: accu.(Int_val sp[0]) <- sp[1]; pops both
             SETVECTITEM:
             if (!rd_phase) begin
@@ -2068,7 +2126,16 @@ module ocaml4142_vm_rtl #(
                     state <= S_DUP_HDR;
                   end
                 end
-                16'h116: begin  // caml_ml_string_length: header, then last word
+                16'h052: begin  // caml_create_bytes len: zero-filled, padded like a string
+                  alloc_base <= hp;
+                  alloc_wosize <= (Int_val(accu) >> 2) + 1;
+                  temp_index <= Int_val(accu);
+                  heap_write(hp, Make_header((Int_val(accu) >> 2) + 1, STRING_TAG));
+                  alloc_i <= 0;
+                  state <= S_CREATE_BYTES;
+                end
+                16'h164: ;  // caml_string_of_bytes: the same block (safe-string)
+                16'h0f7, 16'h116: begin  // caml_ml_bytes_length, caml_ml_string_length
                   temp_heap_addr <= Heap_index_of_ptr(accu);
                   state <= S_STRLEN_HDR;
                 end
@@ -2094,7 +2161,13 @@ module ocaml4142_vm_rtl #(
                   state <= S_HEAP_READ;
                   next_state_after_mem <= S_GETFIELD_DONE;
                 end
-                16'h15b: caml_string_get();
+                16'h15b, 16'h03a: caml_string_get();  // caml_string_get, caml_bytes_get
+                16'h15a, 16'h163: begin  // caml_string_equal, caml_string_notequal
+                  temp_heap_addr <= Heap_index_of_ptr(accu);
+                  str2_addr <= Heap_index_of_ptr(st_rd_a);
+                  streq_negate <= imm == 16'h163;
+                  state <= S_STREQ_HDR;
+                end
                 16'h194: begin  // vm_io_write addr data
                   trap_valid <= 1'b1;
                   trap_prim  <= TRAP_IO_WRITE;
@@ -2108,7 +2181,20 @@ module ocaml4142_vm_rtl #(
             end
 
             C_CALL3:
-            if (imm == 16'h00f) begin  // caml_array_set_addr: SETVECTITEM's layout
+            if (imm == 16'h044) begin  // caml_bytes_set: SETBYTESCHAR's layout
+              if (!rd_phase) begin
+                stack_read_a(sp);  // index
+                stack_read_b(sp + 1);  // the char
+                hold_for_read();
+              end else begin
+                temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW+2:3];
+                str_byte <= st_rd_a[2:1];
+                byte_value <= st_rd_b[8:1];
+                sp <= sp + 2;
+                accu <= VAL_UNIT;
+                state <= S_BYTESET_RMW;
+              end
+            end else if (imm == 16'h00f) begin  // caml_array_set_addr: SETVECTITEM's layout
               if (!rd_phase) begin
                 stack_read_a(sp);  // index
                 stack_read_b(sp + 1);  // value
@@ -2153,34 +2239,32 @@ module ocaml4142_vm_rtl #(
               alloc_tag <= TAG_CLOSURE;
               alloc_prefix <= 2;
               alloc_code <= $signed(pc) + $signed(offset) - 1;
+              alloc_nfuncs <= 0;
               alloc_use_accu <= nvars != 0;
               alloc_push_result <= 1'b0;
               alloc_then_return <= 1'b0;
               state <= S_ALLOC_HDR;
             end
 
-            CLOSUREREC:
-            if (imm == 1) begin
-              alloc_wosize <= 2 + nvars;
+            // CLOSUREREC f, v, offsets: f closures in one block (see
+            // alloc_nfuncs); pc is at the offset table.
+            CLOSUREREC: begin
+              alloc_wosize <= 3 * imm - 1 + nvars;
               alloc_tag <= TAG_CLOSURE;
-              alloc_prefix <= 2;
-              alloc_code <= $signed(pc) + $signed(code_rdata);  // the offset word at pc
-              pc <= pc + 1;
+              alloc_prefix <= 3 * imm - 1;
+              alloc_nfuncs <= imm;
+              alloc_table <= pc;
               alloc_use_accu <= nvars != 0;
               alloc_push_result <= 1'b1;
               alloc_then_return <= 1'b0;
               state <= S_ALLOC_HDR;
-            end else begin
-              $display("Multi-function CLOSUREREC (nfuncs > 1) not yet implemented");
-              trap_valid <= 1'b1;
-              trap_prim <= 8'hF0;
-              state <= S_TRAP_WAIT;
             end
 
+            // OFFSETCLOSURE n: accu = env + n words -- a sibling in a CLOSUREREC block
             OFFSETCLOSURE0:  accu <= env;
-            OFFSETCLOSURE3:  read_acc_from_heap(env, 1 + 3);
-            OFFSETCLOSUREM3: read_acc_from_heap(env, 1 - 3);
-
+            OFFSETCLOSURE3:  accu <= env + 12;
+            OFFSETCLOSUREM3: accu <= env - 12;
+            OFFSETCLOSURE:   accu <= env + (imm << 2);
 
             PUSHOFFSETCLOSURE0: begin
               logic [31:0] old_sp;
@@ -2195,7 +2279,7 @@ module ocaml4142_vm_rtl #(
               old_sp = sp;
               sp <= sp - 1;
               stack_write(old_sp-1, accu);
-              accu <= env;
+              accu <= env + 12;
             end
 
             PUSHOFFSETCLOSUREM3: begin
@@ -2203,7 +2287,7 @@ module ocaml4142_vm_rtl #(
               old_sp = sp;
               sp <= sp - 1;
               stack_write(old_sp-1, accu);
-              accu <= env;
+              accu <= env - 12;
             end
 
             PUSHGETGLOBAL:
@@ -2259,6 +2343,7 @@ module ocaml4142_vm_rtl #(
           gc_scan <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
           gc_phase <= GC_ACCU;
           gc_i <= {1'b0, sp};
+          gc_infix_off <= 0;
           state <= S_GC_ROOT;
         end
 
@@ -2298,6 +2383,7 @@ module ocaml4142_vm_rtl #(
         endcase
 
         S_GC_ROOT_WB: begin  // store the forwarded root
+          gc_infix_off <= 0;
           case (gc_phase)
             GC_ACCU: accu <= gc_new;
             GC_ENV: env <= gc_new;
@@ -2316,15 +2402,19 @@ module ocaml4142_vm_rtl #(
           heap_read_a(gc_val[HEAP_AW+1:2]);      // header
           heap_read_b(gc_val[HEAP_AW+1:2] + 1);  // field 0: the forward pointer, if copied
           hold_for_read();
+        end else if (hm_rd_a[7:0] == INFIX_TAG) begin
+          // inside a CLOSUREREC block: forward the block, keep the offset
+          gc_val <= gc_val - {hm_rd_a[31:16], 2'b00};
+          gc_infix_off <= gc_infix_off + hm_rd_a[31:16];
         end else if (hm_rd_a[15:8] == GC_FORWARDED) begin
-          gc_new <= hm_rd_b;
+          gc_new <= hm_rd_b + {gc_infix_off, 2'b00};
           state <= gc_return_to_scan ? S_GC_SCAN_WB : S_GC_ROOT_WB;
         end else begin
           heap_write(gc_free, hm_rd_a);
           gc_obj <= gc_val[HEAP_AW+1:2];
           gc_hdr <= hm_rd_a;
           gc_size <= hm_rd_a[31:16];
-          gc_new <= Ptr_of_heap_index(gc_free);
+          gc_new <= Ptr_of_heap_index(gc_free) + {gc_infix_off, 2'b00};
           gc_new_idx <= gc_free;
           gc_rd <= 0;
           gc_wr <= 0;
@@ -2360,7 +2450,7 @@ module ocaml4142_vm_rtl #(
             state <= gc_return_to_scan ? S_GC_SCAN_WB : S_GC_ROOT_WB;
           end
         end else begin
-          heap_write(gc_obj + 1, gc_new);
+          heap_write(gc_obj + 1, Ptr_of_heap_index(gc_new_idx));  // the block's new address
           gc_free <= gc_free + 1 + gc_size;
           state <= gc_return_to_scan ? S_GC_SCAN_WB : S_GC_ROOT_WB;
         end
@@ -2393,6 +2483,7 @@ module ocaml4142_vm_rtl #(
         end else gc_j <= gc_j + 1;
 
         S_GC_SCAN_WB: begin
+          gc_infix_off <= 0;
           heap_write(gc_scan + 1 + gc_j, gc_new);
           gc_j <= gc_j + 1;
           state <= S_GC_SCAN_FIELD;
@@ -2502,6 +2593,9 @@ module ocaml4142_vm_rtl #(
           heap_write(hp, Make_header(alloc_wosize, alloc_tag));
           alloc_base <= hp;
           alloc_i <= 0;
+          alloc_fn_i <= 0;
+          alloc_phase <= 1;  // field 0 is function 0's code
+          alloc_push_i <= 0;
           state <= S_ALLOC_FIELD;
         end
 
@@ -2510,19 +2604,33 @@ module ocaml4142_vm_rtl #(
           logic [15:0] stack_item;   // index into sp[0], sp[1], ...
           logic field_is_accu, field_from_stack;
           logic [VALUEW-1:0] prefix_field;
+          logic rec_code_field;      // a CLOSUREREC code pointer: read from the table first
           item = alloc_i - alloc_prefix;
           field_is_accu = alloc_i >= alloc_prefix && alloc_use_accu && item == 0;
           field_from_stack = alloc_i >= alloc_prefix && !field_is_accu;
           stack_item = alloc_use_accu ? item - 1 : item;
-          prefix_field = (alloc_i == 0) ? Make_codeptr(alloc_code) : (alloc_i == 1) ? CLOSINFO : env;
+          if (alloc_nfuncs != 0)
+            case (alloc_phase)
+              2'd0: prefix_field = Make_header(3 * alloc_fn_i, INFIX_TAG);
+              2'd1: prefix_field = Make_codeptr($signed(alloc_table) + $signed(code_rdata));
+              default: prefix_field = ((3 * (alloc_nfuncs - alloc_fn_i) - 1) << 1) | 1;  // closinfo
+            endcase
+          else
+            prefix_field = (alloc_i == 0) ? Make_codeptr(alloc_code) : (alloc_i == 1) ? CLOSINFO : env;
+          rec_code_field = alloc_nfuncs != 0 && alloc_i < alloc_prefix && alloc_phase == 1;
           if (alloc_i == alloc_wosize) state <= S_ALLOC_DONE;
           else if (field_from_stack && !rd_phase) begin
             stack_read_a(sp + stack_item);
+            hold_for_read();
+          end else if (rec_code_field && !rd_phase) begin
+            pc <= alloc_table + alloc_fn_i;  // code_rdata is the offset next cycle
             hold_for_read();
           end else begin
             heap_write(alloc_base + 1 + alloc_i,
                        (alloc_i < alloc_prefix) ? prefix_field : field_is_accu ? accu : st_rd_a);
             alloc_i <= alloc_i + 1;
+            alloc_phase <= (alloc_phase == 2) ? 2'd0 : alloc_phase + 1;
+            if (alloc_phase == 2) alloc_fn_i <= alloc_fn_i + 1;
           end
         end
 
@@ -2531,15 +2639,24 @@ module ocaml4142_vm_rtl #(
           sp_after = sp + (alloc_wosize - alloc_prefix - alloc_use_accu);
           hp <= alloc_base + 1 + alloc_wosize;
           accu <= Ptr_of_heap_index(alloc_base);
-          if (alloc_push_result) begin
-            stack_write(sp_after - 1, Ptr_of_heap_index(alloc_base));
-            sp <= sp_after - 1;
-          end else sp <= sp_after;
-          if (alloc_then_return) begin  // GRAB: return the closure through the frame
+          sp <= sp_after;
+          if (alloc_nfuncs != 0) pc <= alloc_table + alloc_nfuncs;  // past the offset table
+          if (alloc_push_result) state <= S_ALLOC_PUSH;
+          else if (alloc_then_return) begin  // GRAB: return the closure through the frame
             imm <= 0;
             op_cycle_count <= 0;
             state <= S_RETURN_READ_FRAME;
           end else state <= S_DONE;
+        end
+
+        // CLOSUREREC pushes the block, then each further function's infix
+        // pointer (block + 3i words), one stack write a cycle.
+        S_ALLOC_PUSH:
+        if (alloc_push_i == alloc_nfuncs) state <= S_DONE;
+        else begin
+          stack_write(sp - 1, Ptr_of_heap_index(alloc_base + 3 * alloc_push_i));
+          sp <= sp - 1;
+          alloc_push_i <= alloc_push_i + 1;
         end
 
         S_DIV_ITER: begin
@@ -2581,6 +2698,61 @@ module ocaml4142_vm_rtl #(
           accu  <= Val_int({str_words, 2'b00} - 1 - hm_rd_a[31:24]);
           state <= S_DONE;
         end
+
+        // A byte store: read the word, write it back with one byte replaced.
+        S_BYTESET_RMW:
+        if (!rd_phase) begin
+          heap_read_a(temp_heap_addr);
+          hold_for_read();
+        end else begin
+          logic [VALUEW-1:0] word;
+          word = hm_rd_a;
+          word[8*str_byte+:8] = byte_value;
+          heap_write(temp_heap_addr, word);
+          state <= S_DONE;
+        end
+
+        // caml_create_bytes: the header is written; now the zero fields, the
+        // last carrying the padding count in its top byte, as OCaml's strings.
+        S_CREATE_BYTES:
+        if (alloc_i == alloc_wosize) begin
+          hp <= alloc_base + 1 + alloc_wosize;
+          accu <= Ptr_of_heap_index(alloc_base);
+          state <= S_DONE;
+        end else begin
+          heap_write(alloc_base + 1 + alloc_i,
+                     (alloc_i == alloc_wosize - 1) ? {8'(4 * alloc_wosize - 1 - temp_index), 24'd0} : '0);
+          alloc_i <= alloc_i + 1;
+        end
+
+        // caml_string_equal: both headers, then word by word (equal lengths
+        // pad alike, so whole words compare), reading both on ports A and B.
+        S_STREQ_HDR:
+        if (!rd_phase) begin
+          heap_read_a(temp_heap_addr);
+          heap_read_b(str2_addr);
+          hold_for_read();
+        end else if (hm_rd_a[31:16] != hm_rd_b[31:16]) begin
+          accu <= streq_negate ? VAL_TRUE : VAL_FALSE;
+          state <= S_DONE;
+        end else begin
+          alloc_wosize <= hm_rd_a[31:16];
+          alloc_i <= 0;
+          state <= S_STREQ_WORD;
+        end
+
+        S_STREQ_WORD:
+        if (alloc_i == alloc_wosize) begin
+          accu <= streq_negate ? VAL_FALSE : VAL_TRUE;
+          state <= S_DONE;
+        end else if (!rd_phase) begin
+          heap_read_a(temp_heap_addr + 1 + alloc_i);
+          heap_read_b(str2_addr + 1 + alloc_i);
+          hold_for_read();
+        end else if (hm_rd_a != hm_rd_b) begin
+          accu <= streq_negate ? VAL_TRUE : VAL_FALSE;
+          state <= S_DONE;
+        end else alloc_i <= alloc_i + 1;
 
         S_STRGET_READ:
         if (!rd_phase) begin
@@ -2685,10 +2857,6 @@ module ocaml4142_vm_rtl #(
         end
 
 
-        S_OFFSETCLOSURE_CALC: begin
-          accu  <= Ptr_of_heap_index(Heap_index_of_ptr(temp_heap_val) + offset);
-          state <= S_DONE;
-        end
 
 
 
@@ -2782,21 +2950,36 @@ module ocaml4142_vm_rtl #(
         S_APPTERM3_WRITE_ARGS: begin
           case (op_cycle_count)
             0: begin
-              stack_write(sp+imm-3, temp_arg1);
+              stack_write(sp, temp_arg1);  // sp is already sp + imm - 3
               op_cycle_count <= 1;
             end
             1: begin
-              stack_write(sp+imm-2, temp_arg2);
+              stack_write(sp + 1, temp_arg2);
               op_cycle_count <= 2;
             end
             2: begin
-              stack_write(sp+imm-1, temp_arg3);
+              stack_write(sp + 2, temp_arg3);
               extra_args <= extra_args + 2;
               temp_heap_addr <= Heap_index_of_ptr(accu) + 1;
               state <= S_HEAP_READ;
               next_state_after_mem <= S_APPTERM3_SETPC;
             end
           endcase
+        end
+
+        S_APPTERM_COPY:
+        if (!rd_phase) begin
+          stack_read_a(sp + op_cycle_count);
+          hold_for_read();
+        end else begin
+          stack_write(sp + imm2 - imm + op_cycle_count, st_rd_a);
+          if (op_cycle_count == 0) begin
+            sp <= sp + imm2 - imm;
+            extra_args <= extra_args + imm - 1;
+            temp_heap_addr <= Heap_index_of_ptr(accu) + 1;
+            state <= S_HEAP_READ;
+            next_state_after_mem <= S_APPTERM3_SETPC;  // pc = Code_val(accu), env = accu
+          end else op_cycle_count <= op_cycle_count - 1;
         end
 
         S_APPTERM3_SETPC: begin

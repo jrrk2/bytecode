@@ -116,6 +116,8 @@ const char *statenam(int state)
     case S_ALLOC_HDR: return "S_ALLOC_HDR";
     case S_ALLOC_FIELD: return "S_ALLOC_FIELD";
     case S_ALLOC_DONE: return "S_ALLOC_DONE";
+    case S_ALLOC_PUSH: return "S_ALLOC_PUSH";
+    case S_APPTERM_COPY: return "S_APPTERM_COPY";
     case S_GC_START: return "S_GC_START";
     case S_GC_ROOT: return "S_GC_ROOT";
     case S_GC_ROOT_WB: return "S_GC_ROOT_WB";
@@ -134,6 +136,10 @@ const char *statenam(int state)
     case S_RESTART_ARG: return "S_RESTART_ARG";
     case S_RESTART_ENV: return "S_RESTART_ENV";
     case S_DIV_ITER: return "S_DIV_ITER";
+    case S_BYTESET_RMW: return "S_BYTESET_RMW";
+    case S_CREATE_BYTES: return "S_CREATE_BYTES";
+    case S_STREQ_HDR: return "S_STREQ_HDR";
+    case S_STREQ_WORD: return "S_STREQ_WORD";
     case S_STRLEN_HDR: return "S_STRLEN_HDR";
     case S_STRLEN_LAST: return "S_STRLEN_LAST";
     case S_STRGET_READ: return "S_STRGET_READ";
@@ -237,7 +243,9 @@ int main(int argc, char** argv) {
 	    printf("Trace cnt=%d: %s\n", cnt, trace[1]);
 	    if (cnt >= 2 && matching)
 	      {
-		if (strcmp(op, opcode))
+		// ocamlrund's tracer names 4.14's last opcode (GETSTRINGCHAR)
+		// "???": that name cannot disagree, the pc still has to
+		if (strcmp(op, opcode) && strcmp(opcode, "???"))
 		  matching = 0;
 		if (!matching)
 		  printf("Stopped due to instruction mismatch %s vs %s\n", op, opcode);

@@ -94,6 +94,8 @@
     S_ALLOC_HDR,
     S_ALLOC_FIELD,
     S_ALLOC_DONE,
+    S_ALLOC_PUSH,
+    S_APPTERM_COPY,
 
     // Garbage collection (Cheney)
     S_GC_START,
@@ -122,6 +124,12 @@
 
     // DIVINT / MODINT: one quotient bit per cycle
     S_DIV_ITER,
+
+    // Bytes: a byte store, caml_create_bytes, caml_string_equal
+    S_BYTESET_RMW,
+    S_CREATE_BYTES,
+    S_STREQ_HDR,
+    S_STREQ_WORD,
 
     // String primitives (caml_ml_string_length, caml_string_get)
     S_STRLEN_HDR,
