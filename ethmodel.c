@@ -15,6 +15,10 @@
 // 6969 (a DATA block per ACK).  The program stages the image through
 // 0x10000.. and writes ETH_BOOT; the model then checks the staged bytes
 // against the file ("eth: BOOT ...") and the run is done.
+//
+// UART input (0x1008): the next byte of $ETHMODEL_UART_INPUT (a file), or -1
+// when none is waiting; after the file is used up and read a few more times
+// the run is done too.
 #include "ethmodel.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -25,7 +29,7 @@ enum {
   RX_BASE = 0x0000, TX_BASE = 0x0800, WINDOW = 0x0800,
   ETH_STATUS = 0x1000, ETH_STATUS_PHY = 0x1001, ETH_RXLEN = 0x1002,
   ETH_TXLEN = 0x1003, LEDS = 0x1004, UART = 0x1005, ETH_TIMER_MS = 0x1006,
-  ETH_BOOT = 0x1007, STAGE_BASE = 0x10000, STAGE_SIZE = 0x10000,
+  ETH_BOOT = 0x1007, UART_RX = 0x1008, STAGE_BASE = 0x10000, STAGE_SIZE = 0x10000,
 };
 enum { TFTP_PORT = 6969, TFTP_TID = 6970, TFTP_BLOCK = 512 };
 enum { RX_VALID = 1, TX_BUSY = 2, RX_TRUNC = 4 };
@@ -66,6 +70,20 @@ static uint8_t *tftp_data;
 static long tftp_size;
 static int tftp_active, tftp_last_block_sent, booted;
 static int frame_mode;   // driven by ethmodel_tx_frame/_rx_frame: replies stay queued
+
+// UART input
+static FILE *uart_in;
+static int uart_in_opened, uart_in_eof_reads;
+static long uart_rx(void) {
+  if (!uart_in_opened) {
+    const char *name = getenv("ETHMODEL_UART_INPUT");
+    uart_in = name ? fopen(name, "rb") : NULL;
+    uart_in_opened = 1;
+  }
+  int c = uart_in ? fgetc(uart_in) : EOF;
+  if (c == EOF) { uart_in_eof_reads++; return -1; }
+  return c;
+}
 static uint8_t rxbuf[WINDOW], txbuf[WINDOW];
 static char uart_line[256];
 static int uart_len;
@@ -282,6 +300,7 @@ long ethmodel_read(long a) {
     if (!rx_valid && !dhcp_in_progress && !tftp_active && next_frame >= nframes) idle_polls++;
     return rx_valid ? RX_VALID : 0;
   case ETH_TIMER_MS: return now_ms & 0x3FFFFFFF;
+  case UART_RX: return uart_rx();
   case ETH_STATUS_PHY: return PHY_STATUS;
   case ETH_RXLEN: return rx_len;
   default: return 0;
@@ -321,7 +340,10 @@ void ethmodel_write(long a, long d) {
   fflush(stdout);
 }
 
-int ethmodel_done(void) { return booted || (!tftp_active && idle_polls >= IDLE_POLLS_WHEN_DONE); }
+int ethmodel_done(void) {
+  return booted || (!tftp_active && idle_polls >= IDLE_POLLS_WHEN_DONE)
+      || (uart_in && uart_in_eof_reads >= IDLE_POLLS_WHEN_DONE);
+}
 
 void ethmodel_tx_frame(const unsigned char *b, int len) {
   init();

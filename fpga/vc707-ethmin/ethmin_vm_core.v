@@ -17,6 +17,7 @@
 //   0x1005  w  UART byte (simpleuart, 115200 8N1)
 //   0x1006  r  milliseconds since reset (30 bits, wraps after ~12 days)
 //   0x1007  w  boot the image staged in the staging RAM
+//   0x1008  r  the next byte received on the UART, or -1 (a 256-byte FIFO)
 //   0x10000..0x1FFFF  the staging RAM, a byte per address
 //
 // The packet RAM is a true dual-port BRAM: port B belongs to the DMA on
@@ -114,7 +115,7 @@ module ethmin_vm_core #(
 	// and starts it, until the next reset brings the resident one back.
 	localparam integer PROG_WORDS  = 8192;    // program code RAM
 	localparam integer STAGE_WORDS = 16384;   // staging RAM: 64 KiB
-	localparam integer HEAP_AW     = 13;
+	localparam integer HEAP_AW     = 14;      // 16K-word heap: two 8K semi-spaces above the image
 
 	reg [31:0] code_rom    [0:`PROGRAM_WORDS-1];
 	reg [31:0] heap_rom    [0:`HEAP_WORDS-1];
@@ -283,13 +284,35 @@ module ethmin_vm_core #(
 	reg  [7:0] uart_byte;
 	reg        uart_we;
 	wire       uart_wait;
+	wire       uart_rx_take;
+	wire [31:0] uart_rx_do;
 	simpleuart #(.DEFAULT_DIV(CLK_HZ / BAUD)) uart (
 		.clk(clk_sys), .resetn(resetn),
 		.ser_tx(UART_TX), .ser_rx(UART_RX),
 		.reg_div_we(4'b0000), .reg_div_di(32'd0), .reg_div_do(),
-		.reg_dat_we(uart_we), .reg_dat_re(1'b0),
-		.reg_dat_di({24'd0, uart_byte}), .reg_dat_do(),
+		.reg_dat_we(uart_we), .reg_dat_re(uart_rx_take),
+		.reg_dat_di({24'd0, uart_byte}), .reg_dat_do(uart_rx_do),
 		.reg_dat_wait(uart_wait));
+
+	// Received bytes: simpleuart holds one (reg_dat_do is ~0 without one);
+	// take each into a FIFO at once, so a pasted line is not lost.
+	reg  [7:0]  rx_fifo [0:255];
+	reg  [8:0]  rxf_wp, rxf_rp;
+	wire        rxf_empty = rxf_wp == rxf_rp;
+	wire        rxf_full  = (rxf_wp[7:0] == rxf_rp[7:0]) && (rxf_wp[8] != rxf_rp[8]);
+	assign uart_rx_take = (uart_rx_do != 32'hFFFFFFFF) && !rxf_full;
+	reg         rxf_pop;
+	always @(posedge clk_sys)
+		if (!resetn) begin
+			rxf_wp <= 9'd0;
+			rxf_rp <= 9'd0;
+		end else begin
+			if (uart_rx_take) begin
+				rx_fifo[rxf_wp[7:0]] <= uart_rx_do[7:0];
+				rxf_wp <= rxf_wp + 9'd1;
+			end
+			if (rxf_pop) rxf_rp <= rxf_rp + 9'd1;
+		end
 	always @(posedge clk_sys)
 		if (!resetn) begin
 			uf_wp <= 9'd0; uf_rp <= 9'd0; uart_we <= 1'b0;
@@ -367,6 +390,7 @@ module ethmin_vm_core #(
 		rx_ack     <= 1'b0;
 		tx_start   <= 1'b0;
 		boot_req   <= 1'b0;
+		rxf_pop    <= 1'b0;
 		if (!resetn || vm_reset) begin
 			io_state <= IO_IDLE;
 			if (!resetn) begin
@@ -388,6 +412,10 @@ module ethmin_vm_core #(
 						32'h1002: trap_result <= {21'd0, rx_len};
 						32'h1004: trap_result <= {24'd0, leds};
 						32'h1006: trap_result <= {2'b00, ms_count};
+						32'h1008: begin                               // a received byte, or -1
+							trap_result <= rxf_empty ? 32'hFFFFFFFF : {24'd0, rx_fifo[rxf_rp[7:0]]};
+							rxf_pop <= io_read && !rxf_empty;
+						end
 						default:  trap_result <= 32'd0;
 					endcase
 					if (io_write) case (io_addr)

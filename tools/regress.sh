@@ -36,7 +36,9 @@ tftp_image() {  # io test name -> the image file, built if needed ("" if none)
 for ml in "$B"/io/*.ml; do
     n=$(basename "$ml" .ml)
     export ETHMODEL_TFTP_FILE=$(tftp_image "$n")
-    [ -s "$T/$n.trace" ] && [ "$T/$n.trace" -nt "$ml" ] && [ "$T/$n.trace" -nt "$B/ethmodel.c" ] && continue
+    # io/<test>.input, if there is one, is typed at the UART (ethmodel 0x1008)
+    export ETHMODEL_UART_INPUT=$( [ -f "$B/io/$n.input" ] && echo "$B/io/$n.input" )
+    [ -s "$T/$n.trace" ] && [ "$T/$n.trace" -nt "$B/io/$n.input" ] && [ "$T/$n.trace" -nt "$ml" ] && [ "$T/$n.trace" -nt "$B/ethmodel.c" ] && continue
     ( cd "$T" && cp "$ml" . && /usr/bin/ocamlc -nopervasives -use-prims vm.prims "$n.ml" -o "$n" 2>"$n.comp.err" \
         && /usr/bin/ocamlc -nopervasives -custom -runtime-variant d -ccopt -I"$B" "$n.ml" "$B/io/io_stubs.c" \
              "$B/ethmodel.c" -o "$n.ref" 2>>"$n.comp.err" \
@@ -73,6 +75,7 @@ for tr in "$T"/*.trace; do
     # a test can ask for simulation plusargs with a "(* regress: +name=value ... *)" line
     extra=$(sed -n 's/^(\* regress: \(.*\)$/\1/p' "$T/$n.ml" 2>/dev/null | head -1)
     [ -f "$B/io/$n.ml" ] && export ETHMODEL_TFTP_FILE=$(tftp_image "$n")
+    export ETHMODEL_UART_INPUT=$( [ -f "$B/io/$n.input" ] && echo "$B/io/$n.input" )
     ( cd "$d" && timeout 600 "$M/obj/Vocaml4142_vm_rtl" "$T/$n" "$tr" +heap="$img/heap.hex" +globals="$img/globals.hex" \
         +heap_words="$(awk '/heap_words/{print $2}' "$img/image.txt")" $extra > full.log 2>&1; echo "exit $?" >> full.log; rm -f trace.vcd )
     gcs=$(grep -c '^GC [0-9]*:' "$d/full.log"); gcbad=$(grep -c 'HEAP CHECK FAILED\|GC: out of memory' "$d/full.log")

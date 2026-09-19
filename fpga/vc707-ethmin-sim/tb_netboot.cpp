@@ -3,7 +3,9 @@
 // -- at the MAC streams.  Frames the core sends go to the model; the model's
 // replies are fed in whenever the DMA's RX window is free.  Prints the TX
 // frames and UART lines; stops once the booted program has printed a line
-// after "starting it", or at the time limit.
+// after "starting it", or at the time limit.  With $TB_UART_INPUT, that
+// file is typed at the UART once the booted program has printed its first
+// line, and the run stops 30 ms after the last output once it is all sent.
 #include "Vethmin_vm_core.h"
 #include "Vethmin_vm_core___024root.h"
 #include "verilated.h"
@@ -18,19 +20,45 @@ static uint64_t ticks;           // 4 ns: eth_clk 125 MHz, clk_sys 25 MHz
 static std::string uart_line;
 static int uart_state = -1, uart_cnt, uart_byte, uart_last = 1, lines_after_boot = -1;
 static unsigned char tx_buf[2048];
+// typing at the UART: the next byte's bits, sent LSB first at 115200 8N1
+static FILE *uart_in;
+static int typing = 0, type_bit = -1, type_cnt, type_byte, typed_all;
+static uint64_t last_output_tick;
+extern uint64_t ticks_now();
 static int tx_len;
+
+static void type_step() {           // at each clk_sys edge
+  const int bit = 25000000 / 115200;
+  if (!typing || typed_all) return;
+  if (type_bit < 0) {                  // idle: two bit times, then the next byte
+    if (--type_cnt > 0) return;
+    int c = fgetc(uart_in);
+    if (c == EOF) { typed_all = 1; top->UART_RX = 1; return; }
+    type_byte = c; type_bit = 0; type_cnt = bit;
+    top->UART_RX = 0;                  // start bit
+    return;
+  }
+  if (--type_cnt > 0) return;
+  type_cnt = bit;
+  if (type_bit < 8) top->UART_RX = (type_byte >> type_bit++) & 1;
+  else if (type_bit == 8) { top->UART_RX = 1; type_bit++; }          // stop bit
+  else { type_bit = -1; type_cnt = 2 * bit; }
+}
 
 static void sys_edge() {
   const int bit = 25000000 / 115200;
+  type_step();
   int tx = top->UART_TX;
   if (uart_state < 0) {
     if (uart_last && !tx) { uart_state = 0; uart_cnt = bit + bit / 2; uart_byte = 0; }
   } else if (--uart_cnt == 0) {
     if (uart_state < 8) { uart_byte |= tx << uart_state++; uart_cnt = bit; }
     else {
+      last_output_tick = ticks_now();
       if (uart_byte == '\n') {
         printf("uart: %s\n", uart_line.c_str());
         if (lines_after_boot >= 0) lines_after_boot++;
+        if (lines_after_boot >= 1 && uart_in && !typing) { typing = 1; type_cnt = 50000; }  // 2 ms, then type
         if (uart_line.find("starting it") != std::string::npos) lines_after_boot = 0;
         uart_line.clear();
       } else uart_line += (char)uart_byte;
@@ -54,6 +82,8 @@ static void eth_edge() {
   }
 }
 
+uint64_t ticks_now() { return ticks; }
+
 static void step() {
   ticks++;
   bool eth_rise = (ticks % 2) == 0, sys_rise = (ticks % 10) == 0;
@@ -71,6 +101,7 @@ int main(int argc, char **argv) {
   top->tx_axis_tready = 1;
   top->pcspma_status = 0x0303;
   top->UART_RX = 1;
+  if (getenv("TB_UART_INPUT")) uart_in = fopen(getenv("TB_UART_INPUT"), "rb");
   top->resetn = 0; top->eth_rst = 1;
   for (int i = 0; i < 200; i++) step();
   top->resetn = 1; top->eth_rst = 0;
@@ -81,7 +112,11 @@ int main(int argc, char **argv) {
   bool last_rx_valid = false;
   uint64_t released_at = 0;
   uint64_t limit = (uint64_t)((argc > 1 ? atof(argv[1]) : 2.0) * 250e6);   // seconds, in 4 ns steps
-  while (ticks < limit && lines_after_boot < 1) {
+  auto finished = [&]() {
+    if (!uart_in) return lines_after_boot >= 1;
+    return typed_all && ticks - last_output_tick > 7500000ULL;   // 30 ms quiet
+  };
+  while (ticks < limit && !finished()) {
     bool rx_valid = top->rootp->ethmin_vm_core__DOT__rx_valid;
     if (rx_n == 0 && ticks % 2 == 1) {          // between eth_clk edges
       if (wait_taken == 1 && rx_valid) wait_taken = 2;
@@ -109,7 +144,8 @@ int main(int argc, char **argv) {
              top->rootp->ethmin_vm_core__DOT__seq_state, top->rootp->ethmin_vm_core__DOT__code_bank,
              top->rootp->ethmin_vm_core__DOT__pc, top->rootp->ethmin_vm_core__DOT__prog_words);
   }
-  printf("tb: stopped at %.1f ms%s\n", ticks * 4e-6, lines_after_boot >= 1 ? "" : " (time limit)");
+  if (!uart_line.empty()) printf("uart: %s\n", uart_line.c_str());   // a prompt, say
+  printf("tb: stopped at %.1f ms%s\n", ticks * 4e-6, finished() ? "" : " (time limit)");
   delete top;
-  return lines_after_boot >= 1 ? 0 : 1;
+  return finished() ? 0 : 1;
 }
