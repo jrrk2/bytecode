@@ -7,8 +7,8 @@ module ocaml4142_vm_rtl #(
     // Initial heap (the program's structured constants) and global table, as
     // laid out by bc2image; the heap allocates from HEAP_INIT_WORDS upwards.
     // In simulation +heap=, +globals= and +heap_words= override them.
-    parameter string HEAP_INIT = "",
-    parameter string GLOBALS_INIT = "",
+    parameter HEAP_INIT = "",  // untyped: Vivado 2020.1 synthesis has no string parameters
+    parameter GLOBALS_INIT = "",
     parameter int HEAP_INIT_WORDS = 0
 ) (
     input logic clk,
@@ -448,15 +448,15 @@ module ocaml4142_vm_rtl #(
   // register an address depends on, so every read sees exactly the memory
   // state it would have seen when reads were combinational.
   // ------------------------------------------------------------------
-  logic                  st_re_a, st_we_a, st_re_b, st_we_b;
+  logic                  st_re_a, st_we_a, st_re_b;
   logic [  STACK_AW-1:0] st_addr_a, st_addr_b;
-  logic [    VALUEW-1:0] st_wd_a, st_wd_b, st_rd_a, st_rd_b;
-  logic                  hm_re_a, hm_we_a, hm_re_b, hm_we_b;
+  logic [    VALUEW-1:0] st_wd_a, st_rd_a, st_rd_b;
+  logic                  hm_re_a, hm_we_a, hm_re_b;
   logic [   HEAP_AW-1:0] hm_addr_a, hm_addr_b;
-  logic [    VALUEW-1:0] hm_wd_a, hm_wd_b, hm_rd_a, hm_rd_b;
-  logic                  gm_re_a, gm_we_a, gm_re_b, gm_we_b;
+  logic [    VALUEW-1:0] hm_wd_a, hm_rd_a, hm_rd_b;
+  logic                  gm_re_a, gm_we_a, gm_re_b;
   logic [GLOBALS_AW-1:0] gm_addr_a, gm_addr_b;
-  logic [    VALUEW-1:0] gm_wd_a, gm_wd_b, gm_rd_a, gm_rd_b;
+  logic [    VALUEW-1:0] gm_wd_a, gm_rd_a, gm_rd_b;
   logic                  rd_phase;
 
   // tos: a register loaded from stack port A whenever it reads stack[sp],
@@ -482,19 +482,17 @@ module ocaml4142_vm_rtl #(
     gm_addr_a = a;
   endtask
 
-  // Writes take whichever port is still free this cycle.
+  // Each memory is one read/write port (A) and one read-only port (B): a
+  // write needs port A, so a state writes a memory at most once per cycle.
+  // Two tools' RAM inference depend on this shape (yosys and Vivado).
   task automatic stack_write(input logic [STACK_AW-1:0] a, input logic [VALUEW-1:0] d);
     if (!st_re_a && !st_we_a) begin
       st_we_a = 1'b1;
       st_addr_a = a;
       st_wd_a = d;
-    end else if (!st_re_b && !st_we_b) begin
-      st_we_b = 1'b1;
-      st_addr_b = a;
-      st_wd_b = d;
     end else begin
 `ifndef SYNTHESIS
-      $error("stack_mem: third access in one cycle (state %s)", state.name());
+      $error("stack_mem: port A already in use this cycle (state %s)", state.name());
 `endif
     end
   endtask
@@ -503,13 +501,9 @@ module ocaml4142_vm_rtl #(
       hm_we_a = 1'b1;
       hm_addr_a = a;
       hm_wd_a = d;
-    end else if (!hm_re_b && !hm_we_b) begin
-      hm_we_b = 1'b1;
-      hm_addr_b = a;
-      hm_wd_b = d;
     end else begin
 `ifndef SYNTHESIS
-      $error("heap_mem: third access in one cycle (state %s)", state.name());
+      $error("heap_mem: port A already in use this cycle (state %s)", state.name());
 `endif
     end
   endtask
@@ -518,13 +512,9 @@ module ocaml4142_vm_rtl #(
       gm_we_a = 1'b1;
       gm_addr_a = a;
       gm_wd_a = d;
-    end else if (!gm_re_b && !gm_we_b) begin
-      gm_we_b = 1'b1;
-      gm_addr_b = a;
-      gm_wd_b = d;
     end else begin
 `ifndef SYNTHESIS
-      $error("globals_mem: third access in one cycle (state %s)", state.name());
+      $error("globals_mem: port A already in use this cycle (state %s)", state.name());
 `endif
     end
   endtask
@@ -625,27 +615,21 @@ module ocaml4142_vm_rtl #(
     st_re_a = 1'b0;
     st_we_a = 1'b0;
     st_re_b = 1'b0;
-    st_we_b = 1'b0;
     st_addr_a = '0;
     st_addr_b = '0;
     st_wd_a = '0;
-    st_wd_b = '0;
     hm_re_a = 1'b0;
     hm_we_a = 1'b0;
     hm_re_b = 1'b0;
-    hm_we_b = 1'b0;
     hm_addr_a = '0;
     hm_addr_b = '0;
     hm_wd_a = '0;
-    hm_wd_b = '0;
     gm_re_a = 1'b0;
     gm_we_a = 1'b0;
     gm_re_b = 1'b0;
-    gm_we_b = 1'b0;
     gm_addr_a = '0;
     gm_addr_b = '0;
     gm_wd_a = '0;
-    gm_wd_b = '0;
     putc_valid <= 1'b0;
 
     if (reset) begin
@@ -946,7 +930,7 @@ module ocaml4142_vm_rtl #(
               hold_for_read();
             end else begin
               stack_write(sp - 3, st_rd_a);
-              stack_write(sp - 2, st_rd_b);
+              temp_arg2 <= st_rd_b;  // written next cycle: one stack write per cycle
               op_cycle_count <= 0;
               state <= (opcode == APPLY2) ? S_APPLY2_WRITE_FRAME : S_APPLY3_WRITE_FRAME;
             end
@@ -2697,14 +2681,21 @@ module ocaml4142_vm_rtl #(
 
 
 
-        S_APPLY2_WRITE_FRAME: begin  // args already at old sp-3, sp-2
+        S_APPLY2_WRITE_FRAME: begin  // arg 1 already at old sp-3
           case (op_cycle_count)
             0: begin
-              stack_write(sp - 1, Make_codeptr(pc));
-              stack_write(sp, env);
+              stack_write(sp - 2, temp_arg2);
               op_cycle_count <= 1;
             end
             1: begin
+              stack_write(sp - 1, Make_codeptr(pc));
+              op_cycle_count <= 2;
+            end
+            2: begin
+              stack_write(sp, env);
+              op_cycle_count <= 3;
+            end
+            3: begin
               stack_write(sp + 1, Val_int(extra_args));
               sp <= sp - 3;
               extra_args <= 1;
@@ -2725,19 +2716,30 @@ module ocaml4142_vm_rtl #(
 
 
 
-        S_APPLY3_WRITE_FRAME: begin  // args 1-2 already at old sp-3, sp-2
+        S_APPLY3_WRITE_FRAME: begin  // arg 1 already at old sp-3
           case (op_cycle_count)
             0:
             if (!rd_phase) begin
               stack_read_a(sp + 2);  // arg 3
               hold_for_read();
             end else begin
-              stack_write(sp - 1, st_rd_a);
-              stack_write(sp, Make_codeptr(pc));
+              stack_write(sp - 2, temp_arg2);
+              temp_arg3 <= st_rd_a;
               op_cycle_count <= 1;
             end
             1: begin
+              stack_write(sp - 1, temp_arg3);
+              op_cycle_count <= 2;
+            end
+            2: begin
+              stack_write(sp, Make_codeptr(pc));
+              op_cycle_count <= 3;
+            end
+            3: begin
               stack_write(sp + 1, env);
+              op_cycle_count <= 4;
+            end
+            4: begin
               stack_write(sp + 2, Val_int(extra_args));
               sp <= sp - 3;
               extra_args <= 2;
@@ -2870,15 +2872,12 @@ module ocaml4142_vm_rtl #(
     // ---- The memory ports: the only accesses to the three memories. ----
     if (st_we_a) stack_mem[st_addr_a] <= st_wd_a;
     if (st_re_a) st_rd_a <= stack_mem[st_addr_a];
-    if (st_we_b) stack_mem[st_addr_b] <= st_wd_b;
     if (st_re_b) st_rd_b <= stack_mem[st_addr_b];
     if (hm_we_a) heap_mem[hm_addr_a] <= hm_wd_a;
     if (hm_re_a) hm_rd_a <= heap_mem[hm_addr_a];
-    if (hm_we_b) heap_mem[hm_addr_b] <= hm_wd_b;
     if (hm_re_b) hm_rd_b <= heap_mem[hm_addr_b];
     if (gm_we_a) globals_mem[gm_addr_a] <= gm_wd_a;
     if (gm_re_a) gm_rd_a <= globals_mem[gm_addr_a];
-    if (gm_we_b) globals_mem[gm_addr_b] <= gm_wd_b;
     if (gm_re_b) gm_rd_b <= globals_mem[gm_addr_b];
 
     // tos follows stack port A's reads of stack[sp], a cycle later.
