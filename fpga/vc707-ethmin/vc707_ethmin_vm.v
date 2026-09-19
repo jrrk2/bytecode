@@ -43,10 +43,22 @@ module vc707_ethmin_vm (
 		.IO_CLK_P(IO_CLK_P), .IO_CLK_N(IO_CLK_N), .IO_RST_N(~IO_RST),
 		.clk_sys(clk_sys), .clk_mac(clk_mac),
 		.rst_sys_n(rst_sys_n), .locked(locked));
-	wire resetn = rst_sys_n;
+	// CPU_RESET.  clkgen_vc707 takes IO_RST_N but never uses it (its MMCM
+	// reset is tied off and rst_sys_n is just LOCKED), so the button is
+	// handled here: synchronised to clk_sys and held for 2^16 cycles
+	// (2.6 ms) after release.  It resets everything, the Ethernet side
+	// included, so the DMA's clock-crossing toggles restart together.
+	reg [1:0]  button_sync = 2'b00;
+	reg [15:0] button_hold = 16'd0;
+	always @(posedge clk_sys) begin
+		button_sync <= {button_sync[0], IO_RST};
+		if (button_sync[1]) button_hold <= 16'd0;
+		else if (!(&button_hold)) button_hold <= button_hold + 16'd1;
+	end
+	wire resetn = rst_sys_n && (&button_hold);
 
 	wire eth_clk, rx_clk;
-	wire eth_rst = ~rst_sys_n;
+	wire eth_rst = ~resetn;
 
 	// ─── SGMII PCS/PMA + MAC ─────────────────────────────────────────────
 	wire [7:0] rx_tdata, tx_tdata;
@@ -57,7 +69,7 @@ module vc707_ethmin_vm (
 	// RETIME_MAC=1: the MAC runs on clk_mac, decoupled from the PCS's 125 MHz
 	// by 256-byte RAM256X1S packet buffers.  Frames over 256 bytes are dropped.
 	sgmii_soc #(.RETIME_MAC(1)) eth (
-		.clk_int(clk_sys), .rst_int(~rst_sys_n),
+		.clk_int(clk_sys), .rst_int(~resetn),
 		.mac_clk_in(clk_mac),
 		.eth_clk(eth_clk),
 		.sgmii_rxp(sgmii_rxp), .sgmii_rxn(sgmii_rxn),
