@@ -228,7 +228,7 @@ module ocaml4142_vm_rtl #(
       BRANCH, BRANCHIF, BRANCHIFNOT, PUSHTRAP,
       C_CALL1, C_CALL2, C_CALL3, C_CALL4, C_CALL5,
       CONSTINT, PUSHCONSTINT, OFFSETINT,
-      OFFSETREF, OFFSETCLOSURE, PUSHOFFSETCLOSURE
+      OFFSETREF, OFFSETCLOSURE, PUSHOFFSETCLOSURE, SWITCH
       :
       opcode_has_imm8 = 1'b1;
       default: opcode_has_imm8 = 1'b0;
@@ -1539,10 +1539,17 @@ module ocaml4142_vm_rtl #(
             end
 
 
-            SWITCH: begin
-
-              $display("SWITCH needs RTL conversion");
-              state <= S_DONE;
+            // SWITCH sizes: a jump table follows, (sizes & 0xFFFF) entries for
+            // the constant constructors, then one per block tag.  pc is the
+            // table: step to the entry, then jump to table + entry.
+            SWITCH:
+            if (accu[0]) begin
+              temp_index <= Int_val(accu);
+              pc <= pc + Int_val(accu);
+              state <= S_SWITCH_JUMP;
+            end else begin
+              temp_heap_addr <= Heap_index_of_ptr(accu);  // the tag is in the header
+              state <= S_SWITCH_TAG;
             end
 
 
@@ -1743,10 +1750,14 @@ module ocaml4142_vm_rtl #(
 
 
 
-            OFFSETREF: begin
-              temp_stack_addr <= sp + imm;
-              state <= S_STACK_READ;
-              next_state_after_mem <= S_OFFSETREF_ADD;
+            // OFFSETREF n: Field(accu, 0) += n (as an OCaml int); accu = unit
+            OFFSETREF:
+            if (!rd_phase) begin
+              heap_read_a(Heap_index_of_ptr(accu) + 1);
+              hold_for_read();
+            end else begin
+              heap_write(Heap_index_of_ptr(accu) + 1, hm_rd_a + (imm << 1));
+              accu <= VAL_UNIT;
             end
 
 
@@ -1933,6 +1944,8 @@ module ocaml4142_vm_rtl #(
               hold_for_read();
             end else begin
               heap_write(Heap_index_of_ptr(accu) + 1 + 0, st_rd_a);
+              sp <= sp + 1;  // Field(accu, n) = *sp++; accu = unit
+              accu <= VAL_UNIT;
               state <= S_DONE;
             end
 
@@ -1942,6 +1955,8 @@ module ocaml4142_vm_rtl #(
               hold_for_read();
             end else begin
               heap_write(Heap_index_of_ptr(accu) + 1 + 1, st_rd_a);
+              sp <= sp + 1;  // Field(accu, n) = *sp++; accu = unit
+              accu <= VAL_UNIT;
               state <= S_DONE;
             end
 
@@ -1951,6 +1966,8 @@ module ocaml4142_vm_rtl #(
               hold_for_read();
             end else begin
               heap_write(Heap_index_of_ptr(accu) + 1 + 2, st_rd_a);
+              sp <= sp + 1;  // Field(accu, n) = *sp++; accu = unit
+              accu <= VAL_UNIT;
               state <= S_DONE;
             end
 
@@ -1960,6 +1977,8 @@ module ocaml4142_vm_rtl #(
               hold_for_read();
             end else begin
               heap_write(Heap_index_of_ptr(accu) + 1 + 3, st_rd_a);
+              sp <= sp + 1;  // Field(accu, n) = *sp++; accu = unit
+              accu <= VAL_UNIT;
               state <= S_DONE;
             end
 
@@ -1969,6 +1988,8 @@ module ocaml4142_vm_rtl #(
               hold_for_read();
             end else begin
               heap_write(Heap_index_of_ptr(accu) + 1 + imm, st_rd_a);
+              sp <= sp + 1;  // Field(accu, n) = *sp++; accu = unit
+              accu <= VAL_UNIT;
               state <= S_DONE;
             end
 
@@ -1976,6 +1997,19 @@ module ocaml4142_vm_rtl #(
               temp_heap_addr <= Heap_index_of_ptr(accu);
               state <= S_HEAP_READ;
               next_state_after_mem <= S_VECTLENGTH_CALC;
+            end
+
+            // SETVECTITEM: accu.(Int_val sp[0]) <- sp[1]; pops both
+            SETVECTITEM:
+            if (!rd_phase) begin
+              stack_read_a(sp);  // index
+              stack_read_b(sp + 1);  // value
+              hold_for_read();
+            end else begin
+              temp_index <= Int_val(st_rd_a);
+              temp_value <= st_rd_b;
+              temp_base_ptr <= accu;
+              state <= S_SETVECTITEM_WRITE;
             end
 
             GETVECTITEM:
@@ -2043,8 +2077,20 @@ module ocaml4142_vm_rtl #(
               sp += 1;
             end
 
-            C_CALL3: begin
-
+            C_CALL3:
+            if (imm == 16'h00f) begin  // caml_array_set_addr: SETVECTITEM's layout
+              if (!rd_phase) begin
+                stack_read_a(sp);  // index
+                stack_read_b(sp + 1);  // value
+                hold_for_read();
+              end else begin
+                temp_index <= Int_val(st_rd_a);
+                temp_value <= st_rd_b;
+                temp_base_ptr <= accu;
+                state <= S_SETVECTITEM_WRITE;  // pops both, accu = unit
+              end
+            end else begin
+              $display("Unsupported C_CALL3: 0x%x", imm);
               accu <= VAL_UNIT;
               sp += 2;
             end
@@ -2402,6 +2448,21 @@ module ocaml4142_vm_rtl #(
           state <= S_DONE;
         end
 
+        S_SWITCH_TAG:
+        if (!rd_phase) begin
+          heap_read_a(temp_heap_addr);
+          hold_for_read();
+        end else begin
+          temp_index <= imm[15:0] + hm_rd_a[7:0];
+          pc <= pc + imm[15:0] + hm_rd_a[7:0];
+          state <= S_SWITCH_JUMP;
+        end
+
+        S_SWITCH_JUMP: begin  // code_rdata is the table entry at pc
+          pc <= pc - temp_index + $signed(code_rdata);
+          state <= S_DONE;
+        end
+
         S_VECTLENGTH_CALC: begin  // temp_heap_val holds the block's header
           accu  <= Val_long(Wosize_hd(temp_heap_val));
           state <= S_DONE;
@@ -2593,10 +2654,6 @@ module ocaml4142_vm_rtl #(
           state <= S_DONE;
         end
 
-        S_OFFSETREF_ADD: begin
-          accu  <= accu + Int_val(temp_stack_val) * 2;
-          state <= S_DONE;
-        end
 
         S_OFFSETCLOSURE_CALC: begin
           accu  <= Ptr_of_heap_index(Heap_index_of_ptr(temp_heap_val) + offset);
@@ -2888,18 +2945,6 @@ module ocaml4142_vm_rtl #(
         S_GETVECTITEM_DONE: begin
           accu  <= temp_heap_val;  // Array element now in accu
           state <= S_DONE;
-        end
-
-        SETVECTITEM:
-        if (!rd_phase) begin
-          stack_read_a(sp);  // index
-          stack_read_b(sp + 1);  // value
-          hold_for_read();
-        end else begin
-          temp_index <= Int_val(st_rd_a);
-          temp_value <= st_rd_b;
-          temp_base_ptr <= accu;
-          state <= S_SETVECTITEM_WRITE;
         end
 
         S_SETVECTITEM_WRITE: begin

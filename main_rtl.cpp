@@ -46,7 +46,6 @@ const char *statenam(int state)
     // Helper completion states
     case S_ENVACC_DONE: return "S_ENVACC_DONE";          // Complete ENVACC operations
     case S_GETFIELD_DONE: return "S_GETFIELD_DONE";        // Complete GETFIELD operations
-    case S_OFFSETREF_ADD: return "S_OFFSETREF_ADD";        // Complete OFFSETREF calculation
     case S_OFFSETCLOSURE_CALC: return "S_OFFSETCLOSURE_CALC";   // Complete OFFSETCLOSURE calculation
     
     // MAKEBLOCK3 states
@@ -127,6 +126,8 @@ const char *statenam(int state)
     case S_GC_SCAN_FIELD: return "S_GC_SCAN_FIELD";
     case S_GC_SCAN_WB: return "S_GC_SCAN_WB";
     case S_GC_DONE: return "S_GC_DONE";
+    case S_SWITCH_TAG: return "S_SWITCH_TAG";
+    case S_SWITCH_JUMP: return "S_SWITCH_JUMP";
     case S_DUP_HDR: return "S_DUP_HDR";
     case S_DUP_FIELD: return "S_DUP_FIELD";
     case S_RESTART_HDR: return "S_RESTART_HDR";

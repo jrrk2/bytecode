@@ -36,7 +36,9 @@ implemented = set()
 if len(sys.argv) > 2:
     rtl = open(sys.argv[2]).read()
     s_exec = rtl[rtl.index('S_EXEC: begin'):]
-    implemented = set(re.findall(r'^\s*([A-Z][A-Z0-9_]*)\s*:', s_exec, re.M))
+    implemented = set()
+    for labels in re.findall(r'^\s*([A-Z][A-Z0-9_]*(?:\s*,\s*[A-Z][A-Z0-9_]*)*)\s*:', s_exec, re.M):
+        implemented.update(l.strip() for l in labels.split(','))
     implemented.discard('default')
     trapped = set(re.findall(r'^\s*([A-Z][A-Z0-9_]*):\s*begin\s*\n\s*\$display\("[A-Z_0-9]+ needs RTL', s_exec, re.M))
 for op in sorted(hist, key=lambda o: NAMES.index(o)):

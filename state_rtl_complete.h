@@ -18,7 +18,6 @@
     // Helper completion states
     S_ENVACC_DONE,          // Complete ENVACC operations
     S_GETFIELD_DONE,        // Complete GETFIELD operations
-    S_OFFSETREF_ADD,        // Complete OFFSETREF calculation
     S_OFFSETCLOSURE_CALC,   // Complete OFFSETCLOSURE calculation
     
     // MAKEBLOCK3 states
@@ -107,6 +106,10 @@
     S_GC_SCAN_FIELD,
     S_GC_SCAN_WB,
     S_GC_DONE,
+
+    // SWITCH: a block's tag, then the jump
+    S_SWITCH_TAG,
+    S_SWITCH_JUMP,
 
     // caml_obj_dup: header, then fields
     S_DUP_HDR,
