@@ -49,3 +49,55 @@ uses (x1 for the stack and heap, x9 for globals) are the prime suspect.
 
 nextpnr also cannot place memories deep enough for yosys to build cascaded
 RAMB36 pairs, which is why the harness sets `STACK_AW`/`HEAP_AW` to 15.
+
+# Ethernet: `vc707-ethmin/`
+
+The VC707 ethmin design from xc7-bitstream-tools (clocking, LiteEth's SGMII
+PCS/PMA on the GTX, the 1G MAC and the DMA, all used in place, no Xilinx IP)
+with the VM in place of picorv32.  `ethmin_vm_core.v` holds the VM, a packet
+RAM shared with the DMA, a staging RAM, the program code RAM and the boot
+sequencer, and answers the VM's `vm_io_read`/`vm_io_write` with this I/O
+space (the one `ethmodel.c` simulates):
+
+| address | |
+|---|---|
+| 0x0000–0x07FF | RX window, a byte per address |
+| 0x0800–0x0FFF | TX window |
+| 0x1000 | r: rx valid, tx busy, rx truncated |
+| 0x1001 | r: PHY status |
+| 0x1002 | r: received length; w: release the RX window |
+| 0x1003 | w: send the TX window |
+| 0x1004 | LEDs |
+| 0x1005 | w: UART byte (a FIFO, shared with `caml_ml_output_char`) |
+| 0x1006 | r: milliseconds since reset |
+| 0x1007 | w: boot the staged image |
+| 0x10000–0x1FFFF | staging RAM (64 KiB) |
+
+The resident program, run after every reset (CPU_RESET works; see the note
+in `vc707_ethmin_vm.v`), is one of:
+
+- `io/ethmin.ml`: ARP and ping at 192.168.1.42 (MAC …:31)
+- `io/dhcp.ml`: the same, with the address leased by DHCP (MAC …:32)
+- `io/netboot.ml`: a loader (MAC …:33).  It leases an address by DHCP,
+  fetches `vm.img` by TFTP (from the DHCP reply's `siaddr`/`file`, else
+  192.168.1.106 port 6969), checks it (magic, sizes, the primitive-table
+  digest, CRC-16) and writes BOOT: the sequencer loads the image's code into
+  the code RAM and its heap and globals into the VM, and starts it.  The
+  next reset brings the loader back.
+
+## Build and boot
+
+    tools/progimage.sh io/netboot.ml fpga/vc707-ethmin     # the resident program
+    cd <work dir>; vivado -mode batch -source <repo>/fpga/vc707-ethmin/build.tcl
+
+A program to boot is packed by `tools/mkvmimage.py` and served per MAC by
+xc7-bitstream-tools' `scripts/tftp_serve.py`:
+
+    tools/progimage.sh fact.ml build/fact
+    tools/mkvmimage.py build/fact ~/tftp-vc707/02:00:00:4d:47:33/vm.img
+
+Simulation: `vc707-ethmin-sim/run.sh` runs the core with ethmin on canned
+frames; `vc707-ethmin-sim/run_netboot.sh [prog.ml]` runs the loader against
+`ethmodel`'s DHCP server, ARP and TFTP host, and shows the booted program's
+output.  The Vivado build is used for the board; nextpnr's has the fault
+described above.

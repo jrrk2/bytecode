@@ -1,8 +1,11 @@
 // ethmin_vm_core -- xc7-bitstream-tools' ethmin_core with the OCaml bytecode
 // VM in place of picosoc.  Same ports, same Ethernet DMA (eth_stream_dma) and
-// register semantics; the program (io/ethmin.ml) reaches them through the
-// VM's trap port as one I/O space (vm_io_read / vm_io_write), exactly as
-// ethmodel.c simulates it:
+// register semantics.  The resident program (io/ethmin.ml, io/dhcp.ml or the
+// loader io/netboot.ml, built in by tools/progimage.sh) runs after every
+// reset; the loader can stage another program's image and BOOT it (see the
+// boot sequencer below).  Programs reach the hardware through the VM's trap
+// port as one I/O space (vm_io_read / vm_io_write), exactly as ethmodel.c
+// simulates it:
 //
 //   0x0000..0x07FF  RX window, a byte per address   packet RAM words 0..511
 //   0x0800..0x0FFF  TX window                       packet RAM words 512..1023
@@ -13,6 +16,8 @@
 //   0x1004  rw LEDs
 //   0x1005  w  UART byte (simpleuart, 115200 8N1)
 //   0x1006  r  milliseconds since reset (30 bits, wraps after ~12 days)
+//   0x1007  w  boot the image staged in the staging RAM
+//   0x10000..0x1FFFF  the staging RAM, a byte per address
 //
 // The packet RAM is a true dual-port BRAM: port B belongs to the DMA on
 // eth_clk, port A to the VM on clk_sys; eth_stream_dma's ownership handshake
@@ -52,7 +57,8 @@ module ethmin_vm_core #(
 	wire [13:0] mem_b_addr;
 	wire [31:0] mem_b_wdata;
 	reg  [31:0] mem_b_rdata;
-	wire        rx_valid, rx_trunc, tx_busy;
+	wire        rx_valid /*verilator public_flat_rd*/;  // the testbench feeds frames when it is clear
+	wire        rx_trunc, tx_busy;
 	wire [10:0] rx_len;
 	reg  [10:0] tx_len;
 	reg         tx_start, rx_ack;
@@ -100,28 +106,162 @@ module ethmin_vm_core #(
 			pa_rdata <= pkt[pa_addr];
 		end
 
+	// ─── code, images and the boot sequencer ─────────────────────────────
+	// The resident program (tools/progimage.sh: program.hex, heap.hex,
+	// globals.hex) runs after every reset.  It may stage another program's
+	// image (tools/mkvmimage.py) in the staging RAM and write BOOT: the
+	// sequencer then loads that image into the program code RAM and the VM
+	// and starts it, until the next reset brings the resident one back.
+	localparam integer PROG_WORDS  = 8192;    // program code RAM
+	localparam integer STAGE_WORDS = 16384;   // staging RAM: 64 KiB
+	localparam integer HEAP_AW     = 13;
+
+	reg [31:0] code_rom    [0:`PROGRAM_WORDS-1];
+	reg [31:0] heap_rom    [0:`HEAP_WORDS-1];
+	reg [31:0] globals_rom [0:`GLOBALS_WORDS-1];
+	initial begin
+		$readmemh(`PROGRAM_HEX, code_rom);
+		$readmemh("heap.hex", heap_rom);
+		$readmemh("globals.hex", globals_rom);
+	end
+	reg [31:0] prog_code [0:PROG_WORDS-1];
+	reg [31:0] stage_ram [0:STAGE_WORDS-1];
+
+	wire [23:0] pc /*verilator public_flat_rd*/;
+	reg         code_bank /*verilator public_flat_rd*/;  // 0: the resident program, 1: the loaded one
+	reg  [13:0] prog_words /*verilator public_flat_rd*/;
+	// Code is read asynchronously: the VM samples code_rdata in the cycle it
+	// presents pc.
+	wire [31:0] code_rdata =
+		code_bank ? ((pc < prog_words) ? prog_code[pc[12:0]] : 32'hDEADBEEF)
+		          : ((pc < `PROGRAM_WORDS) ? code_rom[pc] : 32'hDEADBEEF);
+
+	// The sequencer: after reset it loads the resident program's heap and
+	// globals into the VM; on BOOT the staged image's code, heap and globals.
+	// The VM is held in reset throughout, writing through its load port.
+	localparam [2:0] SEQ_RESIDENT = 3'd0, SEQ_HEADER = 3'd1, SEQ_CODE = 3'd2,
+	                 SEQ_HEAP = 3'd3, SEQ_GLOBALS = 3'd4, SEQ_START = 3'd5, SEQ_RUN = 3'd6;
+	reg [2:0]  seq_state /*verilator public_flat_rd*/;
+	reg        seq_from_stage;         // copying the staged image (else the resident one)
+	reg        seq_data_ready;         // the word read last cycle is in seq_q
+	reg [15:0] seq_i, seq_n;           // word index within the current section, its length
+	reg [15:0] stage_code, stage_heap, stage_globals;
+	reg [15:0] glob_count;             // globals from the image; the rest become Val_int(0)
+	reg [31:0] seq_q, rom_q;
+	reg        vm_hold;
+	reg        load_we, load_globals;
+	reg [HEAP_AW-1:0] load_addr, image_words;
+	reg [31:0] load_data;
+	reg        boot_req;
+	reg [1:0]  hdr_i;
+
+	// The word read this cycle, available next cycle in rom_q (the resident
+	// images) or seq_q (the staged one): header words 2-4, then each section.
+	wire [13:0] seq_addr = (seq_state == SEQ_HEADER) ? 14'd2 + hdr_i
+	                     : 14'd8 + seq_i + ((seq_state != SEQ_CODE) ? stage_code : 16'd0)
+	                                     + ((seq_state == SEQ_GLOBALS) ? stage_heap : 16'd0);
+	always @(posedge clk_sys) begin
+		rom_q <= (seq_state == SEQ_GLOBALS) ? globals_rom[seq_i] : heap_rom[seq_i];
+		seq_q <= stage_ram[seq_addr];
+	end
+
+	always @(posedge clk_sys) begin
+		load_we <= 1'b0;
+		if (!resetn) begin
+			seq_state <= SEQ_RESIDENT;
+			seq_from_stage <= 1'b0;
+			seq_i <= 16'd0;
+			seq_data_ready <= 1'b0;
+			vm_hold <= 1'b1;
+			code_bank <= 1'b0;
+		end else case (seq_state)
+			SEQ_RESIDENT: begin             // straight to the heap copy
+				seq_n <= `HEAP_WORDS;
+				seq_i <= 16'd0;
+				seq_data_ready <= 1'b0;
+				seq_state <= SEQ_HEAP;
+			end
+			SEQ_HEADER: begin               // staged words 2, 3, 4: code, heap, globals
+				seq_data_ready <= 1'b1;
+				if (seq_data_ready) case (hdr_i)
+					2'd1: stage_code <= seq_q[15:0];
+					2'd2: stage_heap <= seq_q[15:0];
+					2'd3: begin
+						stage_globals <= seq_q[15:0];
+						seq_n <= stage_code;
+						seq_i <= 16'd0;
+						seq_data_ready <= 1'b0;
+						seq_state <= SEQ_CODE;
+					end
+					default: ;
+				endcase
+				hdr_i <= hdr_i + 2'd1;
+			end
+			// Each section: read word i, write it the cycle after.
+			SEQ_CODE, SEQ_HEAP, SEQ_GLOBALS: begin
+				if (seq_data_ready) begin
+					if (seq_state == SEQ_CODE) prog_code[seq_i[12:0] - 1] <= seq_q;
+					else begin
+						load_we <= 1'b1;
+						load_globals <= seq_state == SEQ_GLOBALS;
+						load_addr <= seq_i - 1;
+						load_data <= (seq_state == SEQ_GLOBALS && seq_i - 1 >= glob_count) ? 32'h1
+						           : seq_from_stage ? seq_q : rom_q;
+					end
+				end
+				if (seq_i < seq_n) begin              // seq_addr reads word seq_i this cycle
+					seq_i <= seq_i + 16'd1;
+					seq_data_ready <= 1'b1;
+				end else begin                  // section done: the next
+					seq_i <= 16'd0;
+					seq_data_ready <= 1'b0;
+					case (seq_state)
+						SEQ_CODE: begin seq_n <= stage_heap; seq_state <= SEQ_HEAP; end
+						SEQ_HEAP: begin   // every global slot: no stale pointers for the GC
+							seq_n <= 16'd4096;
+							glob_count <= seq_from_stage ? stage_globals : `GLOBALS_WORDS;
+							seq_state <= SEQ_GLOBALS;
+						end
+						default: seq_state <= SEQ_START;
+					endcase
+				end
+			end
+			SEQ_START: begin
+				image_words <= seq_from_stage ? stage_heap[HEAP_AW-1:0] : `HEAP_WORDS;
+				code_bank   <= seq_from_stage;
+				prog_words  <= stage_code[13:0];
+				seq_state   <= SEQ_RUN;         // the VM leaves reset next cycle
+			end
+			SEQ_RUN: begin
+				vm_hold <= 1'b0;
+				if (boot_req) begin
+					vm_hold <= 1'b1;
+					seq_from_stage <= 1'b1;
+					hdr_i <= 2'd0;
+					seq_data_ready <= 1'b0;
+					seq_state <= SEQ_HEADER;
+				end
+			end
+			default: seq_state <= SEQ_RUN;
+		endcase
+	end
+	wire vm_reset = !resetn || vm_hold;
+
 	// ─── the VM ──────────────────────────────────────────────────────────
-	wire [23:0] pc;
 	wire        trap_valid;
 	wire [7:0]  trap_prim;
 	wire [31:0] trap_arg0, trap_arg1;
 	reg         trap_ready;
 	reg  [31:0] trap_result;
-
-	// Code ROM: asynchronous, as the VM samples code_rdata in the cycle it
-	// presents pc.
-	reg  [31:0] code_rom [0:`PROGRAM_WORDS-1];
-	initial $readmemh(`PROGRAM_HEX, code_rom);
-	wire [31:0] code_rdata = (pc < `PROGRAM_WORDS) ? code_rom[pc] : 32'hDEADBEEF;
+	wire        putc_valid;
+	wire [7:0]  putc_char;
 
 	ocaml4142_vm_rtl #(
-		.STACK_AW       (13),
-		.HEAP_AW        (13),
-		.HEAP_INIT      ("heap.hex"),
-		.GLOBALS_INIT   ("globals.hex"),
-		.HEAP_INIT_WORDS(`HEAP_WORDS)
+		.STACK_AW      (13),
+		.HEAP_AW       (HEAP_AW),
+		.EXTERNAL_IMAGE(1'b1)
 	) vm (
-		.clk(clk_sys), .reset(~resetn),
+		.clk(clk_sys), .reset(vm_reset),
 		.pc(pc), .code_rdata(code_rdata),
 		.trap_valid(trap_valid), .trap_prim(trap_prim),
 		.trap_arg0(trap_arg0), .trap_arg1(trap_arg1),
@@ -129,11 +269,19 @@ module ethmin_vm_core #(
 		.accu(), .sp(), .state_out(), .imm(), .nvars(), .offset(),
 		.alloc_wosize(), .alloc_base(), .alloc_tag(), .closure_codeptr(),
 		.closure_nvars(), .closure_i(), .opcode_out(), .tos(), .halted(),
-		.putc_valid(), .putc_char());
+		.putc_valid(putc_valid), .putc_char(putc_char),
+		.load_we(load_we), .load_globals(load_globals), .load_addr(load_addr),
+		.load_data(load_data), .image_heap_words(image_words));
 
-	// ─── UART ────────────────────────────────────────────────────────────
-	reg        uart_we;
+	// ─── UART: a FIFO fed by I/O writes and caml_ml_output_char ─────────
+	reg  [7:0] uart_fifo [0:255];
+	reg  [8:0] uf_wp, uf_rp;             // one extra bit tells full from empty
+	wire       uf_empty = uf_wp == uf_rp;
+	wire       uf_full  = (uf_wp[7:0] == uf_rp[7:0]) && (uf_wp[8] != uf_rp[8]);
+	reg        uf_push;
+	reg  [7:0] uf_din;
 	reg  [7:0] uart_byte;
+	reg        uart_we;
 	wire       uart_wait;
 	simpleuart #(.DEFAULT_DIV(CLK_HZ / BAUD)) uart (
 		.clk(clk_sys), .resetn(resetn),
@@ -142,6 +290,22 @@ module ethmin_vm_core #(
 		.reg_dat_we(uart_we), .reg_dat_re(1'b0),
 		.reg_dat_di({24'd0, uart_byte}), .reg_dat_do(),
 		.reg_dat_wait(uart_wait));
+	always @(posedge clk_sys)
+		if (!resetn) begin
+			uf_wp <= 9'd0; uf_rp <= 9'd0; uart_we <= 1'b0;
+		end else begin
+			if (uf_push && !uf_full) begin
+				uart_fifo[uf_wp[7:0]] <= uf_din;
+				uf_wp <= uf_wp + 9'd1;
+			end
+			if (uart_we) begin
+				if (!uart_wait) uart_we <= 1'b0;   // simpleuart took it
+			end else if (!uf_empty) begin
+				uart_byte <= uart_fifo[uf_rp[7:0]];
+				uart_we <= 1'b1;
+				uf_rp <= uf_rp + 9'd1;
+			end
+		end
 
 	// ─── millisecond timer ───────────────────────────────────────────────
 	localparam integer MS_DIV = CLK_HZ / 1000;
@@ -160,44 +324,63 @@ module ethmin_vm_core #(
 	// One trap_ready per request; a request is not acted on again until
 	// trap_valid has dropped (the VM drops it on seeing trap_ready).
 	localparam [7:0] TRAP_IO_READ = 8'h01, TRAP_IO_WRITE = 8'h02;
-	localparam [1:0] IO_IDLE = 2'd0, IO_PKT_READ = 2'd1, IO_UART = 2'd2, IO_DONE = 2'd3;
-	reg [1:0] io_state;
+	localparam [2:0] IO_IDLE = 3'd0, IO_PKT_READ = 3'd1, IO_UART = 3'd2, IO_DONE = 3'd3,
+	                 IO_STAGE_READ = 3'd4;
+	reg [2:0] io_state;
 	reg [1:0] io_lane;
 	reg [7:0] leds;
 	assign LED = leds;
 
 	wire io_read  = trap_prim == TRAP_IO_READ;
 	wire io_write = trap_prim == TRAP_IO_WRITE;
-	wire io_new   = trap_valid && (io_read || io_write) && io_state == IO_IDLE;
+	wire io_new   = trap_valid && (io_read || io_write) && io_state == IO_IDLE && !vm_reset;
 	wire [31:0] io_addr = trap_arg0;
 	wire io_is_packet = io_addr < 32'h1000;
+	wire io_is_stage  = io_addr >= 32'h10000 && io_addr < 32'h20000;
 
 	always @(*) begin
 		pa_en    = io_new && io_is_packet;
 		pa_we    = (io_new && io_is_packet && io_write) ? (4'b0001 << io_addr[1:0]) : 4'b0000;
 		pa_addr  = io_addr[11:2];
 		pa_wdata = {4{trap_arg1[7:0]}};
+		// caml_ml_output_char, or a UART write the I/O space accepts
+		uf_push  = putc_valid || (io_state == IO_UART && !uf_full);
+		uf_din   = putc_valid ? putc_char : trap_arg1[7:0];
 	end
+
+	wire [31:0] io_read_word = (io_state == IO_PKT_READ) ? pa_rdata : stage_q;
+
+	// The staging RAM's program side: a byte per address, as the packet RAM.
+	reg [31:0] stage_q;
+	integer stage_lane;
+	always @(posedge clk_sys)
+		if (io_new && io_is_stage) begin
+			if (io_write)
+				for (stage_lane = 0; stage_lane < 4; stage_lane = stage_lane + 1)
+					if (io_addr[1:0] == stage_lane)
+						stage_ram[io_addr[15:2]][8*stage_lane +: 8] <= trap_arg1[7:0];
+			stage_q <= stage_ram[io_addr[15:2]];
+		end
 
 	always @(posedge clk_sys) begin
 		trap_ready <= 1'b0;
 		rx_ack     <= 1'b0;
 		tx_start   <= 1'b0;
-		if (!resetn) begin
+		boot_req   <= 1'b0;
+		if (!resetn || vm_reset) begin
 			io_state <= IO_IDLE;
-			leds     <= 8'd0;
-			tx_len   <= 11'd0;
-			uart_we  <= 1'b0;
+			if (!resetn) begin
+				leds   <= 8'd0;
+				tx_len <= 11'd0;
+			end
 		end else case (io_state)
 			IO_IDLE: if (io_new) begin
 				io_lane <= io_addr[1:0];
-				if (io_is_packet) begin
-					if (io_read) io_state <= IO_PKT_READ;      // BRAM data next cycle
+				if (io_is_packet || io_is_stage) begin
+					if (io_read) io_state <= io_is_packet ? IO_PKT_READ : IO_STAGE_READ;  // BRAM data next cycle
 					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
 				end else if (io_write && io_addr == 32'h1005) begin
-					uart_byte <= trap_arg1[7:0];
-					uart_we   <= 1'b1;
-					io_state  <= IO_UART;
+					io_state <= IO_UART;                                // into the FIFO when there is room
 				end else begin
 					case (io_addr)
 						32'h1000: trap_result <= {29'd0, rx_trunc, tx_busy, rx_valid};
@@ -211,23 +394,24 @@ module ethmin_vm_core #(
 						32'h1002: rx_ack <= 1'b1;                     // release the RX window
 						32'h1003: begin tx_len <= trap_arg1[10:0]; tx_start <= 1'b1; end
 						32'h1004: leds <= trap_arg1[7:0];
+						32'h1007: boot_req <= 1'b1;                   // boot the staged image
 						default: ;
 					endcase
 					trap_ready <= 1'b1;
 					io_state   <= IO_DONE;
 				end
 			end
-			IO_PKT_READ: begin
-				trap_result <= {24'd0, pa_rdata[8*io_lane +: 8]};
+			IO_PKT_READ, IO_STAGE_READ: begin
+				trap_result <= {24'd0, io_read_word[8*io_lane +: 8]};
 				trap_ready  <= 1'b1;
 				io_state    <= IO_DONE;
 			end
-			IO_UART: if (!uart_wait) begin                     // simpleuart took the byte
-				uart_we    <= 1'b0;
+			IO_UART: if (!uf_full) begin                         // the FIFO took the byte
 				trap_ready <= 1'b1;
 				io_state   <= IO_DONE;
 			end
 			IO_DONE: if (!trap_valid) io_state <= IO_IDLE;
+			default: io_state <= IO_IDLE;
 		endcase
 	end
 endmodule
