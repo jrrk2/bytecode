@@ -12,6 +12,7 @@
 //   0x1003  w  length: send the TX window
 //   0x1004  rw LEDs
 //   0x1005  w  UART byte (simpleuart, 115200 8N1)
+//   0x1006  r  milliseconds since reset (30 bits, wraps after ~12 days)
 //
 // The packet RAM is a true dual-port BRAM: port B belongs to the DMA on
 // eth_clk, port A to the VM on clk_sys; eth_stream_dma's ownership handshake
@@ -142,6 +143,19 @@ module ethmin_vm_core #(
 		.reg_dat_di({24'd0, uart_byte}), .reg_dat_do(),
 		.reg_dat_wait(uart_wait));
 
+	// ─── millisecond timer ───────────────────────────────────────────────
+	localparam integer MS_DIV = CLK_HZ / 1000;
+	reg [15:0] ms_prescale;
+	reg [29:0] ms_count;
+	always @(posedge clk_sys)
+		if (!resetn) begin
+			ms_prescale <= 16'd0;
+			ms_count    <= 30'd0;
+		end else if (ms_prescale == MS_DIV - 1) begin
+			ms_prescale <= 16'd0;
+			ms_count    <= ms_count + 30'd1;
+		end else ms_prescale <= ms_prescale + 16'd1;
+
 	// ─── the I/O space, answering the VM's trap port ─────────────────────
 	// One trap_ready per request; a request is not acted on again until
 	// trap_valid has dropped (the VM drops it on seeing trap_ready).
@@ -190,6 +204,7 @@ module ethmin_vm_core #(
 						32'h1001: trap_result <= {16'd0, pcspma_status};
 						32'h1002: trap_result <= {21'd0, rx_len};
 						32'h1004: trap_result <= {24'd0, leds};
+						32'h1006: trap_result <= {2'b00, ms_count};
 						default:  trap_result <= 32'd0;
 					endcase
 					if (io_write) case (io_addr)

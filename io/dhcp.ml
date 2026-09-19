@@ -1,0 +1,300 @@
+(* dhcp: ethmin (ARP + ICMP echo) with a DHCP client that leases its address
+   instead of having one built in.
+
+   I/O space as ethmin.ml, plus
+     0x1006  milliseconds since reset (30 bits)
+
+   Init -> DISCOVER -> Selecting -> (OFFER) REQUEST -> Requesting -> (ACK)
+   Bound; a timeout in Selecting or Requesting starts again, and a Bound
+   client renews (REQUEST) at T1, half the lease.  Addresses and the
+   transaction id are 4-byte arrays: 32 bits do not fit an OCaml int here. *)
+
+external ( = ) : 'a -> 'a -> bool = "%equal"
+external ( <> ) : 'a -> 'a -> bool = "%notequal"
+external ( < ) : 'a -> 'a -> bool = "%lessthan"
+external ( > ) : 'a -> 'a -> bool = "%greaterthan"
+external ( >= ) : 'a -> 'a -> bool = "%greaterequal"
+external ( + ) : int -> int -> int = "%addint"
+external ( - ) : int -> int -> int = "%subint"
+external ( * ) : int -> int -> int = "%mulint"
+external ( / ) : int -> int -> int = "%divint"
+external ( mod ) : int -> int -> int = "%modint"
+external ( land ) : int -> int -> int = "%andint"
+external ( lor ) : int -> int -> int = "%orint"
+external ( lxor ) : int -> int -> int = "%xorint"
+external ( lsl ) : int -> int -> int = "%lslint"
+external ( lsr ) : int -> int -> int = "%lsrint"
+external ( && ) : bool -> bool -> bool = "%sequand"
+external ( || ) : bool -> bool -> bool = "%sequor"
+external not : bool -> bool = "%boolnot"
+external string_length : string -> int = "%string_length"
+external string_get : string -> int -> char = "%string_safe_get"
+external int_of_char : char -> int = "%identity"
+external array_get : 'a array -> int -> 'a = "%array_safe_get"
+external array_set : 'a array -> int -> 'a -> unit = "%array_safe_set"
+
+type 'a ref = { mutable contents : 'a }
+external ref : 'a -> 'a ref = "%makemutable"
+external ( ! ) : 'a ref -> 'a = "%field0"
+external ( := ) : 'a ref -> 'a -> unit = "%setfield0"
+
+external io_read : int -> int = "vm_io_read"
+external io_write : int -> int -> unit = "vm_io_write"
+
+(* ---- memory map ---- *)
+let rx_base = 0x0000
+let tx_base = 0x0800
+let eth_status = 0x1000
+let eth_status_phy = 0x1001
+let eth_rxlen = 0x1002
+let eth_txlen = 0x1003
+let leds = 0x1004
+let uart = 0x1005
+let timer_ms = 0x1006
+
+let eth_rx_valid = 1
+let eth_tx_busy = 2
+let eth_rx_trunc = 4
+
+let rx i = io_read (rx_base + i)
+let tx i v = io_write (tx_base + i) v
+let tx_get i = io_read (tx_base + i)
+let now () = io_read timer_ms
+
+(* ---- identity ---- *)
+let my_mac = "\x02\x00\x00\x4d\x47\x32"  (* "MG2": not ethmin's MG1, so a DHCP server sees a new client *)
+let mac i = int_of_char (string_get my_mac i)
+
+(* ---- DHCP state ---- *)
+type state = Init | Selecting | Requesting | Bound
+
+let state = ref Init
+let my_ip = [| 0; 0; 0; 0 |]        (* 0.0.0.0 until bound *)
+let offered_ip = [| 0; 0; 0; 0 |]
+let server_id = [| 0; 0; 0; 0 |]
+let xid = [| 0x56; 0x4d; 0; 0 |]    (* "VM" and two bytes of the clock *)
+let deadline = ref 0                 (* ms: retransmit or renew *)
+let lease_s = ref 0
+
+let bound () = !state = Bound
+let ip i = array_get my_ip i
+
+(* ---- uart ---- *)
+let uart_putc c = io_write uart (int_of_char c)
+let uart_puts s =
+  for i = 0 to string_length s - 1 do uart_putc (string_get s i) done
+let rec uart_dec n =
+  if n >= 10 then uart_dec (n / 10);
+  io_write uart (48 + n mod 10)
+let uart_ip a =
+  for i = 0 to 3 do
+    uart_dec (array_get a i);
+    if i < 3 then uart_putc '.'
+  done
+
+(* ---- checksum over the TX window ---- *)
+let lnot_16 s = s lxor 0xFFFF
+
+let ip_checksum start len =
+  let s = ref 0 in
+  let i = ref 0 in
+  while !i + 1 < len do
+    s := !s + ((tx_get (start + !i) lsl 8) lor tx_get (start + !i + 1));
+    i := !i + 2
+  done;
+  if !i < len then s := !s + (tx_get (start + !i) lsl 8);
+  while !s lsr 16 <> 0 do s := (!s land 0xFFFF) + (!s lsr 16) done;
+  lnot_16 !s
+
+let eth_send len =
+  while io_read eth_status land eth_tx_busy <> 0 do () done;
+  let len =
+    if len < 60 then begin           (* pad to the 60-byte minimum *)
+      for i = len to 59 do tx i 0 done;
+      60
+    end else len in
+  io_write eth_txlen len
+
+let ip_is_mine off =
+  rx off = ip 0 && rx (off + 1) = ip 1 && rx (off + 2) = ip 2 && rx (off + 3) = ip 3
+
+(* ---- ARP and ICMP echo, as ethmin, once we have an address ---- *)
+let handle_arp len =
+  if bound () && len >= 42 && rx 20 = 0x00 && rx 21 = 0x01 && ip_is_mine 38 then begin
+    for i = 0 to 5 do
+      tx i (rx (6 + i));
+      tx (6 + i) (mac i)
+    done;
+    tx 12 0x08; tx 13 0x06;
+    tx 14 0x00; tx 15 0x01;
+    tx 16 0x08; tx 17 0x00;
+    tx 18 6; tx 19 4;
+    tx 20 0x00; tx 21 0x02;
+    for i = 0 to 5 do tx (22 + i) (mac i) done;
+    for i = 0 to 3 do tx (28 + i) (ip i) done;
+    for i = 0 to 5 do tx (32 + i) (rx (22 + i)) done;
+    for i = 0 to 3 do tx (38 + i) (rx (28 + i)) done;
+    eth_send 42;
+    uart_puts " -> arp reply\n"
+  end
+
+let handle_icmp len ihl =
+  if bound () && ip_is_mine 30 && rx (14 + ihl) = 8 then begin
+    for i = 0 to len - 1 do tx i (rx i) done;
+    for i = 0 to 5 do
+      tx i (rx (6 + i));
+      tx (6 + i) (mac i)
+    done;
+    for i = 0 to 3 do
+      tx (26 + i) (ip i);
+      tx (30 + i) (rx (26 + i))
+    done;
+    tx 24 0; tx 25 0;
+    let s = ip_checksum 14 ihl in
+    tx 24 (s lsr 8); tx 25 (s land 0xFF);
+    tx (14 + ihl) 0;
+    tx (14 + ihl + 2) 0; tx (14 + ihl + 3) 0;
+    let s = ip_checksum (14 + ihl) (len - 14 - ihl) in
+    tx (14 + ihl + 2) (s lsr 8); tx (14 + ihl + 3) (s land 0xFF);
+    eth_send len;
+    uart_puts " -> echo reply\n"
+  end
+
+(* ---- DHCP client ---- *)
+(* Frame layout: Ethernet 0..13, IP 14..33, UDP 34..41, BOOTP from 42 (its
+   options from 42 + 240 = 282), 300 bytes of BOOTP: a 342-byte frame. *)
+let bootp = 42
+let frame_len = 342
+
+type dhcp_msg = Discover | Request
+
+let dhcp_send msg =
+  for i = 0 to frame_len - 1 do tx i 0 done;
+  for i = 0 to 5 do tx i 0xff; tx (6 + i) (mac i) done;       (* broadcast *)
+  tx 12 0x08; tx 13 0x00;
+  tx 14 0x45; tx 16 ((frame_len - 14) lsr 8); tx 17 ((frame_len - 14) land 0xFF);
+  tx 22 64; tx 23 17;                                           (* TTL, UDP *)
+  for i = 0 to 3 do tx (30 + i) 0xff done;                      (* to 255.255.255.255, from 0.0.0.0 *)
+  let s = ip_checksum 14 20 in
+  tx 24 (s lsr 8); tx 25 (s land 0xFF);
+  tx 35 68; tx 37 67;                                           (* ports 68 -> 67 *)
+  tx 38 ((frame_len - 34) lsr 8); tx 39 ((frame_len - 34) land 0xFF);  (* UDP checksum 0: none *)
+  tx bootp 1; tx (bootp + 1) 1; tx (bootp + 2) 6;               (* BOOTREQUEST, Ethernet *)
+  for i = 0 to 3 do tx (bootp + 4 + i) (array_get xid i) done;
+  tx (bootp + 10) 0x80;                                         (* broadcast replies *)
+  for i = 0 to 5 do tx (bootp + 28 + i) (mac i) done;           (* chaddr *)
+  tx (bootp + 236) 0x63; tx (bootp + 237) 0x82; tx (bootp + 238) 0x53; tx (bootp + 239) 0x63;
+  let o = ref (bootp + 240) in
+  let opt b = tx !o b; o := !o + 1 in
+  opt 53; opt 1;
+  (match msg with
+   | Discover -> opt 1
+   | Request ->
+     opt 3;
+     opt 50; opt 4; for i = 0 to 3 do opt (array_get offered_ip i) done;
+     opt 54; opt 4; for i = 0 to 3 do opt (array_get server_id i) done);
+  opt 55; opt 3; opt 1; opt 3; opt 6;                           (* subnet, router, DNS *)
+  opt 255;
+  eth_send frame_len
+
+let discover () =
+  let t = now () in
+  array_set xid 2 ((t lsr 8) land 0xFF);
+  array_set xid 3 (t land 0xFF);
+  uart_puts "dhcp: discover\n";
+  dhcp_send Discover;
+  state := Selecting;
+  deadline := now () + 4000
+
+let request () =
+  uart_puts "dhcp: request ";
+  uart_ip offered_ip;
+  uart_putc '\n';
+  dhcp_send Request;
+  state := Requesting;
+  deadline := now () + 4000
+
+(* A BOOTREPLY to us: its message type (0 if it has none), with the
+   offered address, server and lease noted on the way. *)
+let dhcp_parse len =
+  let msg = ref 0 in
+  for i = 0 to 3 do array_set offered_ip i (rx (bootp + 16 + i)) done;
+  let o = ref (bootp + 240) in
+  while !o + 1 < len && rx !o <> 255 do
+    let code = rx !o in
+    if code = 0 then o := !o + 1
+    else begin
+      let n = rx (!o + 1) in
+      (match code with
+       | 53 -> msg := rx (!o + 2)
+       | 54 -> for i = 0 to 3 do array_set server_id i (rx (!o + 2 + i)) done
+       | 51 -> lease_s := (rx (!o + 2) lsl 24) lor (rx (!o + 3) lsl 16)
+                          lor (rx (!o + 4) lsl 8) lor rx (!o + 5)
+       | _ -> ());
+      o := !o + 2 + n
+    end
+  done;
+  !msg
+
+let for_us () =
+  rx bootp = 2
+  && rx (bootp + 4) = array_get xid 0 && rx (bootp + 5) = array_get xid 1
+  && rx (bootp + 6) = array_get xid 2 && rx (bootp + 7) = array_get xid 3
+  && rx (bootp + 28) = mac 0 && rx (bootp + 29) = mac 1 && rx (bootp + 30) = mac 2
+  && rx (bootp + 31) = mac 3 && rx (bootp + 32) = mac 4 && rx (bootp + 33) = mac 5
+  && rx (bootp + 236) = 0x63 && rx (bootp + 237) = 0x82
+  && rx (bootp + 238) = 0x53 && rx (bootp + 239) = 0x63
+
+let handle_dhcp len =
+  if len >= bootp + 240 && for_us () then begin
+    let msg = dhcp_parse len in
+    match !state, msg with
+    | Selecting, 2 -> request ()                                (* OFFER *)
+    | Requesting, 5 ->                                          (* ACK *)
+      for i = 0 to 3 do array_set my_ip i (array_get offered_ip i) done;
+      state := Bound;
+      deadline := now () + !lease_s * 500;                      (* T1: half the lease, in ms *)
+      uart_puts "dhcp: bound ";
+      uart_ip my_ip;
+      uart_puts " lease ";
+      uart_dec !lease_s;
+      uart_puts " s from ";
+      uart_ip server_id;
+      uart_putc '\n'
+    | Requesting, 6 -> uart_puts "dhcp: nak\n"; state := Init  (* NAK *)
+    | _ -> ()
+  end
+
+let dhcp_tick () =
+  match !state with
+  | Init -> discover ()
+  | Selecting | Requesting -> if now () > !deadline then begin
+      uart_puts "dhcp: timeout\n"; state := Init end
+  | Bound -> if now () > !deadline then request ()             (* renew *)
+
+let uart_hex16 v =
+  let digits = "0123456789abcdef" in
+  for k = 3 downto 0 do uart_putc (string_get digits ((v lsr (4 * k)) land 0xF)) done
+
+let () =
+  io_write leds 1;
+  uart_puts "dhcp (OCaml VM): phy=";
+  uart_hex16 (io_read eth_status_phy);
+  uart_putc '\n';
+  let pkts = ref 0 in
+  while true do
+    dhcp_tick ();
+    let st = io_read eth_status in
+    if st land eth_rx_valid <> 0 then begin
+      let len = io_read eth_rxlen land 0x7FF in
+      if rx 12 = 0x08 && rx 13 = 0x06 then handle_arp len
+      else if rx 12 = 0x08 && rx 13 = 0x00 && len >= 42 then begin
+        let ihl = (rx 14 land 0x0F) * 4 in
+        if rx 23 = 1 then handle_icmp len ihl
+        else if rx 23 = 17 && rx (14 + ihl + 2) = 0 && rx (14 + ihl + 3) = 68 then handle_dhcp len
+      end;
+      io_write eth_rxlen 0;
+      pkts := !pkts + 1;
+      io_write leds ((if bound () then 2 else 0) lor ((!pkts land 0x3F) lsl 2))
+    end
+  done
