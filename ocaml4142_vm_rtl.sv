@@ -9,7 +9,11 @@ module ocaml4142_vm_rtl #(
     // In simulation +heap=, +globals= and +heap_words= override them.
     parameter HEAP_INIT = "",  // untyped: Vivado 2020.1 synthesis has no string parameters
     parameter GLOBALS_INIT = "",
-    parameter int HEAP_INIT_WORDS = 0
+    parameter int HEAP_INIT_WORDS = 0,
+    // EXTERNAL_IMAGE: the program's heap and globals are written through the
+    // load port while in reset (a boot sequencer), and image_heap_words says
+    // where its heap image ends, in place of HEAP_INIT/HEAP_INIT_WORDS.
+    parameter bit EXTERNAL_IMAGE = 1'b0
 ) (
     input logic clk,
     input logic reset,
@@ -42,7 +46,15 @@ module ocaml4142_vm_rtl #(
     output logic                halted,
     // caml_ml_output_char: one-cycle strobe with the character written
     output logic                putc_valid,
-    output logic [         7:0] putc_char
+    output logic [         7:0] putc_char,
+
+    // Load port: while reset is held, load_we writes load_data to
+    // heap_mem[load_addr] (or globals_mem[load_addr] with load_globals).
+    input  logic                load_we,
+    input  logic                load_globals,
+    input  logic [HEAP_AW-1:0]  load_addr,
+    input  logic [VALUEW-1:0]   load_data,
+    input  logic [HEAP_AW-1:0]  image_heap_words
 );
 
 
@@ -329,6 +341,14 @@ module ocaml4142_vm_rtl #(
   localparam logic [7:0] GC_FORWARDED = 8'hFF;  // header colour of a copied block
   localparam int NO_SCAN_TAG = 251;             // strings, floats, custom: no pointers inside
   int gc_count;
+
+  // Where the dynamic heap starts (above the image) and each semi-space's size.
+  logic [HEAP_AW-1:0] image_words;
+  logic [HEAP_AW:0] heap_base, semi_space;
+  assign image_words = EXTERNAL_IMAGE ? image_heap_words : hp_after_image;
+  assign heap_base = (image_words == 0) ? 1 : image_words;
+  assign semi_space = (gc_semispace_override != 0) ? gc_semispace_override
+                    : (((1 << HEAP_AW) - heap_base) >> 1);
 
   // A pointer into the current from-space: even, no code-pointer marker,
   // an index in [from_lo, from_lo + gc_semi).
@@ -734,6 +754,19 @@ module ocaml4142_vm_rtl #(
     gm_wd_a = '0;
     putc_valid <= 1'b0;
 
+    // Loading an image through port A while reset holds the VM still.
+    if (reset && load_we) begin
+      if (load_globals) begin
+        gm_we_a = 1'b1;
+        gm_addr_a = load_addr[GLOBALS_AW-1:0];
+        gm_wd_a = load_data;
+      end else begin
+        hm_we_a = 1'b1;
+        hm_addr_a = load_addr;
+        hm_wd_a = load_data;
+      end
+    end
+
     if (reset) begin
       putc_char    <= '0;
       trap_valid   <= 1'b0;
@@ -779,14 +812,11 @@ module ocaml4142_vm_rtl #(
 
 
       // the dynamic heap starts above the image, and never at index 0
-      heap_lo  <= (hp_after_image == 0) ? 1 : hp_after_image;
-      gc_semi  <= (gc_semispace_override != 0) ? gc_semispace_override
-                : (((1 << HEAP_AW) - ((hp_after_image == 0) ? 1 : hp_after_image)) >> 1);
-      from_lo  <= (hp_after_image == 0) ? 1 : hp_after_image;
-      hp       <= (hp_after_image == 0) ? 1 : hp_after_image;
-      hp_limit <= ((hp_after_image == 0) ? 1 : hp_after_image)
-                + ((gc_semispace_override != 0) ? gc_semispace_override
-                : (((1 << HEAP_AW) - ((hp_after_image == 0) ? 1 : hp_after_image)) >> 1));
+      heap_lo  <= heap_base;
+      gc_semi  <= semi_space;
+      from_lo  <= heap_base;
+      hp       <= heap_base;
+      hp_limit <= heap_base + semi_space;
       gc_count <= 0;
     end else if (!halted) begin
       // A two-cycle state's request cycle sets this again (hold_for_read).

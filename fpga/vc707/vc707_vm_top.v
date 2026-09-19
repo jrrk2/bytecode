@@ -86,7 +86,12 @@ module vc707_vm_top (
       .accu       (accu),
       .halted     (halted),
       .putc_valid (putc_valid),
-      .putc_char  (putc_char)
+      .putc_char  (putc_char),
+      .load_we    (1'b0),
+      .load_globals(1'b0),
+      .load_addr  ('0),
+      .load_data  (32'd0),
+      .image_heap_words('0)
   );
 
   // ------------------------------------------------- messages and sequencing

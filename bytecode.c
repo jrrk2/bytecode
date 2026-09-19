@@ -165,7 +165,8 @@ void byte_caml_load_code(int fd, asize_t len)
   caml_fixup_endianness(caml_start_code, caml_code_size);
 #endif
   printf("Dumping %zu bytes\n", caml_code_size);
-  for (int i = 0; i < caml_code_size; i++)
+  /* caml_code_size is in bytes; the code is 32-bit words */
+  for (int i = 0; i < caml_code_size / sizeof(*caml_start_code); i++)
     {
     printf("(%d,0x%x) ", i, caml_start_code[i]);
     code_rom[i] = (uint32_t) caml_start_code[i];
