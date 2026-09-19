@@ -23,8 +23,19 @@ done
 # -use-prims build; the reference trace and device output come from a -custom
 # debug runtime linked with io_stubs.c and the same device model (ethmodel.c).
 { /usr/bin/ocamlrun -p; printf 'vm_io_read\nvm_io_write\n'; } > "$T/vm.prims"
+# A "(* regress-tftp: prog.ml" line makes the model serve prog.ml's netboot
+# image (tools/progimage.sh + mkvmimage.py) as $ETHMODEL_TFTP_FILE.
+tftp_image() {  # io test name -> the image file, built if needed ("" if none)
+    local src; src=$(sed -n 's/^(\* regress-tftp: \([^ ]*\).*$/\1/p' "$B/io/$1.ml" 2>/dev/null | head -1)
+    [ -z "$src" ] && return
+    if [ ! -s "$T/$1.tftp.img" ] || [ "$B/$src" -nt "$T/$1.tftp.img" ]; then
+        "$B/tools/progimage.sh" "$B/$src" "$T/$1.tftp" > /dev/null && "$B/tools/mkvmimage.py" "$T/$1.tftp" "$T/$1.tftp.img" > /dev/null
+    fi
+    echo "$T/$1.tftp.img"
+}
 for ml in "$B"/io/*.ml; do
     n=$(basename "$ml" .ml)
+    export ETHMODEL_TFTP_FILE=$(tftp_image "$n")
     [ -s "$T/$n.trace" ] && [ "$T/$n.trace" -nt "$ml" ] && [ "$T/$n.trace" -nt "$B/ethmodel.c" ] && continue
     ( cd "$T" && cp "$ml" . && /usr/bin/ocamlc -nopervasives -use-prims vm.prims "$n.ml" -o "$n" 2>"$n.comp.err" \
         && /usr/bin/ocamlc -nopervasives -custom -runtime-variant d -ccopt -I"$B" "$n.ml" "$B/io/io_stubs.c" \
@@ -61,6 +72,7 @@ for tr in "$T"/*.trace; do
     img=$T/$n.img
     # a test can ask for simulation plusargs with a "(* regress: +name=value ... *)" line
     extra=$(sed -n 's/^(\* regress: \(.*\)$/\1/p' "$T/$n.ml" 2>/dev/null | head -1)
+    [ -f "$B/io/$n.ml" ] && export ETHMODEL_TFTP_FILE=$(tftp_image "$n")
     ( cd "$d" && timeout 600 "$M/obj/Vocaml4142_vm_rtl" "$T/$n" "$tr" +heap="$img/heap.hex" +globals="$img/globals.hex" \
         +heap_words="$(awk '/heap_words/{print $2}' "$img/image.txt")" $extra > full.log 2>&1; echo "exit $?" >> full.log; rm -f trace.vcd )
     gcs=$(grep -c '^GC [0-9]*:' "$d/full.log"); gcbad=$(grep -c 'HEAP CHECK FAILED\|GC: out of memory' "$d/full.log")

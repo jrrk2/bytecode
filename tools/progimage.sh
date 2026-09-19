@@ -3,12 +3,13 @@
 # images for the FPGA builds.
 #   program.hex           its CODE section (bc2hex.py)
 #   heap.hex, globals.hex its DATA section in the VM's heap format (bc2image)
-#   program.vh            PROGRAM_HEX, PROGRAM_WORDS, PROGRAM_NAME, HEAP_WORDS
+#   program.vh            PROGRAM_HEX, PROGRAM_WORDS, PROGRAM_NAME, HEAP_WORDS,
+#                         GLOBALS_WORDS
 # A .ml is compiled with ocamlc -nopervasives, and with the VM's primitive
 # list (the runtime's, plus vm_io_read/vm_io_write) if it uses vm_io_*.
 # Intermediate files go to $GEN (default ~/bytecode-work/progimage).
 set -e
-PROG=$(readlink -f "$1"); OUT=$(readlink -f "$2")
+PROG=$(realpath -m "$1"); OUT=$(realpath -m "$2")
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 GEN=${GEN:-$HOME/bytecode-work/progimage}
 OCAMLC=${OCAMLC:-ocamlc}
@@ -36,11 +37,13 @@ python3 "$REPO/tools/bc2hex.py" "$BC" "$OUT/program.hex" > /dev/null
 "$GEN/bc2image" "$BC" "$OUT" > /dev/null
 words=$(wc -l < "$OUT/program.hex")
 heap_words=$(awk '/heap_words/{print $2}' "$OUT/image.txt")
+globals_words=$(awk '/^globals/{print $2}' "$OUT/image.txt")
 rm "$OUT/image.txt"
 cat > "$OUT/program.vh" <<VH
 \`define PROGRAM_HEX "program.hex"
 \`define PROGRAM_WORDS $words
 \`define PROGRAM_NAME "$name"
 \`define HEAP_WORDS $heap_words
+\`define GLOBALS_WORDS $globals_words
 VH
 echo "$name: program.hex ($words words), heap.hex ($heap_words words), globals.hex -> $OUT"
