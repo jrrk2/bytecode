@@ -156,6 +156,9 @@ static void dhcp_reply_frame(const uint8_t *req, int type) {
   memcpy(bootp + 4, req + 4, 4);                     // xid
   bootp[10] = 0x80;                                  // broadcast flag
   memcpy(bootp + 16, leased_ip, 4);                  // yiaddr
+  // siaddr: many home routers name themselves here with no boot service to
+  // offer; $ETHMODEL_SIADDR_ROUTER makes this server do the same
+  if (getenv("ETHMODEL_SIADDR_ROUTER")) memcpy(bootp + 20, server_ip, 4);
   memcpy(bootp + 28, req + 28, 16);                  // chaddr
   o = bootp + 236;
   o[0] = 0x63; o[1] = 0x82; o[2] = 0x53; o[3] = 0x63; o += 4;

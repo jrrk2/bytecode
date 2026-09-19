@@ -3,6 +3,7 @@
    the DHCP reply names (siaddr, file), else 192.168.1.106 and "vm.img" --
    into the staging RAM, checks it (tools/mkvmimage.py's format) and writes
    BOOT: the boot sequencer then loads it into the VM and starts it.
+   (siaddr counts only when the reply names a file too.)
 
    I/O space as ethmin.ml, plus
      0x1006   milliseconds since reset (30 bits)
@@ -255,15 +256,17 @@ let file_name = [| 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0;
 let file_len = ref 0
 let default_file = "vm.img"
 
-(* The ACK's siaddr and file, if it names them (the BOOTP fields). *)
+(* The ACK's boot file and siaddr (the BOOTP fields), when it names a file.
+   siaddr alone is no sign of a boot service: home routers commonly put
+   their own address there, so without a file the defaults stand. *)
 let note_boot_server () =
-  if rx (bootp + 20) <> 0 then
-    for i = 0 to 3 do array_set server_ip i (rx (bootp + 20 + i)) done;
   file_len := 0;
   while !file_len < 31 && rx (bootp + 108 + !file_len) <> 0 do
     array_set file_name !file_len (rx (bootp + 108 + !file_len));
     file_len := !file_len + 1
   done;
+  if !file_len > 0 && rx (bootp + 20) <> 0 then
+    for i = 0 to 3 do array_set server_ip i (rx (bootp + 20 + i)) done;
   if !file_len = 0 then begin
     for i = 0 to string_length default_file - 1 do
       array_set file_name i (int_of_char (string_get default_file i))
