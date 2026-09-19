@@ -55,16 +55,10 @@ const char *statenam(int state)
     case S_MAKEBLOCK_WRITE_FIELD: return "S_MAKEBLOCK_WRITE_FIELD";    // Write fields (loop)
     
     // MAKEBLOCK1 states
-    case S_MAKEBLOCK1_FIELD: return "S_MAKEBLOCK1_FIELD";     // Write single field
     
     // MAKEBLOCK2 states
-    case S_MAKEBLOCK2_HDR: return "S_MAKEBLOCK2_HDR";       // Write header
-    case S_MAKEBLOCK2_FIELDS: return "S_MAKEBLOCK2_FIELDS";    // Write fields (loop)
     
     // MAKEBLOCK3 states
-    case S_MAKEBLOCK3_READ_STACK: return "S_MAKEBLOCK3_READ_STACK"; // Read values from stack
-    case S_MAKEBLOCK3_HDR: return "S_MAKEBLOCK3_HDR";       // Write header
-    case S_MAKEBLOCK3_FIELDS: return "S_MAKEBLOCK3_FIELDS";    // Write fields (loop)
     
     // APPTERM states
     case S_APPTERM_READ_CODE: return "S_APPTERM_READ_CODE";    // Read arguments
@@ -113,21 +107,21 @@ const char *statenam(int state)
     case S_RETURN_SET_STATE: return "S_RETURN_SET_STATE";     // Restore state
     
     // Heap allocation micro-ops (for CLOSURE/MAKEBLOCK via S_EXEC)
-    case S_HEAP_ALLOC_HDR: return "S_HEAP_ALLOC_HDR";       // Write header to heap
-    case S_HEAP_ALLOC_FIELDS: return "S_HEAP_ALLOC_FIELDS";    // Write fields one per cycle
     
     // CLOSURE-specific states (kept from original)
-    case S_CLOSURE_ALLOC_HDR: return "S_CLOSURE_ALLOC_HDR";
-    case S_CLOSURE_WRITE_CODE: return "S_CLOSURE_WRITE_CODE";
-    case S_CLOSURE_WRITE_CLOSINFO: return "S_CLOSURE_WRITE_CLOSINFO";
-    case S_CLOSURE_WRITE_ENV: return "S_CLOSURE_WRITE_ENV";
-    case S_CLOSURE_DONE: return "S_CLOSURE_DONE";
-    case S_CLOSUREREC_CALC: return "S_CLOSUREREC_CALC";
 
     case S_PUSH_RETADDR_WRITE_FRAME: return "S_PUSH_RETADDR_WRITE_FRAME";   // Write return frame
 
     // Trap / ccall
     case S_TRAP_WAIT: return "S_TRAP_WAIT";
+    case S_ALLOC_HDR: return "S_ALLOC_HDR";
+    case S_ALLOC_FIELD: return "S_ALLOC_FIELD";
+    case S_ALLOC_DONE: return "S_ALLOC_DONE";
+    case S_DUP_HDR: return "S_DUP_HDR";
+    case S_DUP_FIELD: return "S_DUP_FIELD";
+    case S_RESTART_HDR: return "S_RESTART_HDR";
+    case S_RESTART_ARG: return "S_RESTART_ARG";
+    case S_RESTART_ENV: return "S_RESTART_ENV";
     case S_DIV_ITER: return "S_DIV_ITER";
     case S_STRLEN_HDR: return "S_STRLEN_HDR";
     case S_STRLEN_LAST: return "S_STRLEN_LAST";
@@ -135,7 +129,6 @@ const char *statenam(int state)
     case S_IO_WAIT: return "S_IO_WAIT";
 
     // obsolete states
-    case S_HEAP_DONE: return "S_HEAP_DONE";
     case S_OFFSETCLOSURE_READ: return "S_OFFSETCLOSURE_READ";
     case S_OFFSETCLOSURE_ADD: return "S_OFFSETCLOSURE_ADD";
     // Unknown state for debugging

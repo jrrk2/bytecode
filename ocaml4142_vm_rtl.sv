@@ -274,7 +274,7 @@ module ocaml4142_vm_rtl #(
   endfunction
 
   function automatic logic [VALUEW-1:0] Wosize_hd(input logic [VALUEW-1:0] hdr);
-    Wosize_hd = hdr[VALUEW-1:10];  // Extract size from header bits [31:10]
+    Wosize_hd = hdr[31:16];  // the VM's header: {wosize[31:16], color[15:8], tag[7:0]}
   endfunction
 
   function automatic logic [VALUEW-1:0] Val_long(input logic [VALUEW-1:0] n);
@@ -306,8 +306,11 @@ module ocaml4142_vm_rtl #(
   logic [ HEAP_AW-1:0] hp;
   logic [ HEAP_AW-1:0] hp_after_image = HEAP_INIT_WORDS;
 
+  // Code pointers (closure field 0, return addresses on the stack) set the
+  // top bit, which no heap pointer (index << 2) has: the GC must tell them
+  // apart, since both are otherwise even words.
   function automatic logic [VALUEW-1:0] Make_codeptr(input logic [PCW-1:0] pc);
-    Make_codeptr = {pc, 2'b00};
+    Make_codeptr = {1'b1, {(VALUEW - PCW - 3) {1'b0}}, pc, 2'b00};
   endfunction
 
   function automatic logic [VALUEW-1:0] Ptr_of_heap_index(input logic [HEAP_AW-1:0] idx);
@@ -357,19 +360,29 @@ module ocaml4142_vm_rtl #(
   assign state_out = state;
   
 
-  int                alloc_fields_left;
-  logic [VALUEW-1:0] alloc_result_ptr;
-  logic              closurerec_push;
 
 
 
-  logic [VALUEW-1:0] pending_field;
 
 
 
 
   logic [       7:0] imm_b;
-  logic [      31:0] imm2;  // second operand of APPTERM, (PUSH)GETGLOBALFIELD, C_CALLN, GETPUBMET
+  logic [      31:0] imm2;
+
+  // The allocator (S_ALLOC_*): a block of alloc_wosize fields, tag
+  // alloc_tag.  Closures start with a prefix: code pointer, closinfo, and
+  // for GRAB's partial application the current env (alloc_prefix = 2 or 3).
+  // The remaining fields are accu (if alloc_use_accu), then sp[0], sp[1], ...
+  // (OCaml 4.14's MAKEBLOCK, CLOSURE, which pushes accu first, and GRAB).
+  logic [15:0] alloc_i;        // the field being written
+  logic [ 1:0] alloc_prefix;   // 0 for blocks, 2 for closures, 3 for GRAB
+  logic        alloc_use_accu;
+  logic [PCW-1:0] alloc_code;  // a closure's code
+  logic        alloc_push_result;  // CLOSUREREC pushes the closure too
+  logic        alloc_then_return;  // GRAB returns the closure to its caller
+  logic [ 7:0] restart_n;          // RESTART: arguments saved in the closure
+  localparam logic [VALUEW-1:0] CLOSINFO = 32'h5;  // Make_closinfo(0, 2): env from field 2  // second operand of APPTERM, (PUSH)GETGLOBALFIELD, C_CALLN, GETPUBMET
 
   logic [VALUEW-1:0] temp_arg1, temp_arg2, temp_arg3;
   logic [VALUEW-1:0] temp_field1, temp_field2, temp_field3;
@@ -405,8 +418,6 @@ module ocaml4142_vm_rtl #(
   logic        div_rem_negative;
   logic        div_want_mod;
   state_t next_state_after_mem;
-  logic [7:0] field_write_idx;
-  logic [7:0] total_fields_to_write;
 
 
   logic [STACK_AW-1:0] temp_stack_addr;
@@ -464,6 +475,10 @@ module ocaml4142_vm_rtl #(
   logic [    VALUEW-1:0] tos_q;
   logic                  st_a_was_tos;
   assign tos = tos_q;
+  // Debug outputs of the old closure path, no longer driven by anything.
+  assign closure_codeptr = alloc_code;
+  assign closure_nvars = nvars[7:0];
+  assign closure_i = alloc_i[7:0];
 
   task automatic stack_read_a(input logic [STACK_AW-1:0] a);
     st_re_a = 1'b1;
@@ -654,7 +669,6 @@ module ocaml4142_vm_rtl #(
       accu                  <= VAL_UNIT;
       env                   <= '0;
       extra_args            <= 8'd0;
-      closurerec_push       <= 1'b0;
       temp_arg1             <= '0;
       temp_arg2             <= '0;
       temp_arg3             <= '0;
@@ -668,8 +682,6 @@ module ocaml4142_vm_rtl #(
       temp_extra_args       <= '0;
       op_cycle_count        <= '0;
       next_state_after_mem  <= S_DONE;
-      field_write_idx       <= '0;
-      total_fields_to_write <= '0;
       temp_stack_addr       <= '0;
       temp_heap_addr        <= '0;
       temp_globals_addr     <= '0;
@@ -1434,21 +1446,26 @@ module ocaml4142_vm_rtl #(
             end
 
 
-            GRAB: begin
-              if (extra_args >= imm) begin
-                extra_args <= extra_args - imm;
-              end else begin
-
-
-                $display("GRAB partial application TBD");
-              end
+            // GRAB n: enough arguments, or partial application: a closure
+            // {RESTART, closinfo, env, the 1 + extra_args arguments} returned
+            // to the caller.  RESTART (just before GRAB) unpacks one again.
+            GRAB:
+            if (extra_args >= imm) begin
+              extra_args <= extra_args - imm;
+            end else begin
+              alloc_wosize <= 3 + 1 + extra_args;
+              alloc_tag <= TAG_CLOSURE;
+              alloc_prefix <= 3;
+              alloc_use_accu <= 1'b0;
+              alloc_code <= pc - 3;  // the RESTART before this GRAB
+              alloc_push_result <= 1'b0;
+              alloc_then_return <= 1'b1;
+              state <= S_ALLOC_HDR;
             end
 
-
             RESTART: begin
-
-
-              $display("RESTART TBD");
+              temp_heap_addr <= Heap_index_of_ptr(env);
+              state <= S_RESTART_HDR;
             end
 
 
@@ -1547,80 +1564,18 @@ module ocaml4142_vm_rtl #(
 
 
 
-            MAKEBLOCK: begin
-              $display("MAKEBLOCK %d,%d", alloc_wosize, alloc_tag);
-              state <= S_HEAP_ALLOC_HDR;
-            end
-
-
-
-            MAKEBLOCK1: begin
-              alloc_base <= hp;
-              alloc_wosize <= 1;
-              alloc_tag <= imm;
-              heap_write(hp, Make_header(1, imm));
-              hp <= hp + 1;
-              state <= S_MAKEBLOCK1_FIELD;
-            end
-
-
-
-
-
-
-
-
-
-
-
-
-
-            MAKEBLOCK2: begin
-              alloc_base <= hp;
-              alloc_wosize <= 2;
-              alloc_tag <= imm;
-              temp_stack_addr <= sp;
-              state <= S_STACK_READ;
-              next_state_after_mem <= S_MAKEBLOCK2_HDR;
-            end
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-            MAKEBLOCK3: begin
-              alloc_base <= hp;
-              alloc_wosize <= 3;
-              alloc_tag <= imm;
-              temp_stack_addr <= sp;
-              op_cycle_count <= 0;
-              state <= S_MAKEBLOCK3_READ_STACK;
+            // MAKEBLOCK n,tag (both operands fetched into alloc_wosize,
+            // alloc_tag) and MAKEBLOCK1-3 tag: field 0 = accu, then sp[0]...
+            MAKEBLOCK, MAKEBLOCK1, MAKEBLOCK2, MAKEBLOCK3: begin
+              if (opcode != MAKEBLOCK) begin
+                alloc_wosize <= (opcode == MAKEBLOCK1) ? 1 : (opcode == MAKEBLOCK2) ? 2 : 3;
+                alloc_tag    <= imm;
+              end
+              alloc_prefix <= 0;
+              alloc_use_accu <= 1'b1;
+              alloc_push_result <= 1'b0;
+              alloc_then_return <= 1'b0;
+              state <= S_ALLOC_HDR;
             end
 
 
@@ -1828,8 +1783,14 @@ module ocaml4142_vm_rtl #(
 
 
 
-            RETURN: begin
-              temp_stack_addr <= sp + imm - 3;
+            RETURN:
+            if (extra_args != 0) begin  // over-application: apply the result
+              sp <= sp + imm;
+              extra_args <= extra_args - 1;
+              temp_heap_addr <= Heap_index_of_ptr(accu) + 1;
+              state <= S_HEAP_READ;
+              next_state_after_mem <= S_APPLY1_SETPC;  // pc = Code_val(accu), env = accu
+            end else begin
               op_cycle_count <= 0;
               state <= S_RETURN_READ_FRAME;
             end
@@ -1917,13 +1878,6 @@ module ocaml4142_vm_rtl #(
               next_state_after_mem <= S_VECTLENGTH_CALC;
             end
 
-            S_VECTLENGTH_CALC: begin
-              // temp_heap_val now contains the header
-              // Header format: [31:10] = wosize, [9:2] = color, [1:0] = tag low bits
-              accu  <= Val_long(Wosize_hd(temp_heap_val));
-              state <= S_DONE;
-            end
-
             GETVECTITEM:
             if (!rd_phase) begin
               stack_read_a(sp);  // the index
@@ -1943,6 +1897,13 @@ module ocaml4142_vm_rtl #(
                 16'h0fd: caml_ml_flush();
                 16'h103: caml_ml_open_descriptor_in();
                 16'h104: caml_ml_open_descriptor_out();
+                16'h136: begin  // caml_obj_dup: copy a block (array literals)
+                  if (accu[0]) state <= S_DONE;  // an immediate is its own copy
+                  else begin
+                    temp_heap_addr <= Heap_index_of_ptr(accu);
+                    state <= S_DUP_HDR;
+                  end
+                end
                 16'h116: begin  // caml_ml_string_length: header, then last word
                   temp_heap_addr <= Heap_index_of_ptr(accu);
                   state <= S_STRLEN_HDR;
@@ -1964,6 +1925,11 @@ module ocaml4142_vm_rtl #(
             end else begin
               unique case (imm)
                 16'h108: caml_ml_output_char();
+                16'h00d: begin  // caml_array_get_addr: Field(accu, Int_val(tos))
+                  temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW:1];
+                  state <= S_HEAP_READ;
+                  next_state_after_mem <= S_GETFIELD_DONE;
+                end
                 16'h15b: caml_string_get();
                 16'h194: begin  // vm_io_write addr data
                   trap_valid <= 1'b1;
@@ -2004,68 +1970,36 @@ module ocaml4142_vm_rtl #(
             ATOM0: begin
             end
 
+            // CLOSURE nvars,ofs and CLOSUREREC 1,nvars,ofs: a closure block
+            // {code, closinfo, accu, sp[0], ...}; CLOSUREREC then pushes it.
             CLOSURE: begin
-              closure_nvars   <= nvars;
-              closure_codeptr <= $signed(pc) + $signed(offset) - 1;
-
               alloc_wosize <= 2 + nvars;
-              alloc_tag    <= TAG_CLOSURE;
-
-              alloc_result_ptr <= Ptr_of_heap_index(hp);
-
-              closure_i <= 0;
-
-
-              if (nvars > 0) begin
-                sp <= sp - 1;
-                stack_write(sp-1, accu);
-              end
-
-              state <= S_CLOSURE_ALLOC_HDR;
+              alloc_tag <= TAG_CLOSURE;
+              alloc_prefix <= 2;
+              alloc_code <= $signed(pc) + $signed(offset) - 1;
+              alloc_use_accu <= nvars != 0;
+              alloc_push_result <= 1'b0;
+              alloc_then_return <= 1'b0;
+              state <= S_ALLOC_HDR;
             end
 
-
-
-
-
-            CLOSUREREC: begin
-              $display("CLOSUREREC (nfuncs = %d, nvars = %d)", imm, nvars);
-              if (imm == 1) begin
-
-
-
-                offset <= code_rdata;
-                pc <= pc + 1;
-
-
-                closure_nvars <= nvars;
-
-
-                if (nvars > 0) begin
-                  sp <= sp - 1;
-                  stack_write(sp-1, accu);
-                end
-
-
-                closurerec_push <= 1'b1;
-
-
-                alloc_wosize <= 2 + nvars;
-                alloc_tag    <= TAG_CLOSURE;
-                alloc_fields_left <= 2 + nvars;
-                alloc_result_ptr <= Ptr_of_heap_index(hp);
-
-
-                state <= S_CLOSUREREC_CALC;
-              end else begin
-                $display("Multi-function CLOSUREREC (nfuncs > 1) not yet implemented");
-                trap_valid <= 1'b1;
-                trap_prim <= 8'hF0;
-                state <= S_TRAP_WAIT;
-              end
+            CLOSUREREC:
+            if (imm == 1) begin
+              alloc_wosize <= 2 + nvars;
+              alloc_tag <= TAG_CLOSURE;
+              alloc_prefix <= 2;
+              alloc_code <= $signed(pc) + $signed(code_rdata);  // the offset word at pc
+              pc <= pc + 1;
+              alloc_use_accu <= nvars != 0;
+              alloc_push_result <= 1'b1;
+              alloc_then_return <= 1'b0;
+              state <= S_ALLOC_HDR;
+            end else begin
+              $display("Multi-function CLOSUREREC (nfuncs > 1) not yet implemented");
+              trap_valid <= 1'b1;
+              trap_prim <= 8'hF0;
+              state <= S_TRAP_WAIT;
             end
-
-
 
             OFFSETCLOSURE0:  accu <= env;
             OFFSETCLOSURE3:  read_acc_from_heap(env, 1 + 3);
@@ -2142,154 +2076,114 @@ module ocaml4142_vm_rtl #(
 
 
 
-        S_HEAP_ALLOC_HDR: begin
-          accu <= Ptr_of_heap_index(hp);
-          heap_write(hp, Make_header(alloc_wosize, alloc_tag));
-          hp <= hp + 1;
-
-
-          alloc_fields_left <= alloc_wosize;
-          state <= S_HEAP_ALLOC_FIELDS;
+        // caml_obj_dup: a new block with the source's header and fields,
+        // copied one field per two cycles (read, then write, both on port A).
+        S_DUP_HDR:
+        if (!rd_phase) begin
+          heap_read_a(temp_heap_addr);
+          hold_for_read();
+        end else begin
+          heap_write(hp, hm_rd_a);  // same size and tag
+          alloc_base <= hp;
+          alloc_wosize <= hm_rd_a[31:16];
+          alloc_i <= 0;
+          state <= S_DUP_FIELD;
         end
 
-        S_HEAP_ALLOC_FIELDS: begin
-          logic is_first_field, is_env_field, is_later_field;
-          logic is_closurerec_var_field, field_from_stack;
-          is_first_field = (alloc_fields_left == alloc_wosize);
-          is_env_field = !is_first_field && (alloc_fields_left == alloc_wosize - 1);
-          is_later_field = !is_first_field && !is_env_field && (alloc_fields_left > 0);
-          is_closurerec_var_field = is_later_field && opcode == CLOSUREREC &&
-              closure_nvars > 0 && closure_i < closure_nvars;
-          field_from_stack = (is_first_field && opcode != CLOSUREREC && opcode != CLOSURE) ||
-              (is_later_field && opcode != CLOSURE);
+        S_DUP_FIELD:
+        if (alloc_i == alloc_wosize) begin
+          hp <= alloc_base + 1 + alloc_wosize;
+          accu <= Ptr_of_heap_index(alloc_base);
+          state <= S_DONE;
+        end else if (!rd_phase) begin
+          heap_read_a(temp_heap_addr + 1 + alloc_i);
+          hold_for_read();
+        end else begin
+          heap_write(alloc_base + 1 + alloc_i, hm_rd_a);
+          alloc_i <= alloc_i + 1;
+        end
 
-          if (field_from_stack && !rd_phase) begin
-            stack_read_a(is_closurerec_var_field ? sp + closure_i : sp);
+        // RESTART: env is a GRAB closure {code, closinfo, env', args...}:
+        // push the args, env = env', extra_args += their count.
+        S_RESTART_HDR:
+        if (!rd_phase) begin
+          heap_read_a(temp_heap_addr);
+          hold_for_read();
+        end else begin
+          restart_n <= hm_rd_a[31:16] - 3;
+          sp <= sp - (hm_rd_a[31:16] - 3);
+          alloc_i <= 0;
+          state <= S_RESTART_ARG;
+        end
+
+        S_RESTART_ARG:
+        if (alloc_i == restart_n) state <= S_RESTART_ENV;
+        else if (!rd_phase) begin
+          heap_read_a(Heap_index_of_ptr(env) + 1 + 3 + alloc_i);
+          hold_for_read();
+        end else begin
+          stack_write(sp + alloc_i, hm_rd_a);
+          alloc_i <= alloc_i + 1;
+        end
+
+        S_RESTART_ENV:
+        if (!rd_phase) begin
+          heap_read_a(Heap_index_of_ptr(env) + 1 + 2);
+          hold_for_read();
+        end else begin
+          env <= hm_rd_a;
+          extra_args <= extra_args + restart_n;
+          state <= S_DONE;
+        end
+
+        S_VECTLENGTH_CALC: begin  // temp_heap_val holds the block's header
+          accu  <= Val_long(Wosize_hd(temp_heap_val));
+          state <= S_DONE;
+        end
+
+        S_ALLOC_HDR: begin
+          heap_write(hp, Make_header(alloc_wosize, alloc_tag));
+          alloc_base <= hp;
+          alloc_i <= 0;
+          state <= S_ALLOC_FIELD;
+        end
+
+        S_ALLOC_FIELD: begin
+          logic [15:0] item;         // index into [accu,] sp[0], sp[1], ...
+          logic [15:0] stack_item;   // index into sp[0], sp[1], ...
+          logic field_is_accu, field_from_stack;
+          logic [VALUEW-1:0] prefix_field;
+          item = alloc_i - alloc_prefix;
+          field_is_accu = alloc_i >= alloc_prefix && alloc_use_accu && item == 0;
+          field_from_stack = alloc_i >= alloc_prefix && !field_is_accu;
+          stack_item = alloc_use_accu ? item - 1 : item;
+          prefix_field = (alloc_i == 0) ? Make_codeptr(alloc_code) : (alloc_i == 1) ? CLOSINFO : env;
+          if (alloc_i == alloc_wosize) state <= S_ALLOC_DONE;
+          else if (field_from_stack && !rd_phase) begin
+            stack_read_a(sp + stack_item);
             hold_for_read();
-          end else if (alloc_fields_left == alloc_wosize) begin
-
-            if (opcode == CLOSUREREC) begin
-              heap_write(hp, pending_field);
-            end else if (opcode == CLOSURE) begin
-              heap_write(hp, pending_field);
-            end else begin
-              heap_write(hp, st_rd_a);  // tos
-              sp <= sp + 1;
-            end
-            hp <= hp + 1;
-            alloc_fields_left <= alloc_fields_left - 1;
-
-          end else if (alloc_fields_left == alloc_wosize - 1) begin
-
-            if (opcode == CLOSUREREC) begin
-              heap_write(hp, Val_int(2));
-            end else if (opcode == CLOSURE) begin
-              heap_write(hp, env);
-            end else begin
-              heap_write(hp, Val_int(0));
-            end
-            hp <= hp + 1;
-            alloc_fields_left <= alloc_fields_left - 1;
-
-
-            closure_i <= 0;
-
-          end else if (alloc_fields_left > 0) begin
-
-
-            if (opcode == CLOSUREREC && closure_nvars > 0 && closure_i < closure_nvars) begin
-              heap_write(hp, st_rd_a);  // stack[sp+closure_i]
-              hp <= hp + 1;
-              closure_i <= closure_i + 1;
-              alloc_fields_left <= alloc_fields_left - 1;
-            end else if (opcode == CLOSURE) begin
-
-              alloc_fields_left <= 0;
-            end else begin
-              heap_write(hp, st_rd_a);  // tos
-              sp <= sp + 1;
-              alloc_fields_left <= alloc_fields_left - 1;
-            end
-
           end else begin
-
-            if (opcode == CLOSUREREC) begin
-              if (closure_nvars > 0) begin
-
-                sp <= sp + closure_nvars - 1;
-                stack_write(sp+closure_nvars-1, accu);
-              end else begin
-
-                sp <= sp - 1;
-                stack_write(sp-1, accu);
-              end
-              closurerec_push <= 1'b0;
-            end else if (closurerec_push) begin
-
-              stack_write(sp-1, accu);
-              sp <= sp - 1;
-              closurerec_push <= 1'b0;
-            end
-
-            state <= S_HEAP_DONE;
+            heap_write(alloc_base + 1 + alloc_i,
+                       (alloc_i < alloc_prefix) ? prefix_field : field_is_accu ? accu : st_rd_a);
+            alloc_i <= alloc_i + 1;
           end
         end
 
-        S_HEAP_DONE: begin
-          heap_write(hp, 32'hDEADBEEF);
-          hp <= hp + 1;
-          state <= S_DONE;
+        S_ALLOC_DONE: begin
+          logic [STACK_AW-1:0] sp_after;  // the stacked fields popped
+          sp_after = sp + (alloc_wosize - alloc_prefix - alloc_use_accu);
+          hp <= alloc_base + 1 + alloc_wosize;
+          accu <= Ptr_of_heap_index(alloc_base);
+          if (alloc_push_result) begin
+            stack_write(sp_after - 1, Ptr_of_heap_index(alloc_base));
+            sp <= sp_after - 1;
+          end else sp <= sp_after;
+          if (alloc_then_return) begin  // GRAB: return the closure through the frame
+            imm <= 0;
+            op_cycle_count <= 0;
+            state <= S_RETURN_READ_FRAME;
+          end else state <= S_DONE;
         end
-
-        S_CLOSURE_ALLOC_HDR: begin
-          heap_write(hp, Make_header(2 + closure_nvars, TAG_CLOSURE));
-          hp <= hp + 1;
-          state <= S_CLOSURE_WRITE_CODE;
-        end
-
-        S_CLOSURE_WRITE_CODE: begin
-          $display("CLOSURE: creating closure at heap[%0d] with code=%0d", hp, closure_codeptr);
-          heap_write(hp, Make_codeptr(closure_codeptr));
-          hp <= hp + 1;
-          state <= S_CLOSURE_WRITE_CLOSINFO;
-        end
-
-        S_CLOSURE_WRITE_CLOSINFO: begin
-          heap_write(hp, 32'd0);
-          hp <= hp + 1;
-          closure_i <= 0;
-          state <= (closure_nvars == 0) ? S_CLOSURE_DONE : S_CLOSURE_WRITE_ENV;
-        end
-
-        S_CLOSURE_WRITE_ENV:
-        if (!rd_phase) begin
-          stack_read_a(sp + closure_i);
-          hold_for_read();
-        end else begin
-          heap_write(hp, st_rd_a);
-          hp <= hp + 1;
-          closure_i <= closure_i + 1;
-
-          if (closure_i + 1 == closure_nvars) state <= S_CLOSURE_DONE;
-        end
-
-        S_CLOSURE_DONE: begin
-          accu <= alloc_result_ptr;
-          sp <= sp + closure_nvars;
-          heap_write(hp, 32'hDEADBEEF);
-          hp <= hp + 1;
-          state <= S_DONE;
-        end
-
-        S_CLOSUREREC_CALC: begin
-          logic [PCW-1:0] tgt;
-          tgt = $signed(pc) + $signed(offset) - 1;
-          pending_field <= Make_codeptr(tgt);
-          state <= S_HEAP_ALLOC_HDR;
-        end
-
-
-
 
         S_DIV_ITER: begin
           logic [32:0] trial;  // {remainder, next dividend bit} - divisor
@@ -2444,94 +2338,6 @@ module ocaml4142_vm_rtl #(
         end
 
 
-
-
-
-        S_MAKEBLOCK1_FIELD: begin
-          heap_write(hp, accu);
-          hp <= hp + 1;
-          accu <= Ptr_of_heap_index(alloc_base);
-          state <= S_DONE;
-        end
-
-
-
-
-
-        S_MAKEBLOCK2_HDR: begin
-          temp_field1 <= temp_heap_val;
-          heap_write(hp, Make_header(2, alloc_tag));
-          hp <= hp + 1;
-          field_write_idx <= 0;
-          state <= S_MAKEBLOCK2_FIELDS;
-        end
-
-        S_MAKEBLOCK2_FIELDS: begin
-          case (field_write_idx)
-            0: begin
-              heap_write(hp, accu);
-              hp <= hp + 1;
-              field_write_idx <= 1;
-            end
-            1: begin
-              heap_write(hp, temp_field1);
-              hp <= hp + 1;
-              sp <= sp + 1;
-              accu <= Ptr_of_heap_index(alloc_base);
-              state <= S_DONE;
-            end
-          endcase
-        end
-
-
-
-
-
-        S_MAKEBLOCK3_READ_STACK:
-        if (!rd_phase) begin
-          stack_read_a(sp + op_cycle_count);  // sp, sp+1
-          hold_for_read();
-        end else begin
-          case (op_cycle_count)
-            0: begin
-              temp_field1 <= st_rd_a;
-              op_cycle_count <= 1;
-            end
-            1: begin
-              temp_field2 <= st_rd_a;
-              state <= S_MAKEBLOCK3_HDR;
-            end
-          endcase
-        end
-
-        S_MAKEBLOCK3_HDR: begin
-          heap_write(hp, Make_header(3, alloc_tag));
-          hp <= hp + 1;
-          field_write_idx <= 0;
-          state <= S_MAKEBLOCK3_FIELDS;
-        end
-
-        S_MAKEBLOCK3_FIELDS: begin
-          case (field_write_idx)
-            0: begin
-              heap_write(hp, accu);
-              hp <= hp + 1;
-              field_write_idx <= 1;
-            end
-            1: begin
-              heap_write(hp, temp_field1);
-              hp <= hp + 1;
-              field_write_idx <= 2;
-            end
-            2: begin
-              heap_write(hp, temp_field2);
-              hp <= hp + 1;
-              sp <= sp + 2;
-              accu <= Ptr_of_heap_index(alloc_base);
-              state <= S_DONE;
-            end
-          endcase
-        end
 
 
 

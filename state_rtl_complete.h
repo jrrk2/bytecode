@@ -27,16 +27,10 @@
     S_MAKEBLOCK_WRITE_FIELD,    // Write fields (loop)
     
     // MAKEBLOCK1 states
-    S_MAKEBLOCK1_FIELD,     // Write single field
     
     // MAKEBLOCK2 states
-    S_MAKEBLOCK2_HDR,       // Write header
-    S_MAKEBLOCK2_FIELDS,    // Write fields (loop)
     
     // MAKEBLOCK3 states
-    S_MAKEBLOCK3_READ_STACK, // Read values from stack
-    S_MAKEBLOCK3_HDR,       // Write header
-    S_MAKEBLOCK3_FIELDS,    // Write fields (loop)
     
     // APPTERM states
     S_APPTERM_READ_CODE,    // Read arguments
@@ -85,16 +79,8 @@
     S_RETURN_SET_STATE,     // Restore state
     
     // Heap allocation micro-ops (for CLOSURE/MAKEBLOCK via S_EXEC)
-    S_HEAP_ALLOC_HDR,       // Write header to heap
-    S_HEAP_ALLOC_FIELDS,    // Write fields one per cycle
     
     // CLOSURE-specific states (kept from original)
-    S_CLOSURE_ALLOC_HDR,
-    S_CLOSURE_WRITE_CODE,
-    S_CLOSURE_WRITE_CLOSINFO,
-    S_CLOSURE_WRITE_ENV,
-    S_CLOSURE_DONE,
-    S_CLOSUREREC_CALC,
 
     S_PUSH_RETADDR_WRITE_FRAME,
     // arrays
@@ -104,6 +90,20 @@
 
     // Trap / ccall
     S_TRAP_WAIT,
+
+    // The allocator: header, fields, done (MAKEBLOCK*, CLOSURE, CLOSUREREC)
+    S_ALLOC_HDR,
+    S_ALLOC_FIELD,
+    S_ALLOC_DONE,
+
+    // caml_obj_dup: header, then fields
+    S_DUP_HDR,
+    S_DUP_FIELD,
+
+    // RESTART: unpack a partial application's closure
+    S_RESTART_HDR,
+    S_RESTART_ARG,
+    S_RESTART_ENV,
 
     // DIVINT / MODINT: one quotient bit per cycle
     S_DIV_ITER,
@@ -117,7 +117,6 @@
     S_IO_WAIT,
 
     // obsolete states
-    S_HEAP_DONE,
     S_OFFSETCLOSURE_READ,
     S_OFFSETCLOSURE_ADD,
     // Unknown state for debugging
