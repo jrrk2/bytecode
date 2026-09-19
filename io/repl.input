@@ -1,0 +1,21 @@
+1 + 2 * 3
+(1 + 2) * 3
+10 / 3 = 3
+let x = 7
+x * x - 1
+let rec fact n = if n = 0 then 1 else n * fact (n - 1)
+fact 10
+let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)
+fib 10
+let add a b = a + b
+let inc = add 1
+inc 41
+let k = let y = 3 in fun z -> y * z
+k 5
+if 2 >= 3 then 1 else -1
+fun q -> q
+y
+1 / 0
+3 +
+true = false
+let t = 1000 mod 7
