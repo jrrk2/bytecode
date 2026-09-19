@@ -3,6 +3,7 @@
 #include "verilated_vcd_c.h"
 typedef enum
 #include "state_rtl_complete.h"
+#include "ethmodel.h"
 
 #include <fstream>
 #include <iostream>
@@ -45,7 +46,6 @@ const char *statenam(int state)
     // Helper completion states
     case S_ENVACC_DONE: return "S_ENVACC_DONE";          // Complete ENVACC operations
     case S_GETFIELD_DONE: return "S_GETFIELD_DONE";        // Complete GETFIELD operations
-    case S_OFFSETREF_ADD: return "S_OFFSETREF_ADD";        // Complete OFFSETREF calculation
     case S_OFFSETCLOSURE_CALC: return "S_OFFSETCLOSURE_CALC";   // Complete OFFSETCLOSURE calculation
     
     // MAKEBLOCK3 states
@@ -54,16 +54,10 @@ const char *statenam(int state)
     case S_MAKEBLOCK_WRITE_FIELD: return "S_MAKEBLOCK_WRITE_FIELD";    // Write fields (loop)
     
     // MAKEBLOCK1 states
-    case S_MAKEBLOCK1_FIELD: return "S_MAKEBLOCK1_FIELD";     // Write single field
     
     // MAKEBLOCK2 states
-    case S_MAKEBLOCK2_HDR: return "S_MAKEBLOCK2_HDR";       // Write header
-    case S_MAKEBLOCK2_FIELDS: return "S_MAKEBLOCK2_FIELDS";    // Write fields (loop)
     
     // MAKEBLOCK3 states
-    case S_MAKEBLOCK3_READ_STACK: return "S_MAKEBLOCK3_READ_STACK"; // Read values from stack
-    case S_MAKEBLOCK3_HDR: return "S_MAKEBLOCK3_HDR";       // Write header
-    case S_MAKEBLOCK3_FIELDS: return "S_MAKEBLOCK3_FIELDS";    // Write fields (loop)
     
     // APPTERM states
     case S_APPTERM_READ_CODE: return "S_APPTERM_READ_CODE";    // Read arguments
@@ -112,24 +106,40 @@ const char *statenam(int state)
     case S_RETURN_SET_STATE: return "S_RETURN_SET_STATE";     // Restore state
     
     // Heap allocation micro-ops (for CLOSURE/MAKEBLOCK via S_EXEC)
-    case S_HEAP_ALLOC_HDR: return "S_HEAP_ALLOC_HDR";       // Write header to heap
-    case S_HEAP_ALLOC_FIELDS: return "S_HEAP_ALLOC_FIELDS";    // Write fields one per cycle
     
     // CLOSURE-specific states (kept from original)
-    case S_CLOSURE_ALLOC_HDR: return "S_CLOSURE_ALLOC_HDR";
-    case S_CLOSURE_WRITE_CODE: return "S_CLOSURE_WRITE_CODE";
-    case S_CLOSURE_WRITE_CLOSINFO: return "S_CLOSURE_WRITE_CLOSINFO";
-    case S_CLOSURE_WRITE_ENV: return "S_CLOSURE_WRITE_ENV";
-    case S_CLOSURE_DONE: return "S_CLOSURE_DONE";
-    case S_CLOSUREREC_CALC: return "S_CLOSUREREC_CALC";
 
     case S_PUSH_RETADDR_WRITE_FRAME: return "S_PUSH_RETADDR_WRITE_FRAME";   // Write return frame
 
     // Trap / ccall
     case S_TRAP_WAIT: return "S_TRAP_WAIT";
+    case S_ALLOC_HDR: return "S_ALLOC_HDR";
+    case S_ALLOC_FIELD: return "S_ALLOC_FIELD";
+    case S_ALLOC_DONE: return "S_ALLOC_DONE";
+    case S_GC_START: return "S_GC_START";
+    case S_GC_ROOT: return "S_GC_ROOT";
+    case S_GC_ROOT_WB: return "S_GC_ROOT_WB";
+    case S_GC_FWD: return "S_GC_FWD";
+    case S_GC_COPY: return "S_GC_COPY";
+    case S_GC_MARK: return "S_GC_MARK";
+    case S_GC_SCAN: return "S_GC_SCAN";
+    case S_GC_SCAN_FIELD: return "S_GC_SCAN_FIELD";
+    case S_GC_SCAN_WB: return "S_GC_SCAN_WB";
+    case S_GC_DONE: return "S_GC_DONE";
+    case S_SWITCH_TAG: return "S_SWITCH_TAG";
+    case S_SWITCH_JUMP: return "S_SWITCH_JUMP";
+    case S_DUP_HDR: return "S_DUP_HDR";
+    case S_DUP_FIELD: return "S_DUP_FIELD";
+    case S_RESTART_HDR: return "S_RESTART_HDR";
+    case S_RESTART_ARG: return "S_RESTART_ARG";
+    case S_RESTART_ENV: return "S_RESTART_ENV";
+    case S_DIV_ITER: return "S_DIV_ITER";
+    case S_STRLEN_HDR: return "S_STRLEN_HDR";
+    case S_STRLEN_LAST: return "S_STRLEN_LAST";
+    case S_STRGET_READ: return "S_STRGET_READ";
+    case S_IO_WAIT: return "S_IO_WAIT";
 
     // obsolete states
-    case S_HEAP_DONE: return "S_HEAP_DONE";
     case S_OFFSETCLOSURE_READ: return "S_OFFSETCLOSURE_READ";
     case S_OFFSETCLOSURE_ADD: return "S_OFFSETCLOSURE_ADD";
     // Unknown state for debugging
@@ -184,6 +194,17 @@ int main(int argc, char** argv) {
 	  printf("Terminating on PC %d out of %d range\n", top->pc, prog_length);
 	  matching = 0;
 	}
+        // The trap port as an I/O bus (vm_io_read / vm_io_write), answered by
+        // the ethmin device model: one ready per request, not again until
+        // trap_valid has dropped.
+        static bool trap_answered = false;
+        top->trap_ready = 0;
+        if (top->trap_valid && !trap_answered && (top->trap_prim == 1 || top->trap_prim == 2)) {
+            if (top->trap_prim == 1) top->trap_result = ethmodel_read((int32_t)top->trap_arg0);
+            else ethmodel_write((int32_t)top->trap_arg0, (int32_t)top->trap_arg1);
+            top->trap_ready = 1;
+            trap_answered = true;
+        } else if (!top->trap_valid) trap_answered = false;
         // Provide instruction byte
         top->code_rdata = top->pc < sizeof(code_rom)/sizeof(*code_rom) ? code_rom[top->pc] : 0xDEADBEEF;
         // Clock tick
@@ -271,6 +292,10 @@ int main(int argc, char** argv) {
 
         if (top->halted) {
             std::cout << "HALT\n";
+            break;
+        }
+        if (ethmodel_done()) {  // ethmin polls forever once the frames are used up
+            std::cout << "HALT (device model done)\n";
             break;
         }
 

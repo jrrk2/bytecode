@@ -18,7 +18,6 @@
     // Helper completion states
     S_ENVACC_DONE,          // Complete ENVACC operations
     S_GETFIELD_DONE,        // Complete GETFIELD operations
-    S_OFFSETREF_ADD,        // Complete OFFSETREF calculation
     S_OFFSETCLOSURE_CALC,   // Complete OFFSETCLOSURE calculation
     
     // MAKEBLOCK3 states
@@ -27,16 +26,10 @@
     S_MAKEBLOCK_WRITE_FIELD,    // Write fields (loop)
     
     // MAKEBLOCK1 states
-    S_MAKEBLOCK1_FIELD,     // Write single field
     
     // MAKEBLOCK2 states
-    S_MAKEBLOCK2_HDR,       // Write header
-    S_MAKEBLOCK2_FIELDS,    // Write fields (loop)
     
     // MAKEBLOCK3 states
-    S_MAKEBLOCK3_READ_STACK, // Read values from stack
-    S_MAKEBLOCK3_HDR,       // Write header
-    S_MAKEBLOCK3_FIELDS,    // Write fields (loop)
     
     // APPTERM states
     S_APPTERM_READ_CODE,    // Read arguments
@@ -85,16 +78,8 @@
     S_RETURN_SET_STATE,     // Restore state
     
     // Heap allocation micro-ops (for CLOSURE/MAKEBLOCK via S_EXEC)
-    S_HEAP_ALLOC_HDR,       // Write header to heap
-    S_HEAP_ALLOC_FIELDS,    // Write fields one per cycle
     
     // CLOSURE-specific states (kept from original)
-    S_CLOSURE_ALLOC_HDR,
-    S_CLOSURE_WRITE_CODE,
-    S_CLOSURE_WRITE_CLOSINFO,
-    S_CLOSURE_WRITE_ENV,
-    S_CLOSURE_DONE,
-    S_CLOSUREREC_CALC,
 
     S_PUSH_RETADDR_WRITE_FRAME,
     // arrays
@@ -105,8 +90,48 @@
     // Trap / ccall
     S_TRAP_WAIT,
 
+    // The allocator: header, fields, done (MAKEBLOCK*, CLOSURE, CLOSUREREC)
+    S_ALLOC_HDR,
+    S_ALLOC_FIELD,
+    S_ALLOC_DONE,
+
+    // Garbage collection (Cheney)
+    S_GC_START,
+    S_GC_ROOT,
+    S_GC_ROOT_WB,
+    S_GC_FWD,
+    S_GC_COPY,
+    S_GC_MARK,
+    S_GC_SCAN,
+    S_GC_SCAN_FIELD,
+    S_GC_SCAN_WB,
+    S_GC_DONE,
+
+    // SWITCH: a block's tag, then the jump
+    S_SWITCH_TAG,
+    S_SWITCH_JUMP,
+
+    // caml_obj_dup: header, then fields
+    S_DUP_HDR,
+    S_DUP_FIELD,
+
+    // RESTART: unpack a partial application's closure
+    S_RESTART_HDR,
+    S_RESTART_ARG,
+    S_RESTART_ENV,
+
+    // DIVINT / MODINT: one quotient bit per cycle
+    S_DIV_ITER,
+
+    // String primitives (caml_ml_string_length, caml_string_get)
+    S_STRLEN_HDR,
+    S_STRLEN_LAST,
+    S_STRGET_READ,
+
+    // vm_io_read / vm_io_write: waiting on the trap port
+    S_IO_WAIT,
+
     // obsolete states
-    S_HEAP_DONE,
     S_OFFSETCLOSURE_READ,
     S_OFFSETCLOSURE_ADD,
     // Unknown state for debugging
