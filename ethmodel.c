@@ -21,8 +21,8 @@ static const uint8_t vm_mac[6] = {0x02, 0x00, 0x00, 0x4d, 0x47, 0x31};
 static const uint8_t vm_ip[4] = {192, 168, 1, 42};
 static const uint8_t other_ip[4] = {192, 168, 1, 43};
 
-typedef struct { int len; uint8_t b[128]; } frame_t;
-static frame_t frames[3];
+typedef struct { int len; uint8_t b[1536]; } frame_t;
+static frame_t frames[4];
 static int nframes, next_frame, rx_valid, rx_len, idle_polls, initialised;
 static uint8_t rxbuf[WINDOW], txbuf[WINDOW];
 static char uart_line[256];
@@ -48,9 +48,9 @@ static void arp_request(frame_t *f, const uint8_t *target_ip) {
   f->len = 60;                              // padded, as it arrives off the wire
 }
 
-static void icmp_echo_request(frame_t *f) {
+static void icmp_echo_request(frame_t *f, int payload) {
   uint8_t *b = f->b;
-  const int payload = 32, ip_len = 20 + 8 + payload;
+  const int ip_len = 20 + 8 + payload;
   memcpy(b, vm_mac, 6); memcpy(b + 6, host_mac, 6);
   b[12] = 0x08; b[13] = 0x00;               // IPv4
   uint8_t *ip = b + 14;
@@ -81,7 +81,8 @@ static void init(void) {
   initialised = 1;
   arp_request(&frames[nframes++], vm_ip);
   arp_request(&frames[nframes++], other_ip);   // not ours: no reply
-  icmp_echo_request(&frames[nframes++]);
+  icmp_echo_request(&frames[nframes++], 32);
+  icmp_echo_request(&frames[nframes++], 1000);   // a frame well over 256 bytes
   load_next_frame();
 }
 

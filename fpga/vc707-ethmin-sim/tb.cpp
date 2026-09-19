@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
   run_sys_cycles(20);
   top->resetn = 1; top->eth_rst = 0;
 
-  unsigned char buf[256];
+  unsigned char buf[2048];
   for (int f = 0;; f++) {
     // wait for the program to be polling: LEDs 1 after start-up, then
     // 2 | count << 2 after each frame

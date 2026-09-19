@@ -24,5 +24,6 @@ for line in open(sys.argv[1]):
         check(ip[12:16] == VM_IP and ip[16:20] == HOST_IP, 'IP addresses swapped')
         icmp = f[14 + ihl:14 + total]
         check(icmp[0] == 0 and csum(icmp) == 0xFFFF, 'ICMP echo reply + checksum')
-print('frames:', n, 'PASS' if ok and n == 2 else 'FAIL')
-sys.exit(0 if ok and n == 2 else 1)
+want = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+print('frames:', n, 'PASS' if ok and n == want else 'FAIL (want %d)' % want)
+sys.exit(0 if ok and n == want else 1)
