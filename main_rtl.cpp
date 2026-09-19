@@ -3,6 +3,7 @@
 #include "verilated_vcd_c.h"
 typedef enum
 #include "state_rtl_complete.h"
+#include "ethmodel.h"
 
 #include <fstream>
 #include <iostream>
@@ -127,6 +128,11 @@ const char *statenam(int state)
 
     // Trap / ccall
     case S_TRAP_WAIT: return "S_TRAP_WAIT";
+    case S_DIV_ITER: return "S_DIV_ITER";
+    case S_STRLEN_HDR: return "S_STRLEN_HDR";
+    case S_STRLEN_LAST: return "S_STRLEN_LAST";
+    case S_STRGET_READ: return "S_STRGET_READ";
+    case S_IO_WAIT: return "S_IO_WAIT";
 
     // obsolete states
     case S_HEAP_DONE: return "S_HEAP_DONE";
@@ -184,6 +190,17 @@ int main(int argc, char** argv) {
 	  printf("Terminating on PC %d out of %d range\n", top->pc, prog_length);
 	  matching = 0;
 	}
+        // The trap port as an I/O bus (vm_io_read / vm_io_write), answered by
+        // the ethmin device model: one ready per request, not again until
+        // trap_valid has dropped.
+        static bool trap_answered = false;
+        top->trap_ready = 0;
+        if (top->trap_valid && !trap_answered && (top->trap_prim == 1 || top->trap_prim == 2)) {
+            if (top->trap_prim == 1) top->trap_result = ethmodel_read((int32_t)top->trap_arg0);
+            else ethmodel_write((int32_t)top->trap_arg0, (int32_t)top->trap_arg1);
+            top->trap_ready = 1;
+            trap_answered = true;
+        } else if (!top->trap_valid) trap_answered = false;
         // Provide instruction byte
         top->code_rdata = top->pc < sizeof(code_rom)/sizeof(*code_rom) ? code_rom[top->pc] : 0xDEADBEEF;
         // Clock tick
@@ -271,6 +288,10 @@ int main(int argc, char** argv) {
 
         if (top->halted) {
             std::cout << "HALT\n";
+            break;
+        }
+        if (ethmodel_done()) {  // ethmin polls forever once the frames are used up
+            std::cout << "HALT (device model done)\n";
             break;
         }
 

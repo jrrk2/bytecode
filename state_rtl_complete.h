@@ -105,6 +105,17 @@
     // Trap / ccall
     S_TRAP_WAIT,
 
+    // DIVINT / MODINT: one quotient bit per cycle
+    S_DIV_ITER,
+
+    // String primitives (caml_ml_string_length, caml_string_get)
+    S_STRLEN_HDR,
+    S_STRLEN_LAST,
+    S_STRGET_READ,
+
+    // vm_io_read / vm_io_write: waiting on the trap port
+    S_IO_WAIT,
+
     // obsolete states
     S_HEAP_DONE,
     S_OFFSETCLOSURE_READ,
