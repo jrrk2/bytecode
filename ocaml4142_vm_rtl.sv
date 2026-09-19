@@ -306,6 +306,38 @@ module ocaml4142_vm_rtl #(
   logic [ HEAP_AW-1:0] hp;
   logic [ HEAP_AW-1:0] hp_after_image = HEAP_INIT_WORDS;
 
+  // ---- Garbage collection: Cheney's copying collector ----
+  // heap_mem: [0, heap_lo) the image's constants, never moved (they cannot
+  // point into the dynamic heap); above that two semi-spaces of gc_semi
+  // words.  Allocation bumps hp within the current space (from_lo up to
+  // hp_limit).  When an allocation would not fit, the VM stops and copies
+  // everything reachable from the roots (accu, env, the live stack, the
+  // globals) into the other space, then restarts the allocating
+  // instruction.  In simulation +semispace=N shrinks the spaces.
+  logic [HEAP_AW:0] heap_lo, gc_semi, from_lo, to_lo, hp_limit;
+  logic [HEAP_AW:0] gc_semispace_override = '0;
+  logic [HEAP_AW:0] gc_free, gc_scan, gc_obj, gc_new_idx;
+  logic [VALUEW-1:0] gc_val, gc_new, gc_hdr;
+  logic [15:0] gc_size, gc_rd, gc_wr, gc_j;
+  logic [15:0] gc_scan_size;  // the block being scanned (gc_size is the one being copied)
+  logic gc_copy_valid, gc_mark_second;
+  logic [STACK_AW:0] gc_i;
+  logic [31:0] gc_need, alloc_need;
+  logic [2:0] gc_phase;
+  localparam logic [2:0] GC_ACCU = 0, GC_ENV = 1, GC_STACK = 2, GC_GLOBALS = 3, GC_SCAN = 4;
+  logic gc_return_to_scan;  // where S_GC_FWD's result goes
+  localparam logic [7:0] GC_FORWARDED = 8'hFF;  // header colour of a copied block
+  localparam int NO_SCAN_TAG = 251;             // strings, floats, custom: no pointers inside
+  int gc_count;
+
+  // A pointer into the current from-space: even, no code-pointer marker,
+  // an index in [from_lo, from_lo + gc_semi).
+  function automatic logic gc_points_to_from(input logic [VALUEW-1:0] v);
+    logic [VALUEW-1:0] idx;
+    idx = {2'b00, v[VALUEW-1:2]};
+    gc_points_to_from = !v[0] && !v[VALUEW-1] && idx >= from_lo && idx < from_lo + gc_semi;
+  endfunction
+
   // Code pointers (closure field 0, return addresses on the stack) set the
   // top bit, which no heap pointer (index << 2) has: the GC must tell them
   // apart, since both are otherwise even words.
@@ -438,6 +470,7 @@ module ocaml4142_vm_rtl #(
     if ($value$plusargs("heap=%s", heap_file)) $readmemh(heap_file, heap_mem);
     if ($value$plusargs("globals=%s", globals_file)) $readmemh(globals_file, globals_mem);
     if ($value$plusargs("heap_words=%d", heap_words)) hp_after_image = heap_words;
+    if ($value$plusargs("semispace=%d", heap_words)) gc_semispace_override = heap_words;
 `endif
   end
 
@@ -491,6 +524,10 @@ module ocaml4142_vm_rtl #(
   task automatic heap_read_a(input logic [HEAP_AW-1:0] a);
     hm_re_a = 1'b1;
     hm_addr_a = a;
+  endtask
+  task automatic heap_read_b(input logic [HEAP_AW-1:0] a);
+    hm_re_b = 1'b1;
+    hm_addr_b = a;
   endtask
   task automatic globals_read_a(input logic [GLOBALS_AW-1:0] a);
     gm_re_a = 1'b1;
@@ -625,6 +662,56 @@ module ocaml4142_vm_rtl #(
     div_want_mod     <= want_mod;
   endtask
 
+`ifndef SYNTHESIS
+  // After a collection (at S_GC_DONE, before the spaces swap): to-space must
+  // be a run of blocks from to_lo exactly to gc_free, none left marked
+  // forwarded, and every pointer in them, in the live stack and in the
+  // globals must land on a block header in to-space or in the image below
+  // heap_lo -- never in from-space.
+  task automatic gc_check_to_space();
+    bit is_block[int];
+    int idx, bad, f;
+    logic [VALUEW-1:0] hdr, v;
+    bad = 0;
+    for (idx = to_lo; idx < gc_free; idx += 1 + heap_mem[idx][31:16]) begin
+      is_block[idx] = 1;
+      if (heap_mem[idx][15:8] == GC_FORWARDED) bad++;
+    end
+    if (idx != gc_free) bad++;
+    for (idx = to_lo; idx < gc_free; idx += 1 + hdr[31:16]) begin
+      hdr = heap_mem[idx];
+      if (hdr[7:0] < NO_SCAN_TAG)
+        for (f = 1; f <= hdr[31:16]; f++) begin
+          v = heap_mem[idx+f];
+          if (!v[0] && !v[VALUEW-1] && !((v >> 2) < heap_lo || is_block.exists(int'(v >> 2)))) bad++;
+        end
+    end
+    for (idx = sp; idx < (1 << STACK_AW) - 1; idx++) begin
+      v = stack_mem[idx];
+      if (!v[0] && !v[VALUEW-1] && !((v >> 2) < heap_lo || is_block.exists(int'(v >> 2)))) bad++;
+    end
+    for (idx = 0; idx < (1 << GLOBALS_AW); idx++) begin
+      v = globals_mem[idx];
+      if (!v[0] && !v[VALUEW-1] && !((v >> 2) < heap_lo || is_block.exists(int'(v >> 2)))) bad++;
+    end
+    $display("GC %0d: %0d words live, semi-space %0d%s", gc_count + 1, gc_free - to_lo, gc_semi,
+             bad ? " -- HEAP CHECK FAILED" : "");
+    if (bad) $error("GC: %0d inconsistencies in to-space", bad);
+  endtask
+`endif
+
+  always_comb begin
+    case (opcode)
+      MAKEBLOCK1: alloc_need = 2;
+      MAKEBLOCK2: alloc_need = 3;
+      MAKEBLOCK3: alloc_need = 4;
+      MAKEBLOCK: alloc_need = alloc_wosize + 1;
+      CLOSURE, CLOSUREREC: alloc_need = 3 + nvars;
+      GRAB: alloc_need = (extra_args < imm) ? 5 + extra_args : 0;
+      default: alloc_need = 0;
+    endcase
+  end
+
   always_ff @(posedge clk) begin
     // No memory requests unless a state makes them this cycle.
     st_re_a = 1'b0;
@@ -691,7 +778,16 @@ module ocaml4142_vm_rtl #(
       trapsp                <= (1 << STACK_AW) - 1;
 
 
-      hp                    <= hp_after_image;
+      // the dynamic heap starts above the image, and never at index 0
+      heap_lo  <= (hp_after_image == 0) ? 1 : hp_after_image;
+      gc_semi  <= (gc_semispace_override != 0) ? gc_semispace_override
+                : (((1 << HEAP_AW) - ((hp_after_image == 0) ? 1 : hp_after_image)) >> 1);
+      from_lo  <= (hp_after_image == 0) ? 1 : hp_after_image;
+      hp       <= (hp_after_image == 0) ? 1 : hp_after_image;
+      hp_limit <= ((hp_after_image == 0) ? 1 : hp_after_image)
+                + ((gc_semispace_override != 0) ? gc_semispace_override
+                : (((1 << HEAP_AW) - ((hp_after_image == 0) ? 1 : hp_after_image)) >> 1));
+      gc_count <= 0;
     end else if (!halted) begin
       // A two-cycle state's request cycle sets this again (hold_for_read).
       rd_phase <= 1'b0;
@@ -805,6 +901,10 @@ module ocaml4142_vm_rtl #(
 
           state <= S_DONE;
 
+          if (!rd_phase && alloc_need != 0 && {1'b0, hp} + alloc_need > hp_limit) begin
+            gc_need <= alloc_need;  // collect, then run this instruction again
+            state <= S_GC_START;
+          end else
           unique case (opcode)
 
 
@@ -2076,12 +2176,178 @@ module ocaml4142_vm_rtl #(
 
 
 
+        // ---- GC: roots, then Cheney scan of to-space ----
+        S_GC_START: begin
+          to_lo <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
+          gc_free <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
+          gc_scan <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
+          gc_phase <= GC_ACCU;
+          gc_i <= {1'b0, sp};
+          state <= S_GC_ROOT;
+        end
+
+        S_GC_ROOT:
+        case (gc_phase)
+          GC_ACCU, GC_ENV: begin
+            gc_val <= (gc_phase == GC_ACCU) ? accu : env;
+            gc_return_to_scan <= 1'b0;
+            if (gc_points_to_from((gc_phase == GC_ACCU) ? accu : env)) state <= S_GC_FWD;
+            else gc_phase <= gc_phase + 1;
+          end
+          GC_STACK:  // the live stack: sp up to (not including) the top slot
+          if (gc_i >= (1 << STACK_AW) - 1) begin
+            gc_i <= 0;
+            gc_phase <= GC_GLOBALS;
+          end else if (!rd_phase) begin
+            stack_read_a(gc_i[STACK_AW-1:0]);
+            hold_for_read();
+          end else begin
+            gc_val <= st_rd_a;
+            gc_return_to_scan <= 1'b0;
+            if (gc_points_to_from(st_rd_a)) state <= S_GC_FWD;
+            else gc_i <= gc_i + 1;
+          end
+          GC_GLOBALS:
+          if (gc_i >= (1 << GLOBALS_AW)) gc_phase <= GC_SCAN;
+          else if (!rd_phase) begin
+            globals_read_a(gc_i[GLOBALS_AW-1:0]);
+            hold_for_read();
+          end else begin
+            gc_val <= gm_rd_a;
+            gc_return_to_scan <= 1'b0;
+            if (gc_points_to_from(gm_rd_a)) state <= S_GC_FWD;
+            else gc_i <= gc_i + 1;
+          end
+          default: state <= S_GC_SCAN;
+        endcase
+
+        S_GC_ROOT_WB: begin  // store the forwarded root
+          case (gc_phase)
+            GC_ACCU: accu <= gc_new;
+            GC_ENV: env <= gc_new;
+            GC_STACK: stack_write(gc_i[STACK_AW-1:0], gc_new);
+            default: globals_write(gc_i[GLOBALS_AW-1:0], gc_new);
+          endcase
+          if (gc_phase == GC_ACCU || gc_phase == GC_ENV) gc_phase <= gc_phase + 1;
+          else gc_i <= gc_i + 1;
+          state <= S_GC_ROOT;
+        end
+
+        // Forward gc_val: its new address in gc_new, copying the block to
+        // gc_free unless an earlier copy left a forwarding header.
+        S_GC_FWD:
+        if (!rd_phase) begin
+          heap_read_a(gc_val[HEAP_AW+1:2]);      // header
+          heap_read_b(gc_val[HEAP_AW+1:2] + 1);  // field 0: the forward pointer, if copied
+          hold_for_read();
+        end else if (hm_rd_a[15:8] == GC_FORWARDED) begin
+          gc_new <= hm_rd_b;
+          state <= gc_return_to_scan ? S_GC_SCAN_WB : S_GC_ROOT_WB;
+        end else begin
+          heap_write(gc_free, hm_rd_a);
+          gc_obj <= gc_val[HEAP_AW+1:2];
+          gc_hdr <= hm_rd_a;
+          gc_size <= hm_rd_a[31:16];
+          gc_new <= Ptr_of_heap_index(gc_free);
+          gc_new_idx <= gc_free;
+          gc_rd <= 0;
+          gc_wr <= 0;
+          gc_copy_valid <= 1'b0;
+          state <= S_GC_COPY;
+        end
+
+        // One word per cycle: port B reads from-space field gc_rd while port
+        // A writes the field read the cycle before.
+        S_GC_COPY: begin
+          if (gc_copy_valid) begin
+            heap_write(gc_new_idx + 1 + gc_wr, hm_rd_b);
+            gc_wr <= gc_wr + 1;
+          end
+          if (gc_rd < gc_size) begin
+            heap_read_b(gc_obj + 1 + gc_rd);
+            gc_rd <= gc_rd + 1;
+            gc_copy_valid <= 1'b1;
+          end else gc_copy_valid <= 1'b0;
+          if (gc_wr + gc_copy_valid == gc_size && gc_rd == gc_size) begin
+            gc_mark_second <= 1'b0;
+            state <= S_GC_MARK;
+          end
+        end
+
+        // Leave a forwarding header (and pointer in field 0) in from-space.
+        S_GC_MARK:
+        if (!gc_mark_second) begin
+          heap_write(gc_obj, {gc_hdr[31:16], GC_FORWARDED, gc_hdr[7:0]});
+          gc_mark_second <= 1'b1;
+          if (gc_size == 0) begin  // nowhere for a forward pointer: an empty block is copied each time
+            gc_free <= gc_free + 1;
+            state <= gc_return_to_scan ? S_GC_SCAN_WB : S_GC_ROOT_WB;
+          end
+        end else begin
+          heap_write(gc_obj + 1, gc_new);
+          gc_free <= gc_free + 1 + gc_size;
+          state <= gc_return_to_scan ? S_GC_SCAN_WB : S_GC_ROOT_WB;
+        end
+
+        // Cheney scan: every block copied to to-space has its fields forwarded.
+        S_GC_SCAN:
+        if (gc_scan == gc_free) state <= S_GC_DONE;
+        else if (!rd_phase) begin
+          heap_read_a(gc_scan);
+          hold_for_read();
+        end else if (hm_rd_a[7:0] >= NO_SCAN_TAG || hm_rd_a[31:16] == 0) begin
+          gc_scan <= gc_scan + 1 + hm_rd_a[31:16];
+        end else begin
+          gc_scan_size <= hm_rd_a[31:16];
+          gc_j <= 0;
+          state <= S_GC_SCAN_FIELD;
+        end
+
+        S_GC_SCAN_FIELD:
+        if (gc_j == gc_scan_size) begin
+          gc_scan <= gc_scan + 1 + gc_scan_size;
+          state <= S_GC_SCAN;
+        end else if (!rd_phase) begin
+          heap_read_a(gc_scan + 1 + gc_j);
+          hold_for_read();
+        end else if (gc_points_to_from(hm_rd_a)) begin
+          gc_val <= hm_rd_a;
+          gc_return_to_scan <= 1'b1;
+          state <= S_GC_FWD;
+        end else gc_j <= gc_j + 1;
+
+        S_GC_SCAN_WB: begin
+          heap_write(gc_scan + 1 + gc_j, gc_new);
+          gc_j <= gc_j + 1;
+          state <= S_GC_SCAN_FIELD;
+        end
+
+        S_GC_DONE: begin
+`ifndef SYNTHESIS
+          gc_check_to_space();
+`endif
+          from_lo <= to_lo;
+          hp <= gc_free;
+          hp_limit <= to_lo + gc_semi;
+          gc_count <= gc_count + 1;
+          if (gc_free + gc_need > to_lo + gc_semi) begin
+            $display("GC: out of memory (%0d words live, %0d needed, semi-space %0d)",
+                     gc_free - to_lo, gc_need, gc_semi);
+            trap_valid <= 1'b1;
+            trap_prim <= 8'hF1;
+            state <= S_TRAP_WAIT;
+          end else state <= S_EXEC;  // run the allocating instruction again
+        end
+
         // caml_obj_dup: a new block with the source's header and fields,
         // copied one field per two cycles (read, then write, both on port A).
         S_DUP_HDR:
         if (!rd_phase) begin
           heap_read_a(temp_heap_addr);
           hold_for_read();
+        end else if ({1'b0, hp} + hm_rd_a[31:16] + 1 > hp_limit) begin
+          gc_need <= hm_rd_a[31:16] + 1;  // collect, then C_CALL1 runs again
+          state <= S_GC_START;
         end else begin
           heap_write(hp, hm_rd_a);  // same size and tag
           alloc_base <= hp;

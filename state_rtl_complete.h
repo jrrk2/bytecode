@@ -96,6 +96,18 @@
     S_ALLOC_FIELD,
     S_ALLOC_DONE,
 
+    // Garbage collection (Cheney)
+    S_GC_START,
+    S_GC_ROOT,
+    S_GC_ROOT_WB,
+    S_GC_FWD,
+    S_GC_COPY,
+    S_GC_MARK,
+    S_GC_SCAN,
+    S_GC_SCAN_FIELD,
+    S_GC_SCAN_WB,
+    S_GC_DONE,
+
     // caml_obj_dup: header, then fields
     S_DUP_HDR,
     S_DUP_FIELD,

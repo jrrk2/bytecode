@@ -117,6 +117,16 @@ const char *statenam(int state)
     case S_ALLOC_HDR: return "S_ALLOC_HDR";
     case S_ALLOC_FIELD: return "S_ALLOC_FIELD";
     case S_ALLOC_DONE: return "S_ALLOC_DONE";
+    case S_GC_START: return "S_GC_START";
+    case S_GC_ROOT: return "S_GC_ROOT";
+    case S_GC_ROOT_WB: return "S_GC_ROOT_WB";
+    case S_GC_FWD: return "S_GC_FWD";
+    case S_GC_COPY: return "S_GC_COPY";
+    case S_GC_MARK: return "S_GC_MARK";
+    case S_GC_SCAN: return "S_GC_SCAN";
+    case S_GC_SCAN_FIELD: return "S_GC_SCAN_FIELD";
+    case S_GC_SCAN_WB: return "S_GC_SCAN_WB";
+    case S_GC_DONE: return "S_GC_DONE";
     case S_DUP_HDR: return "S_DUP_HDR";
     case S_DUP_FIELD: return "S_DUP_FIELD";
     case S_RESTART_HDR: return "S_RESTART_HDR";

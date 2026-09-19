@@ -59,14 +59,17 @@ cp "$B"/*.svh "$B"/*.h "$M/"
 for tr in "$T"/*.trace; do
     n=$(basename "$tr" .trace); d=$R/run-$n; mkdir -p "$d"
     img=$T/$n.img
+    # a test can ask for simulation plusargs with a "(* regress: +name=value ... *)" line
+    extra=$(sed -n 's/^(\* regress: \(.*\)$/\1/p' "$T/$n.ml" 2>/dev/null | head -1)
     ( cd "$d" && timeout 600 "$M/obj/Vocaml4142_vm_rtl" "$T/$n" "$tr" +heap="$img/heap.hex" +globals="$img/globals.hex" \
-        +heap_words="$(awk '/heap_words/{print $2}' "$img/image.txt")" > full.log 2>&1; echo "exit $?" >> full.log; rm -f trace.vcd )
-    grep -E '^(Fetch |Trace |ACCU mismatch|SP mismatch|Stopped|Trace mismatch|Terminating|HALT|Timeout|caml_|exit |eth: |uart: )' "$d/full.log" > "$R/$n.log"
+        +heap_words="$(awk '/heap_words/{print $2}' "$img/image.txt")" $extra > full.log 2>&1; echo "exit $?" >> full.log; rm -f trace.vcd )
+    gcs=$(grep -c '^GC [0-9]*:' "$d/full.log"); gcbad=$(grep -c 'HEAP CHECK FAILED\|GC: out of memory' "$d/full.log")
+    grep -E '^(Fetch |Trace |ACCU mismatch|SP mismatch|Stopped|Trace mismatch|Terminating|HALT|Timeout|caml_|exit |eth: |uart: |GC )' "$d/full.log" > "$R/$n.log"
     io=""
     if [ -s "$T/$n.io" ]; then
         cmp -s "$T/$n.io" <(grep -E '^(eth|uart): ' "$d/full.log") && io="  device output matches" || io="  device output DIFFERS"
     fi
     cyc=$(grep -cE '^[0-9a-f]{8} ' "$d/full.log")
     printf '%-20s %6d fetches %8d cycles  %s\n' "$n" "$(grep -c '^Fetch ' "$R/$n.log")" "$cyc" \
-        "$(grep -qE 'Stopped|Trace mismatch|Terminating|Timeout' "$R/$n.log" && echo STOPPED || (grep -q '^HALT' "$R/$n.log" && echo HALT || echo '?'))$io"
+        "$(grep -qE 'Stopped|Trace mismatch|Terminating|Timeout' "$R/$n.log" && echo STOPPED || (grep -q '^HALT' "$R/$n.log" && echo HALT || echo '?'))$io$( [ "$gcs" != 0 ] && echo "  $gcs GCs" )$( [ "$gcbad" != 0 ] && echo "  GC FAILURES $gcbad" )"
 done
