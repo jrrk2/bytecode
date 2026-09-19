@@ -123,3 +123,10 @@ void ethmodel_write(long a, long d) {
 }
 
 int ethmodel_done(void) { return idle_polls >= IDLE_POLLS_WHEN_DONE; }
+
+int ethmodel_frame(int i, unsigned char *buf) {
+  init();
+  if (i < 0 || i >= nframes) return 0;
+  memcpy(buf, frames[i].b, frames[i].len);
+  return frames[i].len;
+}
