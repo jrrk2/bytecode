@@ -344,12 +344,15 @@ module ocaml4142_vm_rtl #(
   int gc_count;
 
   // Where the dynamic heap starts (above the image) and each semi-space's size.
+  // The upper space stops one word short of the top: hp and alloc_base are
+  // HEAP_AW bits, so a space ending at 1 << HEAP_AW would let an allocation
+  // that exactly fills it wrap hp to 0 and then allocate over the image.
   logic [HEAP_AW-1:0] image_words;
   logic [HEAP_AW:0] heap_base, semi_space;
   assign image_words = EXTERNAL_IMAGE ? image_heap_words : hp_after_image;
   assign heap_base = (image_words == 0) ? 1 : image_words;
   assign semi_space = (gc_semispace_override != 0) ? gc_semispace_override
-                    : (((1 << HEAP_AW) - heap_base) >> 1);
+                    : (((1 << HEAP_AW) - 1 - heap_base) >> 1);
 
   // A pointer into the current from-space: even, no code-pointer marker,
   // an index in [from_lo, from_lo + gc_semi).
