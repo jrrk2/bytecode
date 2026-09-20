@@ -5,7 +5,8 @@
 // frames and UART lines; stops once the booted program has printed a line
 // after "starting it", or at the time limit.  With $TB_UART_INPUT, that
 // file is typed at the UART once the booted program has printed its first
-// line, and the run stops 30 ms after the last output once it is all sent.
+// line, and the run stops 30 ms ($TB_QUIET_MS) after the last output once it
+// is all sent.
 #include "Vethmin_vm_core.h"
 #include "Vethmin_vm_core___024root.h"
 #include "verilated.h"
@@ -114,7 +115,8 @@ int main(int argc, char **argv) {
   uint64_t limit = (uint64_t)((argc > 1 ? atof(argv[1]) : 2.0) * 250e6);   // seconds, in 4 ns steps
   auto finished = [&]() {
     if (!uart_in) return lines_after_boot >= 1;
-    return typed_all && ticks - last_output_tick > 7500000ULL;   // 30 ms quiet
+    static const uint64_t quiet = 250000ULL * (getenv("TB_QUIET_MS") ? atoi(getenv("TB_QUIET_MS")) : 30);
+    return typed_all && ticks - last_output_tick > quiet;   // 30 ms quiet ($TB_QUIET_MS)
   };
   while (ticks < limit && !finished()) {
     bool rx_valid = top->rootp->ethmin_vm_core__DOT__rx_valid;

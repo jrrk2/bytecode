@@ -171,12 +171,15 @@ int main(int argc, char** argv) {
     FILE *tracef = fopen(argv[2], "r");
     fgets(trace[0], sizeof(linbuf), tracef);
     
-    // Optional waveform
+    // Optional waveform (+vcd): every signal every cycle, so gigabytes for
+    // the long network tests
     VerilatedVcdC* tfp = nullptr;
-    Verilated::traceEverOn(true);
-    tfp = new VerilatedVcdC;
-    top->trace(tfp, 99);
-    tfp->open("trace.vcd");
+    if (Verilated::commandArgsPlusMatch("vcd")[0]) {
+        Verilated::traceEverOn(true);
+        tfp = new VerilatedVcdC;
+        top->trace(tfp, 99);
+        tfp->open("trace.vcd");
+    }
 
     // Reset
     top->reset = 1;
@@ -217,7 +220,7 @@ int main(int argc, char** argv) {
         top->clk = 0;
         top->eval();
         vitems = 0xffff - top->sp;
-        tfp->dump(cycles);
+        if (tfp) tfp->dump(cycles);
 	
 	switch(top->state_out)
 	  {
@@ -315,8 +318,7 @@ int main(int argc, char** argv) {
 	windup -= !matching;
     }
 
-    tfp->close();
-    delete tfp;
+    if (tfp) { tfp->close(); delete tfp; }
     delete top;
     return 0;
 }

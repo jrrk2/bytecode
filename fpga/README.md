@@ -40,12 +40,12 @@ from xc7-bitstream-tools' `examples/vc707-ethmin`.
 ## Status
 
 The Vivado bitstream runs on the board and matches simulation exactly
-(`cycles=0000067d` for fact).  The apio/nextpnr bitstream does not: it prints
-nothing and ends `PC!!`.  yosys's synthesis is not at fault (gate-level
-simulation of its netlist with the unisim BRAM models halts correctly), and
-every FASM feature resolves in prjxray-db, so the fault lies in nextpnr's
-placement, routing or BRAM configuration.  The narrow RAMB36 modes this design
-uses (x1 for the stack and heap, x9 for globals) are the prime suspect.
+(`cycles=0000067d` for fact).  The apio/nextpnr one used to print nothing and
+end `PC!!`: nextpnr's FASM left out the RAMB36-level width bits
+(`RAMB36.BRAM36_{READ,WRITE}_WIDTH_{A,B}_1`) that join the two halves into one
+32K x 1 memory, which this design's stack and heap need.  With that fixed
+(openXC7 nextpnr branch `xilinx-ramb36-x1-width`) its bitstream runs fact
+correctly on the board.
 
 nextpnr also cannot place memories deep enough for yosys to build cascaded
 RAMB36 pairs, which is why the harness sets `STACK_AW`/`HEAP_AW` to 15.
@@ -96,8 +96,19 @@ xc7-bitstream-tools' `scripts/tftp_serve.py`:
     tools/progimage.sh fact.ml build/fact
     tools/mkvmimage.py build/fact ~/tftp-vc707/02:00:00:4d:47:33/vm.img
 
+`io/repl.ml`, a small ML read-eval-print loop on the UART and on UDP port
+7777, is the usual program to boot; `tools/vmcat.py` talks to it a line at a
+time.
+
+The core's memories are much smaller than the regression's defaults (heap
+2^14 words, stack 2^13), and the heap's semi-spaces reach the top of the
+address space, so the garbage collector runs in a corner the default model
+never reaches.  `HEAP_AW=14 tools/regress.sh heap14` runs the whole regression
+there.
+
 Simulation: `vc707-ethmin-sim/run.sh` runs the core with ethmin on canned
 frames; `vc707-ethmin-sim/run_netboot.sh [prog.ml]` runs the loader against
 `ethmodel`'s DHCP server, ARP and TFTP host, and shows the booted program's
-output.  The Vivado build is used for the board; nextpnr's has the fault
+output ($TB_UART_INPUT is typed at it, $TB_QUIET_MS is how long a silence ends
+the run).  The Vivado build is used for the board; nextpnr's has the fault
 described above.
