@@ -510,6 +510,9 @@ and parse_atom toks = match toks with
     (match parse_atom rest with
      | Err e -> Err e
      | Ok (a, rest) -> Ok (Binop ("-", Int 0, a), rest))
+  (* () is the argument of a niladic builtin such as ms (); the language has
+     no unit, so it is 0 *)
+  | t :: t2 :: rest when is_sym t "(" && is_sym t2 ")" -> Ok (Int 0, rest)
   | t :: rest when is_sym t "(" ->
     (match parse_expr rest with
      | Err e -> Err e
@@ -573,6 +576,9 @@ let rec eval env e = match e with
      | Ok (VBool false) -> eval env b
      | Ok _ -> Err "if needs a bool"
      | Err m -> Err m)
+  (* ms (): milliseconds since reset, straight from the hardware counter,
+     so a program can time itself: let t = ms () in ... ms () - t *)
+  | App (Var f, _) when string_equal f "ms" -> Ok (VInt (now ()))
   | App (f, a) ->
     (match eval env f with
      | Err m -> Err m
@@ -611,15 +617,23 @@ let evaluate_line () =
       | Err m -> puts "error: "; puts m; newline ()
       | Ok (_, _ :: _) -> puts "error: unexpected input at the end"; newline ()
       | Ok (e, []) ->
+        let t0 = now () in
         match eval !session e with
         | Err m -> puts "error: "; puts m; newline ()
         | Ok v ->
+          let elapsed = now () - t0 in
           (match top_let, e with
            | true, Let (_, name, _, Var _) ->
              session := (name, v) :: !session;
              puts "val "; puts name; puts " = "
            | _ -> puts "- = ");
-          print_value v; newline ()
+          print_value v;
+          (* what it cost on the board, with the network and the UART left
+             out: the millisecond counter around eval alone *)
+          if elapsed > 0 then begin
+            puts "   ("; put_int elapsed; puts " ms)"
+          end;
+          newline ()
   end
 
 (* ---- the UART: a line collected a byte at a time, echoed ---- *)
