@@ -17,8 +17,13 @@
 // against the file ("eth: BOOT ...") and the run is done.
 //
 // UART input (0x1008): the next byte of $ETHMODEL_UART_INPUT (a file), or -1
-// when none is waiting; after the file is used up and read a few more times
-// the run is done too.
+// when none is waiting.
+//
+// $ETHMODEL_UDP_INPUT (a file) adds a datagram per line, from the host's port
+// 5555 to the program's port 7777, after the canned frames ("\n" inside a
+// line splits it); the program's datagrams from port 7777 are printed as
+// "eth: UDP reply <text>".  The run is done when the frames, the UART input
+// and any DHCP or TFTP exchange are all finished.
 #include "ethmodel.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -45,7 +50,8 @@ static const uint8_t leased_ip[4] = {192, 168, 1, 77};
 static uint8_t vm_ip_now[4] = {192, 168, 1, 42};   // .77 once leased
 
 typedef struct { int len; uint8_t b[1536]; } frame_t;
-static frame_t frames[4];
+enum { MAX_FRAMES = 20 };
+static frame_t frames[MAX_FRAMES];
 static int nframes, next_frame, rx_valid, rx_len, idle_polls, initialised;
 static long now_ms;
 // DHCP server: replies waiting to be received, and whether an exchange is
@@ -71,12 +77,19 @@ static long tftp_size;
 static int tftp_active, tftp_last_block_sent, booted;
 static int frame_mode;   // driven by ethmodel_tx_frame/_rx_frame: replies stay queued
 
+// A file named by the environment; regress.sh exports empty names for tests
+// without that input, which count as unset.
+static const char *env_file(const char *var) {
+  const char *name = getenv(var);
+  return name && *name ? name : NULL;
+}
+
 // UART input
 static FILE *uart_in;
 static int uart_in_opened, uart_in_eof_reads;
 static long uart_rx(void) {
   if (!uart_in_opened) {
-    const char *name = getenv("ETHMODEL_UART_INPUT");
+    const char *name = env_file("ETHMODEL_UART_INPUT");
     uart_in = name ? fopen(name, "rb") : NULL;
     uart_in_opened = 1;
   }
@@ -127,12 +140,40 @@ static void icmp_echo_request(frame_t *f, int payload) {
   f->len = 14 + ip_len;
 }
 
+static void udp_to_vm(frame_t *f, const char *text, int n) {
+  uint8_t *b = f->b, *ip = b + 14, *udp = ip + 20;
+  const int ip_len = 20 + 8 + n;
+  memset(b, 0, sizeof f->b);
+  memcpy(b, vm_mac, 6); memcpy(b + 6, host_mac, 6);
+  b[12] = 0x08; b[13] = 0x00;
+  ip[0] = 0x45; ip[2] = ip_len >> 8; ip[3] = ip_len & 0xFF; ip[8] = 64; ip[9] = 17;
+  memcpy(ip + 12, host_ip, 4); memcpy(ip + 16, vm_ip_now, 4);
+  uint16_t s = checksum(ip, 20); ip[10] = s >> 8; ip[11] = s & 0xFF;
+  udp[0] = 5555 >> 8; udp[1] = 5555 & 0xFF; udp[2] = 7777 >> 8; udp[3] = 7777 & 0xFF;
+  udp[4] = (8 + n) >> 8; udp[5] = (8 + n) & 0xFF;
+  memcpy(udp + 8, text, n);
+  f->len = 14 + ip_len < 60 ? 60 : 14 + ip_len;
+}
+
 static void make_canned_frames(void) {
   nframes = 0;
   arp_request(&frames[nframes++], vm_ip_now);
   arp_request(&frames[nframes++], other_ip);     // not ours: no reply
   icmp_echo_request(&frames[nframes++], 32);
   icmp_echo_request(&frames[nframes++], 1000);   // a frame well over 256 bytes
+  const char *name = env_file("ETHMODEL_UDP_INPUT");
+  FILE *fp = name ? fopen(name, "r") : NULL;
+  char text[1024];
+  while (fp && nframes < MAX_FRAMES && fgets(text, sizeof text, fp)) {
+    // "\n" written in the file separates lines within one datagram
+    char out[1024]; int n = 0;
+    for (char *p = text; *p && n < (int)sizeof out - 1; p++) {
+      if (p[0] == '\\' && p[1] == 'n') { out[n++] = '\n'; p++; }
+      else out[n++] = *p;
+    }
+    udp_to_vm(&frames[nframes++], out, n);
+  }
+  if (fp) fclose(fp);
 }
 
 static void deliver(const frame_t *f) {
@@ -237,7 +278,7 @@ static void tftp_server(const uint8_t *b, int len) {
   dport = (udp[2] << 8) | udp[3];
   p = udp + 8;
   if (dport == TFTP_PORT && p[0] == 0 && p[1] == 1) {          // RRQ
-    const char *name = getenv("ETHMODEL_TFTP_FILE");
+    const char *name = env_file("ETHMODEL_TFTP_FILE");
     FILE *fp = name ? fopen(name, "rb") : NULL;
     printf("eth: TFTP RRQ %s\n", (const char *)p + 2);
     if (!fp) {
@@ -317,6 +358,16 @@ void ethmodel_write(long a, long d) {
     printf("eth: TX %ld", d);
     for (long i = 0; i < d && i < WINDOW; i++) printf(" %02x", txbuf[i]);
     printf("\n");
+    if (d >= 42 && txbuf[12] == 0x08 && txbuf[13] == 0x00 && txbuf[23] == 17
+        && ((txbuf[34] << 8) | txbuf[35]) == 7777) {        // a REPL reply, as text
+      int n = ((txbuf[38] << 8) | txbuf[39]) - 8;
+      printf("eth: UDP reply ");
+      for (int i = 0; i < n && 42 + i < WINDOW; i++) {
+        int c = txbuf[42 + i];
+        if (c == '\n') printf("\\n"); else if (c >= 32 && c < 127) putchar(c); else printf("\\x%02x", c);
+      }
+      printf("\n");
+    }
     dhcp_server(txbuf, (int)d);
     host_arp(txbuf, (int)d);
     tftp_server(txbuf, (int)d);
@@ -341,8 +392,13 @@ void ethmodel_write(long a, long d) {
 }
 
 int ethmodel_done(void) {
-  return booted || (!tftp_active && idle_polls >= IDLE_POLLS_WHEN_DONE)
-      || (uart_in && uart_in_eof_reads >= IDLE_POLLS_WHEN_DONE);
+  if (booted) return 1;
+  int uart_done = !uart_in_opened ? !env_file("ETHMODEL_UART_INPUT")
+                                  : (!uart_in || uart_in_eof_reads >= IDLE_POLLS_WHEN_DONE);
+  int eth_idle = !tftp_active && idle_polls >= IDLE_POLLS_WHEN_DONE;
+  // a program that never looks at the Ethernet is done with its UART input
+  int eth_unused = uart_in && idle_polls == 0 && next_frame == 0 && !discovers_seen;
+  return uart_done && (eth_idle || eth_unused);
 }
 
 void ethmodel_tx_frame(const unsigned char *b, int len) {

@@ -1,0 +1,7 @@
+let sq x = x * x
+sq 12
+fact 6 + x
+let a = 2\na * 21
+nosuch 1
+let rec tri n = if n = 0 then 0 else n + tri (n - 1)
+tri 100
