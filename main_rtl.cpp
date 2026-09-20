@@ -214,8 +214,15 @@ int main(int argc, char** argv) {
             top->trap_ready = 1;
             trap_answered = true;
         } else if (!top->trap_valid) trap_answered = false;
-        // Provide instruction byte
-        top->code_rdata = top->pc < sizeof(code_rom)/sizeof(*code_rom) ? code_rom[top->pc] : 0xDEADBEEF;
+        // The fetch unit, as in fpga/vc707-ethmin/ethmin_vm_core.v: the code
+        // memory is read synchronously (block RAM), the word read is kept
+        // with the pc it came from, and the next one is prefetched while the
+        // VM uses this one, so straight-line code costs no extra cycle.
+        static uint32_t code_q = 0xDEADBEEF, code_q_pc = 0xFFFFFFFF;
+        bool code_valid = code_q_pc == top->pc;
+        top->code_rdata = code_q;
+        top->code_valid = code_valid;
+        uint32_t fetch_pc = code_valid ? top->pc + 1 : top->pc;
         // Clock tick
         top->clk = 0;
         top->eval();
@@ -225,6 +232,7 @@ int main(int argc, char** argv) {
 	switch(top->state_out)
 	  {
 	  case S_FETCH:
+	    if (!code_valid) break;   // waiting for the fetch unit
 	    oldpc = top->pc;
 	    op = opname(top->code_rdata);
 	    printf("Fetch PC=%d ROM = 0x%x, instruction = %s, SP=@%d\n", top->pc, top->code_rdata, op, vitems);
@@ -300,6 +308,8 @@ int main(int argc, char** argv) {
 	
         top->clk = 1;
         top->eval();
+        code_q = fetch_pc < sizeof(code_rom)/sizeof(*code_rom) ? code_rom[fetch_pc] : 0xDEADBEEF;
+        code_q_pc = fetch_pc;
 
         if (top->halted) {
             std::cout << "HALT\n";

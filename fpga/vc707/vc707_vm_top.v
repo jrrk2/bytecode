@@ -81,6 +81,7 @@ module vc707_vm_top (
       .reset      (vm_rst),
       .pc         (pc),
       .code_rdata (code_rdata),
+      .code_valid (1'b1),        // this ROM answers in the cycle pc is presented
       .trap_ready (1'b0),
       .trap_result(32'd0),
       .accu       (accu),

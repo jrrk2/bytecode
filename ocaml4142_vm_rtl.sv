@@ -19,8 +19,13 @@ module ocaml4142_vm_rtl #(
     input logic reset,
 
 
+    // Instruction fetch: the code memory may take a cycle (block RAM), so
+    // code_rdata counts only while code_valid is high, and the states that
+    // read it wait in place until it is.  A fetch unit that answers
+    // combinationally ties code_valid high.
     output logic [PCW-1:0] pc,
     input  logic [   31:0] code_rdata,
+    input  logic           code_valid,
 
 
     output logic                trap_valid,
@@ -855,7 +860,9 @@ module ocaml4142_vm_rtl #(
 
 
 
-        S_FETCH: begin
+        S_FETCH:
+        if (!code_valid) ;  // wait for the fetch unit
+        else begin
           opcode <= opcode_t'(code_rdata[7:0]);
           imm <= '0;
           nvars <= '0;
@@ -917,7 +924,9 @@ module ocaml4142_vm_rtl #(
 
 
 
-        S_FETCH_IMM: begin
+        S_FETCH_IMM:
+        if (!code_valid) ;  // wait for the fetch unit
+        else begin
           if (opcode == CLOSUREREC) begin
 
             nvars <= code_rdata;
@@ -2582,7 +2591,9 @@ module ocaml4142_vm_rtl #(
           state <= S_SWITCH_JUMP;
         end
 
-        S_SWITCH_JUMP: begin  // code_rdata is the table entry at pc
+        S_SWITCH_JUMP:  // code_rdata is the table entry at pc
+        if (!code_valid) ;  // wait for the fetch unit
+        else begin
           pc <= pc - temp_index + $signed(code_rdata);
           state <= S_DONE;
         end
@@ -2625,8 +2636,8 @@ module ocaml4142_vm_rtl #(
           else if (field_from_stack && !rd_phase) begin
             stack_read_a(sp + stack_item);
             hold_for_read();
-          end else if (rec_code_field && !rd_phase) begin
-            pc <= alloc_table + alloc_fn_i;  // code_rdata is the offset next cycle
+          end else if (rec_code_field && (!rd_phase || !code_valid)) begin
+            pc <= alloc_table + alloc_fn_i;  // the offset, once the fetch unit has it
             hold_for_read();
           end else begin
             heap_write(alloc_base + 1 + alloc_i,
