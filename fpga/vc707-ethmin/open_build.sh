@@ -11,9 +11,9 @@
 # option has changed, synthesis has nothing to redo (it is the slower half).
 #
 # The VM is SystemVerilog, which yosys does not read, so sv2v converts it
-# first.  The constraints come from xc7-bitstream-tools' own vc707_ethmin.xdc:
-# it is the same board, and it places the clocking primitives by hand, which
-# the open flow needs.  --timing-allow-fail is the flow's standing exception
+# first.  vc707_ethmin_vm_open.xdc is the constraints for this flow: the same
+# board as Vivado's, but placing the clocking primitives by hand, which the
+# open flow needs.  --timing-allow-fail is the flow's standing exception
 # for this design (see the Makefile), and -o hold-fix repairs the
 # min-delay violations it would otherwise let through: the packet RAM's write
 # data arrived too fast for the block RAM's hold time, and the frames the VM
@@ -21,8 +21,8 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
-XC7BT=${XC7BT:-$HOME/xc7-bitstream-tools}
-ETH=$XC7BT/examples/vc707-ethmin/rtl
+XC7BT=${XC7BT:-$HOME/xc7-bitstream-tools}   # the tools only: yosys, nextpnr, prjxray, the venv
+ETH=$REPO/fpga/eth-rtl
 WORK=${WORK:-$HOME/bytecode-work/vc707-ethmin-open}
 OUT=${OUT:-$WORK/vc707_ethmin_vm.bit}
 PART=${PART:-xc7vx485tffg1761-2}
@@ -55,7 +55,7 @@ else
 fi
 
 echo "== nextpnr"
-"$NEXTPNR" --device "$PART" -o xdc="$XC7BT/examples/vc707-ethmin/vc707_ethmin.xdc" \
+"$NEXTPNR" --device "$PART" -o xdc="$HERE/vc707_ethmin_vm_open.xdc" \
   --json "$TOP.json" -o fasm="$TOP.fasm" -o placement="${TOP}_placement.json" \
   --router router2 --timing-allow-fail -o hold-fix ${NEXTPNR_FLAGS:-} 2>&1 | tee nextpnr.log | tail -20
 

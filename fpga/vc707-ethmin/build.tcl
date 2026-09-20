@@ -1,7 +1,7 @@
 # Vivado build of vc707_ethmin_vm: the OCaml VM running io/ethmin.ml with
-# ethmin's SGMII Ethernet.  The MAC, PCS/PMA, DMA and clocking come from
-# xc7-bitstream-tools (examples/vc707-ethmin/rtl, $XC7BT, default
-# ~/xc7-bitstream-tools).  First make the program images:
+# ethmin's SGMII Ethernet.  The MAC, PCS/PMA, DMA and clocking are in
+# fpga/eth-rtl (see its README for where each file came from).  First make
+# the program images:
 #   tools/progimage.sh io/ethmin.ml fpga/vc707-ethmin
 # then, from a work directory:
 #   vivado -mode batch -source <repo>/fpga/vc707-ethmin/build.tcl
@@ -9,8 +9,7 @@
 set part xc7vx485tffg1761-2
 set here [file dirname [file normalize [info script]]]
 set repo [file normalize $here/../..]
-if {[info exists ::env(XC7BT)]} { set xc7bt $::env(XC7BT) } else { set xc7bt $::env(HOME)/xc7-bitstream-tools }
-set eth $xc7bt/examples/vc707-ethmin/rtl
+set eth $repo/fpga/eth-rtl
 file mkdir out
 # $readmemh resolves against the working directory
 foreach f {program.hex heap.hex globals.hex} { file copy -force $here/$f . }
