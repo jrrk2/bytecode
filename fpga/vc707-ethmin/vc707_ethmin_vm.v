@@ -39,7 +39,11 @@ module vc707_ethmin_vm (
 	localparam integer MAC_DIV = `MAC_DIV;
 
 	wire clk_sys, clk_mac, rst_sys_n, locked;
-	clkgen_vc707 #(.MAC_DIV(MAC_DIV)) clkgen (
+	// clk_sys = 1 GHz VCO / SYS_DIV: 20 -> 50 MHz.  CLK_HZ below must match.
+`ifndef SYS_DIV
+`define SYS_DIV 20.000
+`endif
+	clkgen_vc707 #(.MAC_DIV(MAC_DIV), .SYS_DIV(`SYS_DIV)) clkgen (
 		.IO_CLK_P(IO_CLK_P), .IO_CLK_N(IO_CLK_N), .IO_RST_N(~IO_RST),
 		.clk_sys(clk_sys), .clk_mac(clk_mac),
 		.rst_sys_n(rst_sys_n), .locked(locked));
@@ -89,7 +93,7 @@ module vc707_ethmin_vm (
 	// ─── VM + DMA + registers (ethmin_vm_core.v) ─────────────────────────
 	ethmin_vm_core #(
 		.RX_WORD_BASE(RX_WORD_BASE), .TX_WORD_BASE(TX_WORD_BASE),
-		.WINDOW_WORDS(WINDOW_WORDS)
+		.WINDOW_WORDS(WINDOW_WORDS), .CLK_HZ(50_000_000)
 	) core (
 		.clk_sys(clk_sys), .resetn(resetn),
 		// clk_mac DIRECTLY, not the eth_clk that comes back out of sgmii_soc.

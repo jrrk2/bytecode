@@ -57,7 +57,7 @@ module ethmin_vm_core #(
 	wire        mem_b_en, mem_b_we;
 	wire [13:0] mem_b_addr;
 	wire [31:0] mem_b_wdata;
-	reg  [31:0] mem_b_rdata;
+	wire [31:0] mem_b_rdata;
 	wire        rx_valid /*verilator public_flat_rd*/;  // the testbench feeds frames when it is clear
 	wire        rx_trunc, tx_busy;
 	wire [10:0] rx_len;
@@ -82,30 +82,41 @@ module ethmin_vm_core #(
 		.tx_busy(tx_busy));
 
 	// ─── packet RAM: 2 KiB RX + 2 KiB TX, little-endian bytes ───────────
-	reg  [31:0] pkt [0:1023];
+	// One byte-wide memory per lane, each a plain two-port RAM with a whole-
+	// word write enable.  As one 32-bit memory with byte enables it is what
+	// Vivado infers from a byte-write template, but yosys consolidates the
+	// two write ports and then finds no block RAM that fits, so the open
+	// flow cannot map it (memory_libmap: "no valid mapping found").
+	//
+	// Each port also leaves its read register alone while it writes (the
+	// block RAM's NO_CHANGE mode).  Reading the old word of the address
+	// being written is READ_FIRST, which Vivado infers but yosys has no
+	// block RAM rule for; neither side here reads while it writes.
 	reg         pa_en;
 	reg  [3:0]  pa_we;
 	reg  [9:0]  pa_addr;
 	reg  [31:0] pa_wdata;
-	reg  [31:0] pa_rdata;
-	integer lane;
+	wire [31:0] pa_rdata;
 
-	// Both ports are written per byte lane (port B always all four) so the
-	// synthesiser sees one byte-write template and infers a single BRAM.
-	integer lane_b;
-	always @(posedge eth_clk)
-		if (mem_b_en) begin
-			for (lane_b = 0; lane_b < 4; lane_b = lane_b + 1)
-				if (mem_b_we) pkt[mem_b_addr[9:0]][8*lane_b +: 8] <= mem_b_wdata[8*lane_b +: 8];
-			mem_b_rdata <= pkt[mem_b_addr[9:0]];
+	genvar lane;
+	generate
+		for (lane = 0; lane < 4; lane = lane + 1) begin : pkt_lane
+			reg [7:0] mem [0:1023];
+			reg [7:0] b_q, a_q;
+			always @(posedge eth_clk)
+				if (mem_b_en) begin
+					if (mem_b_we) mem[mem_b_addr[9:0]] <= mem_b_wdata[8*lane +: 8];
+					else b_q <= mem[mem_b_addr[9:0]];
+				end
+			always @(posedge clk_sys)
+				if (pa_en) begin
+					if (pa_we[lane]) mem[pa_addr] <= pa_wdata[8*lane +: 8];
+					else a_q <= mem[pa_addr];
+				end
+			assign mem_b_rdata[8*lane +: 8] = b_q;
+			assign pa_rdata[8*lane +: 8] = a_q;
 		end
-
-	always @(posedge clk_sys)
-		if (pa_en) begin
-			for (lane = 0; lane < 4; lane = lane + 1)
-				if (pa_we[lane]) pkt[pa_addr][8*lane +: 8] <= pa_wdata[8*lane +: 8];
-			pa_rdata <= pkt[pa_addr];
-		end
+	endgenerate
 
 	// ─── code, images and the boot sequencer ─────────────────────────────
 	// The resident program (tools/progimage.sh: program.hex, heap.hex,
@@ -113,11 +124,11 @@ module ethmin_vm_core #(
 	// image (tools/mkvmimage.py) in the staging RAM and write BOOT: the
 	// sequencer then loads that image into the program code RAM and the VM
 	// and starts it, until the next reset brings the resident one back.
-	localparam integer PROG_WORDS  = 8192;    // program code RAM
+	localparam integer PROG_WORDS  = 16384;   // program code RAM (block RAM)
 	localparam integer STAGE_WORDS = 16384;   // staging RAM: 64 KiB
 	localparam integer HEAP_AW     = 14;      // 16K-word heap: two 8K semi-spaces above the image
 
-	reg [31:0] code_rom    [0:`PROGRAM_WORDS-1];
+	reg [31:0] code_rom    [0:PROG_WORDS-1];   // $readmemh fills the first `PROGRAM_WORDS
 	reg [31:0] heap_rom    [0:`HEAP_WORDS-1];
 	reg [31:0] globals_rom [0:`GLOBALS_WORDS-1];
 	initial begin
@@ -130,12 +141,7 @@ module ethmin_vm_core #(
 
 	wire [23:0] pc /*verilator public_flat_rd*/;
 	reg         code_bank /*verilator public_flat_rd*/;  // 0: the resident program, 1: the loaded one
-	reg  [13:0] prog_words /*verilator public_flat_rd*/;
-	// Code is read asynchronously: the VM samples code_rdata in the cycle it
-	// presents pc.
-	wire [31:0] code_rdata =
-		code_bank ? ((pc < prog_words) ? prog_code[pc[12:0]] : 32'hDEADBEEF)
-		          : ((pc < `PROGRAM_WORDS) ? code_rom[pc] : 32'hDEADBEEF);
+	reg  [14:0] prog_words /*verilator public_flat_rd*/;
 
 	// The sequencer: after reset it loads the resident program's heap and
 	// globals into the VM; on BOOT the staged image's code, heap and globals.
@@ -201,7 +207,7 @@ module ethmin_vm_core #(
 			// Each section: read word i, write it the cycle after.
 			SEQ_CODE, SEQ_HEAP, SEQ_GLOBALS: begin
 				if (seq_data_ready) begin
-					if (seq_state == SEQ_CODE) prog_code[seq_i[12:0] - 1] <= seq_q;
+					if (seq_state == SEQ_CODE) prog_code[seq_i[13:0] - 1] <= seq_q;
 					else begin
 						load_we <= 1'b1;
 						load_globals <= seq_state == SEQ_GLOBALS;
@@ -230,7 +236,7 @@ module ethmin_vm_core #(
 			SEQ_START: begin
 				image_words <= seq_from_stage ? stage_heap[HEAP_AW-1:0] : `HEAP_WORDS;
 				code_bank   <= seq_from_stage;
-				prog_words  <= stage_code[13:0];
+				prog_words  <= stage_code[14:0];
 				seq_state   <= SEQ_RUN;         // the VM leaves reset next cycle
 			end
 			SEQ_RUN: begin
@@ -248,6 +254,29 @@ module ethmin_vm_core #(
 	end
 	wire vm_reset = !resetn || vm_hold;
 
+	// Instruction fetch.  Both code memories are read synchronously so they
+	// infer block RAM (read asynchronously they cost ~14K LUTs of
+	// distributed RAM).  The word read is kept with the pc it came from:
+	// while it is the one the VM wants, code_valid is high and the next
+	// word is prefetched, so running straight through costs no extra cycle
+	// and only a jump pays one.
+	reg  [31:0] code_rom_q, code_prog_q;   // one registered output each: the block RAM's
+	reg  [23:0] code_q_pc;
+	reg         code_q_valid, fetch_in_range;
+	wire        code_valid = code_q_valid && code_q_pc == pc;
+	wire [23:0] fetch_pc = code_valid ? pc + 24'd1 : pc;   // prefetch past a hit
+	wire [31:0] code_rdata = !fetch_in_range ? 32'hDEADBEEF : code_bank ? code_prog_q : code_rom_q;
+
+	always @(posedge clk_sys) begin
+		code_rom_q  <= code_rom[fetch_pc[13:0]];
+		code_prog_q <= prog_code[fetch_pc[13:0]];
+		fetch_in_range <= code_bank ? (fetch_pc < {9'd0, prog_words})
+		                            : (fetch_pc < `PROGRAM_WORDS);
+		code_q_pc <= fetch_pc;
+		code_q_valid <= !vm_reset;   // a new program invalidates what was fetched
+	end
+
+
 	// ─── the VM ──────────────────────────────────────────────────────────
 	wire        trap_valid;
 	wire [7:0]  trap_prim;
@@ -263,7 +292,7 @@ module ethmin_vm_core #(
 		.EXTERNAL_IMAGE(1'b1)
 	) vm (
 		.clk(clk_sys), .reset(vm_reset),
-		.pc(pc), .code_rdata(code_rdata),
+		.pc(pc), .code_rdata(code_rdata), .code_valid(code_valid),
 		.trap_valid(trap_valid), .trap_prim(trap_prim),
 		.trap_arg0(trap_arg0), .trap_arg1(trap_arg1),
 		.trap_ready(trap_ready), .trap_result(trap_result),
