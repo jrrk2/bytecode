@@ -394,8 +394,8 @@ let server_arp_reply len =
 (* ---- the image: tools/mkvmimage.py's header, then code, heap, globals ---- *)
 let byte i = io_read (stage + i)
 let small i = byte i lor (byte (i + 1) lsl 8) lor (byte (i + 2) lsl 16)   (* a word < 2^24 *)
-let code_max = 16384         (* the program code RAM, in words *)
-let heap_max = 2048          (* heap image words the VM's heap can take *)
+let code_max = 32768         (* the program code RAM, in words *)
+let heap_max = 4096          (* heap image words the VM's heap can take *)
 let globals_max = 4096
 let prims_digest = [| 0x21; 0xad; 0xa2; 0x86 |]   (* mkvmimage.py: this VM's primitives *)
 

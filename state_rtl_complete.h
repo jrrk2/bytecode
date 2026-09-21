@@ -125,6 +125,11 @@
     // DIVINT / MODINT: one quotient bit per cycle
     S_DIV_ITER,
 
+    // MULINT: operands registered, then the product, so the multiplier is
+    // pipelined and off the critical path
+    S_MUL_MUL,
+    S_MUL_DONE,
+
     // Bytes: a byte store, caml_create_bytes, caml_string_equal
     S_BYTESET_RMW,
     S_CREATE_BYTES,

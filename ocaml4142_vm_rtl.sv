@@ -340,6 +340,9 @@ module ocaml4142_vm_rtl #(
   logic gc_copy_valid, gc_mark_second;
   logic [STACK_AW:0] gc_i;
   logic [31:0] gc_need, alloc_need;
+  // MULINT's pipeline: operands, then product (see the MULINT arm)
+  logic signed [VALUEW-1:0] mul_a, mul_b;
+  logic signed [2*VALUEW-1:0] mul_p;
   logic [2:0] gc_phase;
   localparam logic [2:0] GC_ACCU = 0, GC_ENV = 1, GC_STACK = 2, GC_GLOBALS = 3, GC_SCAN = 4;
   logic gc_return_to_scan;  // where S_GC_FWD's result goes
@@ -1359,8 +1362,15 @@ module ocaml4142_vm_rtl #(
               stack_read_a(sp);  // tos
               hold_for_read();
             end else begin
-              accu <= Val_int(Int_val(accu) * Int_val(st_rd_a));
-              sp   <= sp + 1;
+              // The product in one cycle is the design's longest path: three
+              // DSP48s and the carry chains that add their partial products,
+              // 27 levels of logic.  Registering the operands and then the
+              // product puts those registers inside the DSPs and costs two
+              // cycles on an instruction the programs here rarely execute.
+              mul_a <= Int_val(accu);
+              mul_b <= Int_val(st_rd_a);
+              sp    <= sp + 1;
+              state <= S_MUL_MUL;
             end
 
             DIVINT:
@@ -2671,6 +2681,16 @@ module ocaml4142_vm_rtl #(
           stack_write(sp - 1, Ptr_of_heap_index(alloc_base + 3 * alloc_push_i));
           sp <= sp - 1;
           alloc_push_i <= alloc_push_i + 1;
+        end
+
+        S_MUL_MUL: begin
+          mul_p <= mul_a * mul_b;
+          state <= S_MUL_DONE;
+        end
+
+        S_MUL_DONE: begin
+          accu  <= Val_int(mul_p[VALUEW-2:0]);
+          state <= S_DONE;
         end
 
         S_DIV_ITER: begin

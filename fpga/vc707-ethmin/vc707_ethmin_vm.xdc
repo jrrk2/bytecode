@@ -71,8 +71,15 @@ create_clock -period 16.000 -name gt_rxoutclk \
 # TX, RX and the fabric are mutually asynchronous.  eth_gmii_retime256 is the
 # CDC between all three: each direction crosses to mac_clk through its own
 # toggle handshake, which is exactly why the retimer is mandatory here.
+# clk_sys and clk_mac come from one MMCM, so they are related clocks and were
+# analysed against each other.  At 50 and 125 MHz that left 3.975 ns and passed
+# unnoticed; at 100 and 125 the closest edges are 2 ns apart and 163 paths
+# fail.  They cross through the same toggle handshakes as everything else here
+# -- the DMA's, and the packet RAM's two independent clocks -- so the honest
+# statement is that they are asynchronous too.
 set_clock_groups -asynchronous \
-    -group [get_clocks -include_generated_clocks sysclk] \
+    -group [get_clocks clk_sys_unbuf] \
+    -group [get_clocks clk_mac_unbuf] \
     -group [get_clocks -include_generated_clocks gt_txoutclk] \
     -group [get_clocks -include_generated_clocks gt_rxoutclk] \
     -group [get_clocks -include_generated_clocks sgmii_refclk]
