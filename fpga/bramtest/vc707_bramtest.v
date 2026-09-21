@@ -39,7 +39,7 @@ module vc707_bramtest (
 
 	// The shapes.  Depth is chosen so each is one RAMB36's worth at that
 	// width, which is what makes yosys pick the width mode under test.
-	localparam integer N = 8;
+	localparam integer N = 10;
 	wire [N-1:0] done, ok;
 	wire [8:0]   bad9;      // the x9 case's wrong bit positions
 	wire [31:0]  bad32;
@@ -54,8 +54,14 @@ module vc707_bramtest (
 	// read through B, and a 32-bit ROM never written at all.
 	bram_case #(.WIDTH(32), .AW(14), .ROM(0)) c6 (.clk(clk), .rst(rst), .done(done[6]), .ok(ok[6]), .badbits(bad32));
 	bram_case #(.WIDTH(32), .AW(13), .ROM(1)) c7 (.clk(clk), .rst(rst), .done(done[7]), .ok(ok[7]), .badbits());
+	// The shapes the Ethernet path uses and the x9 case above does not
+	// cover: 2048 deep, so one RAMB18 rather than a RAMB36 -- at x9, and at
+	// x8 (eight data bits in the x9 mode, the ninth never used), which is
+	// what the packet lanes and the GMII retimer buffers are.
+	bram_case #(.WIDTH(9),  .AW(11), .ROM(0)) c8 (.clk(clk), .rst(rst), .done(done[8]), .ok(ok[8]), .badbits());
+	bram_case #(.WIDTH(8),  .AW(11), .ROM(0)) c9 (.clk(clk), .rst(rst), .done(done[9]), .ok(ok[9]), .badbits());
 
-	assign LED = {&done, ok[6:0]};
+	assign LED = {&done, ok[9:8], ok[4:0]};
 
 	// ─── reporting ────────────────────────────────────────────────────────
 	// A tiny ROM of the text, walked a character at a time once everything
@@ -87,6 +93,10 @@ module vc707_bramtest (
 			"x32x16384 ";
 		{name[70],name[71],name[72],name[73],name[74],name[75],name[76],name[77],name[78],name[79]} =
 			"x32rom8192";
+		{name[80],name[81],name[82],name[83],name[84],name[85],name[86],name[87],name[88],name[89]} =
+			"x9 x2048  ";
+		{name[90],name[91],name[92],name[93],name[94],name[95],name[96],name[97],name[98],name[99]} =
+			"x8 x2048  ";
 	end
 
 	// One character at a time.  simpleuart's wait line is "strobe AND busy",

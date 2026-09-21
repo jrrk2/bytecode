@@ -39,4 +39,21 @@ report_timing_summary -max_paths 10 -file $outdir/timing.rpt
 report_utilization                  -file $outdir/utilization.rpt
 report_route_status                 -file $outdir/route_status.rpt
 write_bitstream -force $outdir/design.bit
+write_checkpoint -force $outdir/routed.dcp
+
+# Every net's routed delay, driver pin -> each load pin, as the oracle for
+# the extractor's own delay model (fasm2netlist's STA sums the database's
+# per-pip delays along the route it recovers from the bitstream; these are
+# what those sums should come to).  Net names are yosys's, the same names
+# the extraction carries, so the two line up without a map.
+set fh [open $outdir/net_delays.csv w]
+puts $fh "net,from,to,fast_min,fast_max,slow_min,slow_max"
+foreach n [get_nets -hierarchical -filter {TYPE != POWER && TYPE != GROUND}] {
+    foreach d [get_net_delays -of_objects $n -quiet] {
+        set f [get_pins -of_objects $d -filter {DIRECTION == OUT} -quiet]
+        set t [get_pins -of_objects $d -filter {DIRECTION == IN} -quiet]
+        puts $fh "[get_property NAME $n],[get_property NAME $f],[get_property NAME $t],[get_property FAST_MIN $d],[get_property FAST_MAX $d],[get_property SLOW_MIN $d],[get_property SLOW_MAX $d]"
+    }
+}
+close $fh
 puts "NETLIST_PNR_DONE"

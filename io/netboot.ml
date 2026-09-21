@@ -1,6 +1,6 @@
 (* netboot: the resident loader.  It leases an address by DHCP (as
    dhcp.ml), then fetches a program image by TFTP -- from the server and file
-   the DHCP reply names (siaddr, file), else 192.168.1.106 and "vm.img" --
+   the DHCP reply names (siaddr, file), else 10.10.10.10 and "vm.img" --
    into the staging RAM, checks it (tools/mkvmimage.py's format) and writes
    BOOT: the boot sequencer then loads it into the VM and starts it.
    (siaddr counts only when the reply names a file too.)
@@ -249,7 +249,7 @@ let dhcp_parse len =
   !msg
 
 (* ---- where to boot from ---- *)
-let server_ip = [| 192; 168; 1; 106 |]
+let server_ip = [| 10; 10; 10; 10 |]
 let server_mac = [| 0; 0; 0; 0; 0; 0 |]
 let file_name = [| 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0;
                    0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0 |]
@@ -485,6 +485,12 @@ let boot_tick () =
     | Checking -> check_and_boot (); boot_state := Done
     | Done -> ()
 
+(* debug_rx prints every received frame's head, for the bring-up of a
+   receive path that delivers frames but not the ones expected. *)
+let debug_rx = true
+let uart_hex8 v =
+  let d n = if n < 10 then int_of_char '0' + n else int_of_char 'a' + n - 10 in
+  io_write uart (d ((v lsr 4) land 15)); io_write uart (d (v land 15))
 let uart_hex16 v =
   let digits = "0123456789abcdef" in
   for k = 3 downto 0 do uart_putc (string_get digits ((v lsr (4 * k)) land 0xF)) done
@@ -501,6 +507,14 @@ let () =
     let st = io_read eth_status in
     if st land eth_rx_valid <> 0 then begin
       let len = io_read eth_rxlen land 0x7FF in
+      if debug_rx then begin
+        (* every frame's length and first 16 bytes: is the head intact? *)
+        uart_puts "rx "; uart_dec len; uart_putc ':';
+        for i = 0 to 15 do
+          uart_putc ' '; uart_hex8 (rx i)
+        done;
+        uart_putc '\n'
+      end;
       if rx 12 = 0x08 && rx 13 = 0x06 then begin handle_arp len; server_arp_reply len end
       else if rx 12 = 0x08 && rx 13 = 0x00 && len >= 42 then begin
         let ihl = (rx 14 land 0x0F) * 4 in

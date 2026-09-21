@@ -20,7 +20,13 @@ read_verilog -sv [list $eth/eth_mac_1g.sv $eth/axis_gmii_rx.sv $eth/axis_gmii_tx
     $eth/eth_lutram_fifo.sv $eth/eth_stream_dma.sv $eth/eth_gmii_retime256.sv $eth/eth_pkt_buf256.sv \
     $eth/sgmii_soc_liteeth.sv $eth/clkgen_vc707.sv]
 read_xdc $here/vc707_ethmin_vm.xdc
-synth_design -top vc707_ethmin_vm -part $part -include_dirs [list $repo $here] -verilog_define SYNTHESIS
+# $VM_DEFS adds Verilog defines, for a build that differs only by a macro:
+#   VM_DEFS="SYS_DIV=16.000 CLK_HZ=62500000" vivado -mode batch -source build.tcl
+# builds the 62.5 MHz variant the open flow runs at, which is how to tell a
+# fault of the frequency from a fault of the flow.
+set defs [list SYNTHESIS]
+if {[info exists env(VM_DEFS)]} { lappend defs {*}$env(VM_DEFS) }
+synth_design -top vc707_ethmin_vm -part $part -include_dirs [list $repo $here] -verilog_define $defs
 report_utilization -file out/util_synth.rpt
 opt_design
 place_design

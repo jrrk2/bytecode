@@ -76,3 +76,12 @@ set_property LOC BUFGCTRL_X0Y19 [get_cells eth.i_phy.bufg_ethtx125]
 set_property LOC BUFGCTRL_X0Y17 [get_cells eth.i_phy.bufg_ethtx62]
 set_property LOC BUFGCTRL_X0Y2 [get_cells eth.i_phy.bufg_rxoutrebuf]
 set_property LOC BUFGCTRL_X0Y3 [get_cells eth.i_phy.bufg_txoutrebuf]
+
+# The PHY's recovered clocks.  Vivado derives them from the GTX (see
+# vc707_ethmin_vm.xdc); nextpnr cannot, and an unconstrained clock is timed at
+# 12 MHz, so without these the 125 MHz receive and transmit domains are placed
+# as if nothing in them mattered.  The LiteX example in nextpnr's tree
+# (vc707-litex-linux-1gb), whose PHY receives correctly in the open flow,
+# constrains them the same way.
+create_clock -name eth_rx_clk -period 8.000 [get_nets eth.eth_rx_clk]
+create_clock -name eth_tx_clk -period 8.000 [get_nets eth.eth_tx_clk]
