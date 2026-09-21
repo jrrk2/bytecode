@@ -36,6 +36,9 @@ python3 "$REPO/tools/bc2hex.py" "$BC" "$OUT/program.hex" > /dev/null
   (cd "$GEN" && "$OCAMLC" -o bc2image "$REPO/tools/bc2image.ml")
 "$GEN/bc2image" "$BC" "$OUT" > /dev/null
 words=$(wc -l < "$OUT/program.hex")
+# ...and the same code as explicit x1 block RAMs, which is what the design
+# instantiates: inference picks x9, and the open flow gets x9 wrong.
+python3 "$REPO/tools/gen_rom_bram.py" "$OUT/program.hex" "$OUT/program_bram.v" code_rom_bram > /dev/null
 heap_words=$(awk '/heap_words/{print $2}' "$OUT/image.txt")
 globals_words=$(awk '/^globals/{print $2}' "$OUT/image.txt")
 rm "$OUT/image.txt"

@@ -7,9 +7,6 @@
 #   tools/progimage.sh io/netboot.ml fpga/vc707-ethmin   # the resident program
 #   fpga/vc707-ethmin/open_build.sh                      # -> $OUT (a .bit)
 #
-# $SYNTH_OPTS passes options to synth_xilinx: "-nodsp" keeps the multiplier
-# in fabric, which is how to ask whether the DSP48s are the problem.
-#
 # $YOSYS_DEFS passes defines to yosys, for a build that differs only by a
 # macro: "-DSYS_DIV=13.375 -DCLK_HZ=74766355" builds this design at 74.77 MHz
 # instead of 100, which is what the open flow can currently close.
@@ -18,7 +15,7 @@
 # option has changed, synthesis has nothing to redo (it is the slower half).
 #
 # The VM is SystemVerilog, which yosys does not read, so sv2v converts it
-# first.  vc707_ethmin_vm_open.xdc is the constraints for this flow: the same
+# first.  vc707_bram36x9_open.xdc is the constraints for this flow: the same
 # board as Vivado's, but placing the clocking primitives by hand, which the
 # open flow needs.  --timing-allow-fail is the flow's standing exception
 # for this design (see the Makefile), and -o hold-fix repairs the
@@ -30,10 +27,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 XC7BT=${XC7BT:-$HOME/xc7-bitstream-tools}   # the tools only: yosys, nextpnr, prjxray, the venv
 ETH=$REPO/fpga/eth-rtl
-WORK=${WORK:-$HOME/bytecode-work/vc707-ethmin-open}
-OUT=${OUT:-$WORK/vc707_ethmin_vm.bit}
+WORK=${WORK:-$HOME/bytecode-work/bram36x9-open}
+OUT=${OUT:-$WORK/vc707_bram36x9.bit}
 PART=${PART:-xc7vx485tffg1761-2}
-TOP=vc707_ethmin_vm
+TOP=vc707_bram36x9
 YOSYS=${YOSYS:-$XC7BT/yosys-install/bin/yosys}
 NEXTPNR=${NEXTPNR:-$XC7BT/build/nextpnr-himbaechel}   # the Makefile's NEXTPNR_BUILD, with the xc7vx485t chipdb
 PRJXRAY_DB=${PRJXRAY_DB:-$XC7BT/.deps/prjxray-db}
@@ -43,14 +40,9 @@ mkdir -p "$WORK"
 # yosys and $readmemh both resolve paths against the working directory, and
 # the program images live beside the RTL, so build from a copy of this
 # directory with the converted VM added.
-cp "$HERE"/*.v "$HERE"/*.vh "$HERE"/*.hex "$WORK/"
-"${SV2V:-sv2v}" -DSYNTHESIS -I"$REPO" "$REPO/ocaml4142_vm_rtl.sv" > "$WORK/vm_sv2v.v"
+cp "$HERE"/*.v "$WORK/"   # no SystemVerilog here, so no sv2v step
 
-SRCS="vm_sv2v.v program_bram.v ethmin_vm_core.v vc707_ethmin_vm.v \
-  $ETH/simpleuart.v $ETH/liteeth_sgmii_phy.v $ETH/eth_mac_1g.sv \
-  $ETH/axis_gmii_rx.sv $ETH/axis_gmii_tx.sv $ETH/rgmii_lfsr.sv \
-  $ETH/eth_lutram_fifo.sv $ETH/eth_stream_dma.sv $ETH/eth_gmii_retime256.sv \
-  $ETH/eth_pkt_buf256.sv $ETH/sgmii_soc_liteeth.sv $ETH/clkgen_vc707.sv"
+SRCS="bram36x9.v vc707_bram36x9.v $ETH/simpleuart.v $ETH/clkgen_vc707.sv"
 
 cd "$WORK"
 if [ -n "${SKIP_SYNTH:-}" ] && [ -s "$TOP.json" ]; then
@@ -58,11 +50,11 @@ if [ -n "${SKIP_SYNTH:-}" ] && [ -s "$TOP.json" ]; then
 else
     echo "== yosys"
     "$YOSYS" -q -l yosys.log -p \
-      "read_verilog -sv -I. ${YOSYS_DEFS:-} $SRCS; synth_xilinx -flatten -abc9 -arch xc7 ${SYNTH_OPTS:-} -top $TOP; write_json $TOP.json"
+      "read_verilog -sv -I. ${YOSYS_DEFS:-} $SRCS; synth_xilinx -flatten -abc9 -arch xc7 -top $TOP; write_json $TOP.json"
 fi
 
 echo "== nextpnr"
-"$NEXTPNR" --device "$PART" -o xdc="$HERE/vc707_ethmin_vm_open.xdc" \
+"$NEXTPNR" --device "$PART" -o xdc="$HERE/vc707_bram36x9_open.xdc" \
   --json "$TOP.json" -o fasm="$TOP.fasm" -o placement="${TOP}_placement.json" \
   --router router2 --timing-allow-fail -o hold-fix ${NEXTPNR_FLAGS:-} 2>&1 | tee nextpnr.log | tail -20
 

@@ -124,15 +124,32 @@ module ethmin_vm_core #(
 	// image (tools/mkvmimage.py) in the staging RAM and write BOOT: the
 	// sequencer then loads that image into the program code RAM and the VM
 	// and starts it, until the next reset brings the resident one back.
-	localparam integer PROG_WORDS  = 16384;   // program code RAM (block RAM)
-	localparam integer STAGE_WORDS = 16384;   // staging RAM: 64 KiB
-	localparam integer HEAP_AW     = 14;      // 16K-word heap: two 8K semi-spaces above the image
+	// Every memory here is 32K words deep, which is what makes yosys build it
+	// from RAMB36s in x1 mode -- one bit per block RAM, 32K deep, the mode the
+	// open flow gets right.  At 16K deep it picks x2 and at 8K x4, and those
+	// come out of nextpnr miscompiled: the board then runs the loader (whose
+	// code is a x9 ROM) while its heap is corrupt, so the strings are intact
+	// but every pointer into them is wrong.  Vivado is happy either way.
+	// The staging RAM keeps its 16K-word (64 KiB) I/O window; the upper half
+	// is there to buy the width mode, and costs block RAM the part has spare.
+	localparam integer PROG_WORDS  = 32768;   // program code RAM (block RAM)
+	localparam integer STAGE_WORDS = 32768;   // staging RAM: 64 KiB used
+	localparam integer HEAP_AW     = 15;      // 32K-word heap: two 16K semi-spaces above the image
+	localparam integer GLOBALS_AW  = 13;      // see the VM instantiation
 
-	reg [31:0] code_rom    [0:PROG_WORDS-1];   // $readmemh fills the first `PROGRAM_WORDS
-	reg [31:0] heap_rom    [0:`HEAP_WORDS-1];
-	reg [31:0] globals_rom [0:`GLOBALS_WORDS-1];
+	// 36 bits, not 32: at 32 bits yosys slices these ROMs x9, and a RAMB36 in
+	// x9 mode loses its ninth bit in the open flow -- the parity bit comes out
+	// of the lower RAMB18's wire, which prjxray's site-pin mapping does not
+	// model.  Every ninth bit of the program and its constants was wrong.
+	// Four unused bits per word buys x18/x36 slicing instead, and block RAM is
+	// what this design has spare.
+	// code_rom is not inferred: tools/gen_rom_bram.py writes it out as one
+	// RAMB36E1 per bit at x1 (program_bram.v), because inference picks x9 --
+	// fewest block RAMs -- and a RAMB36 at x9 loses its ninth bit in the open
+	// flow.  The others are small and do not land on x9.
+	reg [35:0] heap_rom    [0:`HEAP_WORDS-1];
+	reg [35:0] globals_rom [0:`GLOBALS_WORDS-1];
 	initial begin
-		$readmemh(`PROGRAM_HEX, code_rom);
 		$readmemh("heap.hex", heap_rom);
 		$readmemh("globals.hex", globals_rom);
 	end
@@ -141,7 +158,7 @@ module ethmin_vm_core #(
 
 	wire [23:0] pc /*verilator public_flat_rd*/;
 	reg         code_bank /*verilator public_flat_rd*/;  // 0: the resident program, 1: the loaded one
-	reg  [14:0] prog_words /*verilator public_flat_rd*/;
+	reg  [15:0] prog_words /*verilator public_flat_rd*/;
 
 	// The sequencer: after reset it loads the resident program's heap and
 	// globals into the VM; on BOOT the staged image's code, heap and globals.
@@ -168,7 +185,7 @@ module ethmin_vm_core #(
 	                     : 14'd8 + seq_i + ((seq_state != SEQ_CODE) ? stage_code : 16'd0)
 	                                     + ((seq_state == SEQ_GLOBALS) ? stage_heap : 16'd0);
 	always @(posedge clk_sys) begin
-		rom_q <= (seq_state == SEQ_GLOBALS) ? globals_rom[seq_i] : heap_rom[seq_i];
+		rom_q <= (seq_state == SEQ_GLOBALS) ? globals_rom[seq_i][31:0] : heap_rom[seq_i][31:0];
 		seq_q <= stage_ram[seq_addr];
 	end
 
@@ -207,7 +224,7 @@ module ethmin_vm_core #(
 			// Each section: read word i, write it the cycle after.
 			SEQ_CODE, SEQ_HEAP, SEQ_GLOBALS: begin
 				if (seq_data_ready) begin
-					if (seq_state == SEQ_CODE) prog_code[seq_i[13:0] - 1] <= seq_q;
+					if (seq_state == SEQ_CODE) prog_code[seq_i[14:0] - 1] <= seq_q;
 					else begin
 						load_we <= 1'b1;
 						load_globals <= seq_state == SEQ_GLOBALS;
@@ -225,7 +242,7 @@ module ethmin_vm_core #(
 					case (seq_state)
 						SEQ_CODE: begin seq_n <= stage_heap; seq_state <= SEQ_HEAP; end
 						SEQ_HEAP: begin   // every global slot: no stale pointers for the GC
-							seq_n <= 16'd4096;
+							seq_n <= 16'd1 << GLOBALS_AW;   // every slot, so the GC never scans garbage
 							glob_count <= seq_from_stage ? stage_globals : `GLOBALS_WORDS;
 							seq_state <= SEQ_GLOBALS;
 						end
@@ -236,7 +253,7 @@ module ethmin_vm_core #(
 			SEQ_START: begin
 				image_words <= seq_from_stage ? stage_heap[HEAP_AW-1:0] : `HEAP_WORDS;
 				code_bank   <= seq_from_stage;
-				prog_words  <= stage_code[14:0];
+				prog_words  <= stage_code[15:0];
 				seq_state   <= SEQ_RUN;         // the VM leaves reset next cycle
 			end
 			SEQ_RUN: begin
@@ -260,17 +277,20 @@ module ethmin_vm_core #(
 	// while it is the one the VM wants, code_valid is high and the next
 	// word is prefetched, so running straight through costs no extra cycle
 	// and only a jump pays one.
-	reg  [31:0] code_rom_q, code_prog_q;   // one registered output each: the block RAM's
+	wire [31:0] code_rom_q_w;
+	reg  [31:0] code_prog_q;   // one registered output each: the block RAM's
 	reg  [23:0] code_q_pc;
 	reg         code_q_valid, fetch_in_range;
 	wire        code_valid = code_q_valid && code_q_pc == pc;
 	wire [23:0] fetch_pc = code_valid ? pc + 24'd1 : pc;   // prefetch past a hit
-	wire [31:0] code_rdata = !fetch_in_range ? 32'hDEADBEEF : code_bank ? code_prog_q : code_rom_q;
+	wire [31:0] code_rdata = !fetch_in_range ? 32'hDEADBEEF : code_bank ? code_prog_q : code_rom_q_w;
+
+	code_rom_bram code_rom_i (
+		.clk(clk_sys), .en(1'b1), .addr(fetch_pc[14:0]), .dout(code_rom_q_w));
 
 	always @(posedge clk_sys) begin
-		code_rom_q  <= code_rom[fetch_pc[13:0]];
-		code_prog_q <= prog_code[fetch_pc[13:0]];
-		fetch_in_range <= code_bank ? (fetch_pc < {9'd0, prog_words})
+		code_prog_q <= prog_code[fetch_pc[14:0]];
+		fetch_in_range <= code_bank ? (fetch_pc < {8'd0, prog_words})
 		                            : (fetch_pc < `PROGRAM_WORDS);
 		code_q_pc <= fetch_pc;
 		code_q_valid <= !vm_reset;   // a new program invalidates what was fetched
@@ -287,8 +307,14 @@ module ethmin_vm_core #(
 	wire [7:0]  putc_char;
 
 	ocaml4142_vm_rtl #(
-		.STACK_AW      (13),
+		.STACK_AW      (15),
 		.HEAP_AW       (HEAP_AW),
+		// 8K globals, not 4K: 4096 x 32 packs into exactly four RAMB36s at x9,
+		// and a RAMB36 at x9 loses its ninth bit in the open flow.  This is
+		// the pointer table -- every string constant is reached through it --
+		// which is how the board printed intact strings with wrong pointers
+		// and a MAC of "ting i".  At 8K deep yosys packs it x4, which works.
+		.GLOBALS_AW    (GLOBALS_AW),
 		.EXTERNAL_IMAGE(1'b1)
 	) vm (
 		.clk(clk_sys), .reset(vm_reset),
@@ -361,16 +387,17 @@ module ethmin_vm_core #(
 
 	// ─── millisecond timer ───────────────────────────────────────────────
 	localparam integer MS_DIV = CLK_HZ / 1000;
-	reg [15:0] ms_prescale;
+	localparam integer MS_W   = $clog2(MS_DIV);   // 100 MHz needs 17 bits, not 16
+	reg [MS_W-1:0] ms_prescale;
 	reg [29:0] ms_count;
 	always @(posedge clk_sys)
 		if (!resetn) begin
-			ms_prescale <= 16'd0;
+			ms_prescale <= {MS_W{1'b0}};
 			ms_count    <= 30'd0;
 		end else if (ms_prescale == MS_DIV - 1) begin
-			ms_prescale <= 16'd0;
+			ms_prescale <= {MS_W{1'b0}};
 			ms_count    <= ms_count + 30'd1;
-		end else ms_prescale <= ms_prescale + 16'd1;
+		end else ms_prescale <= ms_prescale + 1'b1;
 
 	// ─── the I/O space, answering the VM's trap port ─────────────────────
 	// One trap_ready per request; a request is not acted on again until

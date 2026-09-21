@@ -15,7 +15,7 @@ file mkdir out
 foreach f {program.hex heap.hex globals.hex} { file copy -force $here/$f . }
 
 read_verilog -sv $repo/ocaml4142_vm_rtl.sv
-read_verilog [list $here/ethmin_vm_core.v $here/vc707_ethmin_vm.v $eth/simpleuart.v $eth/liteeth_sgmii_phy.v]
+read_verilog [list $here/program_bram.v $here/ethmin_vm_core.v $here/vc707_ethmin_vm.v $eth/simpleuart.v $eth/liteeth_sgmii_phy.v]
 read_verilog -sv [list $eth/eth_mac_1g.sv $eth/axis_gmii_rx.sv $eth/axis_gmii_tx.sv $eth/rgmii_lfsr.sv \
     $eth/eth_lutram_fifo.sv $eth/eth_stream_dma.sv $eth/eth_gmii_retime256.sv $eth/eth_pkt_buf256.sv \
     $eth/sgmii_soc_liteeth.sv $eth/clkgen_vc707.sv]
@@ -24,7 +24,13 @@ synth_design -top vc707_ethmin_vm -part $part -include_dirs [list $repo $here] -
 report_utilization -file out/util_synth.rpt
 opt_design
 place_design
+# Physical optimisation, which this flow used to skip entirely: retiming moves
+# registers across logic now that placement knows the real delays, and the
+# post-route pass fixes what is left.  Worth about a nanosecond at 100 MHz,
+# where the design has little to spare.
+phys_opt_design -directive AggressiveExplore
 route_design
+phys_opt_design -directive AggressiveExplore
 report_timing_summary -max_paths 10 -file out/timing.rpt
 report_utilization -file out/util.rpt
 report_methodology -file out/methodology.rpt
