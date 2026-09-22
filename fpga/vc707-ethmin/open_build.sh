@@ -46,6 +46,14 @@ mkdir -p "$WORK"
 cp "$HERE"/*.v "$HERE"/*.vh "$HERE"/*.hex "$WORK/"
 "${SV2V:-sv2v}" -DSYNTHESIS -I"$REPO" "$REPO/ocaml4142_vm_rtl.sv" > "$WORK/vm_sv2v.v"
 
+# Who built this bitstream, for the banner: the commit, a dirty bit, and the
+# flow (1 = this one).  0x100a reads it back.
+commit=$(git -C "$REPO" rev-parse --short=7 HEAD 2>/dev/null || echo 0000000)
+dirty=0; git -C "$REPO" diff --quiet HEAD -- 2>/dev/null || dirty=1
+build_id="32'h$(printf '%x' $(( (1 << 30) | (dirty << 28) | 0x$commit )))"
+YOSYS_DEFS="${YOSYS_DEFS:-} -DBUILD_ID=$build_id"
+echo "== build id $build_id (commit $commit, dirty $dirty, open flow)"
+
 SRCS="vm_sv2v.v program_bram.v ethmin_vm_core.v vc707_ethmin_vm.v \
   $ETH/simpleuart.v $ETH/liteeth_sgmii_phy.v $ETH/eth_mac_1g.sv \
   $ETH/axis_gmii_rx.sv $ETH/axis_gmii_tx.sv $ETH/rgmii_lfsr.sv \

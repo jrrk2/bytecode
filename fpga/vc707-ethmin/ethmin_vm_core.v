@@ -19,6 +19,9 @@
 //   0x1007  w  boot the image staged in the staging RAM
 //   0x1008  r  the next byte received on the UART, or -1 (a 256-byte FIFO)
 //   0x1009  r  the board's DIP switches (8 bits), synchronised
+//   0x100a  r  who built this bitstream: bits 27:0 the git commit (7 hex
+//              digits), bit 28 set if the tree was dirty, bits 31:30 the
+//              flow (1 = the open flow, 2 = Vivado, 0 = unsaid)
 //   0x10000..0x1FFFF  the staging RAM, a byte per address
 //
 // The packet RAM is a true dual-port BRAM: port B belongs to the DMA on
@@ -30,6 +33,7 @@ module ethmin_vm_core #(
 	parameter [13:0] TX_WORD_BASE = 14'd512,
 	parameter integer WINDOW_WORDS = 512,
 	parameter integer CLK_HZ = 25_000_000,
+	parameter [31:0]  BUILD_ID = 32'd0,   // the commit, the dirty bit and the flow
 	parameter integer BAUD = 115_200
 ) (
 	input  wire        clk_sys,
@@ -479,6 +483,7 @@ module ethmin_vm_core #(
 						32'h1004: trap_result <= {24'd0, leds};
 						32'h1006: trap_result <= {2'b00, ms_count};
 						32'h1009: trap_result <= {24'd0, dip_sync[1]};  // the DIP switches
+						32'h100a: trap_result <= BUILD_ID;             // commit, dirty, flow
 						32'h1008: begin                               // a received byte, or -1
 							trap_result <= rxf_empty ? 32'hFFFFFFFF : {24'd0, rx_fifo[rxf_rp[7:0]]};
 							rxf_pop <= io_read && !rxf_empty;

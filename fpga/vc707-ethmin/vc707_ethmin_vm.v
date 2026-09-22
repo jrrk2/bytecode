@@ -47,6 +47,9 @@ module vc707_ethmin_vm (
 `ifndef SYS_DIV
 `define SYS_DIV 10.000
 `endif
+`ifndef BUILD_ID
+`define BUILD_ID 32'd0
+`endif
 `ifndef CLK_HZ
 `define CLK_HZ 100_000_000
 `endif
@@ -100,7 +103,7 @@ module vc707_ethmin_vm (
 	// ─── VM + DMA + registers (ethmin_vm_core.v) ─────────────────────────
 	ethmin_vm_core #(
 		.RX_WORD_BASE(RX_WORD_BASE), .TX_WORD_BASE(TX_WORD_BASE),
-		.WINDOW_WORDS(WINDOW_WORDS), .CLK_HZ(`CLK_HZ)
+		.WINDOW_WORDS(WINDOW_WORDS), .CLK_HZ(`CLK_HZ), .BUILD_ID(`BUILD_ID)
 	) core (
 		.clk_sys(clk_sys), .resetn(resetn),
 		// clk_mac DIRECTLY, not the eth_clk that comes back out of sgmii_soc.

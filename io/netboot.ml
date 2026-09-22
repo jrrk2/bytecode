@@ -525,9 +525,29 @@ let uart_hex16 v =
   let digits = "0123456789abcdef" in
   for k = 3 downto 0 do uart_putc (string_get digits ((v lsr (4 * k)) land 0xF)) done
 
+let build_id = 0x100a
+
+(* "24d6527 open": the commit this bitstream was built from (with a + if the
+   tree was dirty) and which flow built it, so a board on a bench says what
+   it is running. *)
+let uart_build () =
+  let v = io_read build_id in
+  if v = 0 then uart_puts "unstamped"
+  else begin
+    let digits = "0123456789abcdef" in
+    for k = 6 downto 0 do uart_putc (string_get digits ((v lsr (4 * k)) land 0xF)) done;
+    if v land 0x10000000 <> 0 then uart_putc '+';
+    let flow = (v lsr 30) land 3 in
+    if flow = 1 then uart_puts " open"
+    else if flow = 2 then uart_puts " vivado"
+    else uart_puts " ?"
+  end
+
 let () =
   io_write leds 1;
-  uart_puts "netboot (OCaml VM): phy=";
+  uart_puts "netboot (OCaml processor): build ";
+  uart_build ();
+  uart_puts " phy=";
   uart_hex16 (io_read eth_status_phy);
   uart_putc '\n';
   let pkts = ref 0 in

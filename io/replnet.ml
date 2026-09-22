@@ -1102,10 +1102,30 @@ let poll () =
     io_write leds ((if bound () then 2 else 0) lor ((!packets land 0x3F) lsl 2))
   end
 
+let build_id = 0x100a
+
+(* "24d6527 open": the commit this bitstream was built from (with a + if the
+   tree was dirty) and which flow built it, so a board on a bench says what
+   it is running. *)
+let uart_build () =
+  let v = io_read build_id in
+  if v = 0 then uart_puts "unstamped"
+  else begin
+    let digits = "0123456789abcdef" in
+    for k = 6 downto 0 do uart_putc (string_get digits ((v lsr (4 * k)) land 0xF)) done;
+    if v land 0x10000000 <> 0 then uart_putc '+';
+    let flow = (v lsr 30) land 3 in
+    if flow = 1 then uart_puts " open"
+    else if flow = 2 then uart_puts " vivado"
+    else uart_puts " ?"
+  end
+
 (* ==== MAIN ==== *)
 let () =
   io_write leds 1;
-  puts "OCaml VM mini-ML (UART, UDP port 7777, and telnet on port 23)"; newline ();
+  puts "OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build ";
+  uart_build ();
+  newline ();
   puts "# ";
   while true do poll () done
 (* ==== END MAIN ==== *)

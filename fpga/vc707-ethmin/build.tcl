@@ -26,6 +26,14 @@ read_xdc $here/vc707_ethmin_vm.xdc
 # fault of the frequency from a fault of the flow.
 set defs [list SYNTHESIS]
 if {[info exists env(VM_DEFS)]} { lappend defs {*}$env(VM_DEFS) }
+# Who built this bitstream, for the banner: the commit, a dirty bit, and the
+# flow (2 = Vivado).  0x100a reads it back.
+set commit [string trim [exec git -C $repo rev-parse --short=7 HEAD]]
+set dirty 0
+if {[catch {exec git -C $repo diff --quiet HEAD --}]} { set dirty 1 }
+set build_id [format "32'h%x" [expr {(2 << 30) | ($dirty << 28) | 0x$commit}]]
+lappend defs "BUILD_ID=$build_id"
+puts "build id $build_id (commit $commit, dirty $dirty, Vivado)"
 synth_design -top vc707_ethmin_vm -part $part -include_dirs [list $repo $here] -verilog_define $defs
 report_utilization -file out/util_synth.rpt
 opt_design

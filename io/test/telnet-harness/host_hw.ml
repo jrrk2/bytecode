@@ -43,6 +43,8 @@ let io_read a =
   else if a = 0x1006 then !clock
   else if a = 0x1008 then -1
   else if a = 0x1001 then 0x796d
+  else if a = 0x1009 then 0x00                 (* DIP switches: all off *)
+  else if a = 0x100a then 0x4024d65            (* a stamped build, for the banner *)
   else 0
 
 let io_write a v =
@@ -64,5 +66,7 @@ let leds = 0x1004
 let uart = 0x1005
 let timer_ms = 0x1006
 let uart_rx = 0x1008
+let dip_sw = 0x1009
+let build_id_addr = 0x100a
 let eth_rx_valid = 1
 let eth_tx_busy = 2
