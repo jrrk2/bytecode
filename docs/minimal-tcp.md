@@ -91,6 +91,22 @@ and its 109 primitives is everything this leaves out: reassembly, windows,
 congestion control, IPv6, a real socket API -- and that is the right trade
 once the memory system can hold it.
 
+## On the board
+
+*2026-09-22.*  `io/replnet.ml` -- repl.ml's mini-ML with this TCP behind it --
+netbooted onto the VC707 through the open flow (yosys, nextpnr, prjxray):
+
+    $ telnet 10.10.10.60
+    OCaml processor: mini-ML over telnet.  ^C clears the line.
+    # let rec f x = if x <= 0 then 1 else f (x-1) * x
+    val f = <fun>
+    # f 6
+    - = 720
+
+Character-at-a-time, the echo and the line editing done on the board, the
+whole stack -- handshake, ACKs, retransmission, FIN -- in OCaml bytecode on
+a processor whose native instruction set is OCaml bytecode.
+
 ## Running it
 
     tools/progimage.sh io/telnet.ml <outdir>      # for a bitstream's ROM
