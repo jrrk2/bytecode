@@ -18,6 +18,7 @@
 //   0x1006  r  milliseconds since reset (30 bits, wraps after ~12 days)
 //   0x1007  w  boot the image staged in the staging RAM
 //   0x1008  r  the next byte received on the UART, or -1 (a 256-byte FIFO)
+//   0x1009  r  the board's DIP switches (8 bits), synchronised
 //   0x10000..0x1FFFF  the staging RAM, a byte per address
 //
 // The packet RAM is a true dual-port BRAM: port B belongs to the DMA on
@@ -33,6 +34,7 @@ module ethmin_vm_core #(
 ) (
 	input  wire        clk_sys,
 	input  wire        resetn,
+	input  wire [7:0]  DIP,           // the board's DIP switches (SW11)
 	input  wire        eth_clk,
 	input  wire        eth_rst,
 
@@ -410,6 +412,14 @@ module ethmin_vm_core #(
 	reg [7:0] leds;
 	assign LED = leds;
 
+	// The DIP switches are asynchronous to everything: two flops before the
+	// processor ever sees them.
+	reg [7:0] dip_sync [0:1];
+	always @(posedge clk_sys) begin
+		dip_sync[0] <= DIP;
+		dip_sync[1] <= dip_sync[0];
+	end
+
 	wire io_read  = trap_prim == TRAP_IO_READ;
 	wire io_write = trap_prim == TRAP_IO_WRITE;
 	wire io_new   = trap_valid && (io_read || io_write) && io_state == IO_IDLE && !vm_reset;
@@ -468,6 +478,7 @@ module ethmin_vm_core #(
 						32'h1002: trap_result <= {21'd0, rx_len};
 						32'h1004: trap_result <= {24'd0, leds};
 						32'h1006: trap_result <= {2'b00, ms_count};
+						32'h1009: trap_result <= {24'd0, dip_sync[1]};  // the DIP switches
 						32'h1008: begin                               // a received byte, or -1
 							trap_result <= rxf_empty ? 32'hFFFFFFFF : {24'd0, rx_fifo[rxf_rp[7:0]]};
 							rxf_pop <= io_read && !rxf_empty;

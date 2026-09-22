@@ -9,6 +9,7 @@ module vc707_ethmin_vm (
 	input  wire       IO_CLK_N,
 	input  wire       IO_RST,          // CPU_RESET, active high
 	output wire [7:0] LED,
+	input  wire [7:0] GPIO_DIP_SW,   // SW11: the host number this board takes
 	input  wire       UART_RX,
 	output wire       UART_TX,
 
@@ -122,6 +123,6 @@ module vc707_ethmin_vm (
 		.tx_axis_tlast(tx_tlast), .tx_axis_tready(tx_tready),
 		.tx_axis_tuser(tx_tuser),
 		.pcspma_status(pcspma_status),
-		.LED(LED), .UART_RX(UART_RX), .UART_TX(UART_TX));
+		.LED(LED), .DIP(GPIO_DIP_SW), .UART_RX(UART_RX), .UART_TX(UART_TX));
 endmodule
 `default_nettype wire

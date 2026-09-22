@@ -1,6 +1,8 @@
 (* netboot: the resident loader.  It leases an address by DHCP (as
    dhcp.ml), then fetches a program image by TFTP -- from the server and file
-   the DHCP reply names (siaddr, file), else 10.10.10.10 and "vm.img" --
+   the DHCP reply names (siaddr, file) -- or, when DIP switches 0-6 are
+   set, this board's own network with those switches as the host number --
+   else 10.10.10.10 and "vm.img" --
    into the staging RAM, checks it (tools/mkvmimage.py's format) and writes
    BOOT: the boot sequencer then loads it into the VM and starts it.
    (siaddr counts only when the reply names a file too.)
@@ -60,6 +62,7 @@ let eth_txlen = 0x1003
 let leds = 0x1004
 let uart = 0x1005
 let timer_ms = 0x1006
+let dip_sw = 0x1009
 let boot_reg = 0x1007
 let stage = 0x10000
 let stage_size = 0x10000
@@ -291,10 +294,25 @@ let handle_dhcp len =
     | Requesting, 5 ->                                          (* ACK *)
       for i = 0 to 3 do array_set my_ip i (array_get offered_ip i) done;
       note_boot_server ();
+      (* The address is the one the server handed out.  The DIP switches
+         (SW11) say who serves the image: this board's own network, with the
+         switches as the host number -- so the board can move to another
+         network with nothing to set, and which machine holds vm.img is a
+         front-panel decision.  All switches off leaves the reply's siaddr
+         (or the 10.10.10.10 fallback) in charge. *)
+      let dip = io_read dip_sw land 0x7F in          (* switch 7 is the log *)
+      if dip <> 0 then begin
+        for i = 0 to 2 do array_set server_ip i (array_get my_ip i) done;
+        array_set server_ip 3 dip
+      end;
       state := Bound;
       deadline := now () + !lease_s * 500;                      (* T1: half the lease, in ms *)
       uart_puts "dhcp: bound ";
       uart_ip my_ip;
+      if io_read dip_sw land 0x7F <> 0 then begin
+        uart_puts " (dip "; uart_dec (io_read dip_sw land 0x7F);
+        uart_puts ": tftp from "; uart_ip server_ip; uart_putc ')'
+      end;
       uart_puts " lease ";
       uart_dec !lease_s;
       uart_puts " s from ";
@@ -485,11 +503,14 @@ let boot_tick () =
     | Checking -> check_and_boot (); boot_state := Done
     | Done -> ()
 
-(* debug_rx prints a line per received frame: what it was, from whom, and
-   whether its destination was this board -- which is what a ping that does
-   not come back is asking.  debug_rx_hex adds the raw head, for a receive
-   path that delivers damaged frames. *)
-let debug_rx = true
+(* The receive log: a line per frame -- what it was, from whom, and whether
+   its destination was this board, which is what a ping that does not come
+   back is asking.  It costs a few milliseconds of UART per frame, so on a
+   busy network it is not something to leave on: DIP switch 7 (the top
+   switch of SW11, 0x80) turns it on and off while the board runs.
+   debug_rx_hex adds the raw head, for a receive path that delivers damaged
+   frames. *)
+let debug_rx () = io_read dip_sw land 0x80 <> 0
 let debug_rx_hex = false
 let uart_ip_at off =
   for i = 0 to 3 do
@@ -516,7 +537,7 @@ let () =
     let st = io_read eth_status in
     if st land eth_rx_valid <> 0 then begin
       let len = io_read eth_rxlen land 0x7FF in
-      if debug_rx then begin
+      if debug_rx () then begin
         (* One line per frame, named rather than dumped: which protocol
            arrived, from and to which address, and -- the question a ping
            that does not come back asks -- whether it was for us.  The raw

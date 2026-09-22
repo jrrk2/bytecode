@@ -77,6 +77,7 @@ let leds = 0x1004
 let uart = 0x1005
 let timer_ms = 0x1006
 let uart_rx = 0x1008
+let dip_sw = 0x1009
 let eth_rx_valid = 1
 let eth_tx_busy = 2
 
@@ -324,6 +325,9 @@ let handle_dhcp len =
       deadline := now () + !lease_s * 500;                      (* T1: half the lease, in ms *)
       uart_puts "dhcp: bound ";
       uart_ip my_ip;
+      if io_read dip_sw land 0x7F <> 0 then begin
+        uart_puts " (dip "; uart_dec (io_read dip_sw land 0x7F); uart_putc ')'
+      end;
       uart_puts " lease ";
       uart_dec !lease_s;
       uart_puts " s from ";
