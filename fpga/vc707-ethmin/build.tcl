@@ -31,7 +31,10 @@ if {[info exists env(VM_DEFS)]} { lappend defs {*}$env(VM_DEFS) }
 set commit [string trim [exec git -C $repo rev-parse --short=7 HEAD]]
 set dirty 0
 if {[catch {exec git -C $repo diff --quiet HEAD --}]} { set dirty 1 }
-set build_id [format "32'h%x" [expr {(2 << 30) | ($dirty << 28) | 0x$commit}]]
+# The flow bits put the value past 2^31, which this Tcl's format will not
+# take, so the word is spelled out: flow 2 and the dirty bit as one nibble,
+# a zero nibble, then the seven digits of the commit.
+set build_id [format "32'h%x0%s" [expr {8 + $dirty}] $commit]
 lappend defs "BUILD_ID=$build_id"
 puts "build id $build_id (commit $commit, dirty $dirty, Vivado)"
 synth_design -top vc707_ethmin_vm -part $part -include_dirs [list $repo $here] -verilog_define $defs

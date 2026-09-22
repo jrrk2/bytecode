@@ -84,13 +84,15 @@ set_clock_groups -asynchronous \
     -group [get_clocks -include_generated_clocks gt_rxoutclk] \
     -group [get_clocks -include_generated_clocks sgmii_refclk]
 
-# SW11, the user DIP switch: the host number this board takes on the
-# DHCP server's network (pins from Vivado's vc707 board file)
-set_property -dict {PACKAGE_PIN AV30 IOSTANDARD LVCMOS18} [get_ports {GPIO_DIP_SW[0]}]
-set_property -dict {PACKAGE_PIN AY33 IOSTANDARD LVCMOS18} [get_ports {GPIO_DIP_SW[1]}]
-set_property -dict {PACKAGE_PIN BA31 IOSTANDARD LVCMOS18} [get_ports {GPIO_DIP_SW[2]}]
-set_property -dict {PACKAGE_PIN BA32 IOSTANDARD LVCMOS18} [get_ports {GPIO_DIP_SW[3]}]
-set_property -dict {PACKAGE_PIN AW30 IOSTANDARD LVCMOS18} [get_ports {GPIO_DIP_SW[4]}]
-set_property -dict {PACKAGE_PIN AY30 IOSTANDARD LVCMOS18} [get_ports {GPIO_DIP_SW[5]}]
-set_property -dict {PACKAGE_PIN BA30 IOSTANDARD LVCMOS18} [get_ports {GPIO_DIP_SW[6]}]
-set_property -dict {PACKAGE_PIN BB31 IOSTANDARD LVCMOS18} [get_ports {GPIO_DIP_SW[7]}]
+# SW11, the user DIP switch: switches 0-6 are the image server's host
+# number on this board's network, switch 7 turns the receive log on (pins
+# from Vivado's vc707 board file).  A switch that is off drives nothing, so
+# the input needs a pull-down or it floats -- and floating reads as on.
+set_property -dict {PACKAGE_PIN AV30 IOSTANDARD LVCMOS18 PULLDOWN TRUE} [get_ports {GPIO_DIP_SW[0]}]
+set_property -dict {PACKAGE_PIN AY33 IOSTANDARD LVCMOS18 PULLDOWN TRUE} [get_ports {GPIO_DIP_SW[1]}]
+set_property -dict {PACKAGE_PIN BA31 IOSTANDARD LVCMOS18 PULLDOWN TRUE} [get_ports {GPIO_DIP_SW[2]}]
+set_property -dict {PACKAGE_PIN BA32 IOSTANDARD LVCMOS18 PULLDOWN TRUE} [get_ports {GPIO_DIP_SW[3]}]
+set_property -dict {PACKAGE_PIN AW30 IOSTANDARD LVCMOS18 PULLDOWN TRUE} [get_ports {GPIO_DIP_SW[4]}]
+set_property -dict {PACKAGE_PIN AY30 IOSTANDARD LVCMOS18 PULLDOWN TRUE} [get_ports {GPIO_DIP_SW[5]}]
+set_property -dict {PACKAGE_PIN BA30 IOSTANDARD LVCMOS18 PULLDOWN TRUE} [get_ports {GPIO_DIP_SW[6]}]
+set_property -dict {PACKAGE_PIN BB31 IOSTANDARD LVCMOS18 PULLDOWN TRUE} [get_ports {GPIO_DIP_SW[7]}]
