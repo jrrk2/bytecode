@@ -2167,7 +2167,15 @@ module ocaml4142_vm_rtl #(
                   trap_arg0  <= Int_val(accu);
                   state      <= S_IO_WAIT;
                 end
-                default: $display("Unsupported C_CALL1: 0x%x", imm);
+                // caml_ensure_stack_capacity: ocamlc emits this ahead of any
+                // code block whose stack use passes its threshold -- a module
+                // with enough top-level definitions does it.  The stack here is
+                // a fixed block RAM, so there is nothing to grow: answer unit.
+                16'h05a: accu <= VAL_UNIT;
+                default: begin
+                  $display("Unsupported C_CALL1: 0x%x", imm);
+                  accu <= VAL_UNIT;
+                end
               endcase
             end
 
@@ -2178,7 +2186,7 @@ module ocaml4142_vm_rtl #(
             end else begin
               unique case (imm)
                 16'h108: caml_ml_output_char();
-                16'h00d: begin  // caml_array_get_addr: Field(accu, Int_val(tos))
+                16'h00d, 16'h00c: begin  // caml_array_get_addr, caml_array_get: Field(accu, Int_val(tos))
                   temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW:1];
                   state <= S_HEAP_READ;
                   next_state_after_mem <= S_GETFIELD_DONE;
@@ -2197,7 +2205,10 @@ module ocaml4142_vm_rtl #(
                   trap_arg1  <= Int_val(st_rd_a);
                   state      <= S_IO_WAIT;
                 end
-                default: $display("Unsupported C_CALL2: 0x%x", imm);
+                default: begin
+                  $display("Unsupported C_CALL2: 0x%x", imm);
+                  accu <= VAL_UNIT;
+                end
               endcase
               sp += 1;
             end
@@ -2216,7 +2227,7 @@ module ocaml4142_vm_rtl #(
                 accu <= VAL_UNIT;
                 state <= S_BYTESET_RMW;
               end
-            end else if (imm == 16'h00f) begin  // caml_array_set_addr: SETVECTITEM's layout
+            end else if (imm == 16'h00f || imm == 16'h00e) begin  // caml_array_set_addr, caml_array_set
               if (!rd_phase) begin
                 stack_read_a(sp);  // index
                 stack_read_b(sp + 1);  // value

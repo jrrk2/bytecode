@@ -31,6 +31,10 @@ case "$PROG" in
   BC=$PROG ;;
 esac
 
+# An unimplemented primitive is silent until the board runs it, so check the
+# image against the RTL's C_CALL arms before anything is built from it.
+python3 "$REPO/tools/check_prims.py" "$BC" "$REPO/ocaml4142_vm_rtl.sv" | tail -1
+
 python3 "$REPO/tools/bc2hex.py" "$BC" "$OUT/program.hex" > /dev/null
 [ "$GEN/bc2image" -nt "$REPO/tools/bc2image.ml" ] ||
   (cd "$GEN" && "$OCAMLC" -o bc2image "$REPO/tools/bc2image.ml")

@@ -56,8 +56,8 @@ external create_bytes : int -> bytes = "caml_create_bytes"
 external bytes_set : bytes -> int -> char -> unit = "%bytes_unsafe_set"
 external bytes_get : bytes -> int -> char = "%bytes_unsafe_get"
 external bytes_to_string : bytes -> string = "%bytes_to_string"
-external array_get : 'a array -> int -> 'a = "%array_safe_get"
-external array_set : 'a array -> int -> 'a -> unit = "%array_safe_set"
+external array_get : int array -> int -> int = "%array_safe_get"
+external array_set : int array -> int -> int -> unit = "%array_safe_set"
 
 type 'a ref = { mutable contents : 'a }
 external ref : 'a -> 'a ref = "%makemutable"
@@ -103,7 +103,7 @@ let uart_puts s = for i = 0 to string_length s - 1 do uart_putc (string_get s i)
 let rec uart_dec n =
   if n >= 10 then uart_dec (n / 10);
   uart_putc (char_of_int (48 + n mod 10))
-let uart_ip a =
+let uart_ip (a : int array) =
   for i = 0 to 3 do uart_dec (array_get a i); if i < 3 then uart_putc '.' done
 let uart_hex16 v =
   let digits = "0123456789abcdef" in
@@ -310,11 +310,11 @@ let dhcp_tick () =
   | Bound -> if now () > !deadline then request ()
 
 (* ---- 32-bit sequence numbers as two 16-bit halves ---- *)
-let seq_set a hi lo = array_set a 0 hi; array_set a 1 lo
-let seq_copy dst src = seq_set dst (array_get src 0) (array_get src 1)
+let seq_set (a : int array) hi lo = array_set a 0 hi; array_set a 1 lo
+let seq_copy (dst : int array) (src : int array) = seq_set dst (array_get src 0) (array_get src 1)
 
 (* a + n, n >= 0 and small *)
-let seq_add a n =
+let seq_add (a : int array) n =
   let lo = array_get a 1 + n in
   array_set a 1 (lo land 0xFFFF);
   array_set a 0 ((array_get a 0 + (lo lsr 16)) land 0xFFFF)
@@ -322,7 +322,7 @@ let seq_add a n =
 (* a - b as a signed distance, saturating outside +-32767: everything this
    code decides (is this the next byte? is this ack in flight?) is a
    comparison of numbers that are close together *)
-let seq_diff a b =
+let seq_diff (a : int array) (b : int array) =
   let dlo = array_get a 1 - array_get b 1 in
   let borrow = if dlo < 0 then 1 else 0 in
   let dhi = (array_get a 0 - array_get b 0 - borrow) land 0xFFFF in
@@ -332,7 +332,8 @@ let seq_diff a b =
   else if dhi land 0x8000 <> 0 then -32768
   else 32767
 
-let seq_eq a b = array_get a 0 = array_get b 0 && array_get a 1 = array_get b 1
+let seq_eq (a : int array) (b : int array) =
+  array_get a 0 = array_get b 0 && array_get a 1 = array_get b 1
 
 (* ---- TCP ---- *)
 let tcp_port = 23
