@@ -24,7 +24,9 @@
    arithmetic below is all 16-bit: add, compare, difference.  Nothing here
    needs a primitive the processor does not already have.
 
-   I/O space as dhcp.ml, plus 0x1008: the next UART byte, or -1. *)
+   I/O space as dhcp.ml, plus 0x1008: the next UART byte, or -1.  With no
+   DHCP server on the link it takes 10.10.10.60 after three tries, so a
+   direct cable to a host on 10.10.10.10 needs nothing set up. *)
 
 external ( = ) : 'a -> 'a -> bool = "%equal"
 external ( <> ) : 'a -> 'a -> bool = "%notequal"
@@ -284,11 +286,27 @@ let handle_dhcp len =
     | _ -> ()
   end
 
+(* If nothing answers DHCP, take a static address after a few tries: a
+   direct cable to a host that has 10.10.10.10 and no server on it is the
+   usual bench setup, and the session should come up anyway. *)
+let static_ip = [| 10; 10; 10; 60 |]
+let dhcp_tries = ref 0
+
+let go_static () =
+  for i = 0 to 3 do array_set my_ip i (array_get static_ip i) done;
+  state := Bound;
+  deadline := now () + 1000000000;
+  uart_puts "dhcp: no server, static ";
+  uart_ip my_ip;
+  uart_putc '\n'
+
 let dhcp_tick () =
   match !state with
-  | Init -> discover ()
+  | Init -> if !dhcp_tries >= 3 then go_static () else discover ()
   | Selecting | Requesting -> if now () > !deadline then begin
-      uart_puts "dhcp: timeout\n"; state := Init end
+      uart_puts "dhcp: timeout\n";
+      dhcp_tries := !dhcp_tries + 1;
+      state := Init end
   | Bound -> if now () > !deadline then request ()
 
 (* ---- 32-bit sequence numbers as two 16-bit halves ---- *)
