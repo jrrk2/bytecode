@@ -32,3 +32,37 @@ let deliver (b : Bytes.t) =
   for i = 0 to n - 1 do mem_rx.(i) <- Char.code (Bytes.get b i) done;
   rx_length := n;
   rx_valid := true
+
+(* replnet.ml calls io_read/io_write directly outside the HW block (the UART,
+   the LEDs, the status and length registers), so the shim answers those too *)
+let io_read a =
+  if a < 0x800 then mem_rx.(a)
+  else if a < 0x1000 then mem_tx.(a - 0x800)
+  else if a = 0x1000 then (if !rx_valid then 1 else 0)
+  else if a = 0x1002 then !rx_length
+  else if a = 0x1006 then !clock
+  else if a = 0x1008 then -1
+  else if a = 0x1001 then 0x796d
+  else 0
+
+let io_write a v =
+  if a >= 0x800 && a < 0x1000 then mem_tx.(a - 0x800) <- v land 0xFF
+  else if a = 0x1003 then eth_send v
+  else if a = 0x1004 then leds_v := v
+  else if a = 0x1005 then Buffer.add_char uart_buf (Char.chr (v land 0xFF))
+  else if a = 0x1002 then (rx_valid := false; rx_length := 0)
+
+(* the I/O addresses themselves, since the device file keeps them in the HW
+   block that this module replaces *)
+let rx_base = 0x0000
+let tx_base = 0x0800
+let eth_status = 0x1000
+let eth_status_phy = 0x1001
+let eth_rxlen = 0x1002
+let eth_txlen = 0x1003
+let leds = 0x1004
+let uart = 0x1005
+let timer_ms = 0x1006
+let uart_rx = 0x1008
+let eth_rx_valid = 1
+let eth_tx_busy = 2

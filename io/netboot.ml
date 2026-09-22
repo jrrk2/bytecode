@@ -485,9 +485,18 @@ let boot_tick () =
     | Checking -> check_and_boot (); boot_state := Done
     | Done -> ()
 
-(* debug_rx prints every received frame's head, for the bring-up of a
-   receive path that delivers frames but not the ones expected. *)
+(* debug_rx prints a line per received frame: what it was, from whom, and
+   whether its destination was this board -- which is what a ping that does
+   not come back is asking.  debug_rx_hex adds the raw head, for a receive
+   path that delivers damaged frames. *)
 let debug_rx = true
+let debug_rx_hex = false
+let uart_ip_at off =
+  for i = 0 to 3 do
+    uart_dec (rx (off + i));
+    if i < 3 then uart_putc '.'
+  done
+
 let uart_hex8 v =
   let d n = if n < 10 then int_of_char '0' + n else int_of_char 'a' + n - 10 in
   io_write uart (d ((v lsr 4) land 15)); io_write uart (d (v land 15))
@@ -508,12 +517,40 @@ let () =
     if st land eth_rx_valid <> 0 then begin
       let len = io_read eth_rxlen land 0x7FF in
       if debug_rx then begin
-        (* every frame's length and first 16 bytes: is the head intact? *)
-        uart_puts "rx "; uart_dec len; uart_putc ':';
-        for i = 0 to 15 do
-          uart_putc ' '; uart_hex8 (rx i)
-        done;
-        uart_putc '\n'
+        (* One line per frame, named rather than dumped: which protocol
+           arrived, from and to which address, and -- the question a ping
+           that does not come back asks -- whether it was for us.  The raw
+           head is still there under debug_rx_hex, for a receive path that
+           delivers damaged frames. *)
+        uart_puts "rx "; uart_dec len; uart_putc ' ';
+        let et = (rx 12 lsl 8) lor rx 13 in
+        if et = 0x0806 then begin
+          uart_puts "arp ";
+          uart_dec (rx 27);                                  (* opcode: 1 request, 2 reply *)
+          uart_puts " who-has "; uart_ip_at 38;
+          uart_puts " tell "; uart_ip_at 28
+        end else if et = 0x0800 then begin
+          let ihl = (rx 14 land 0x0F) * 4 in
+          let proto = rx 23 in
+          uart_ip_at 26; uart_puts " -> "; uart_ip_at 30;
+          uart_puts (if ip_is_mine 30 then " (mine)" else " (not mine)");
+          if proto = 1 then begin
+            uart_puts " icmp type "; uart_dec (rx (14 + ihl))
+          end else if proto = 17 then begin
+            uart_puts " udp "; uart_dec ((rx (14 + ihl) lsl 8) lor rx (14 + ihl + 1));
+            uart_puts " -> "; uart_dec ((rx (14 + ihl + 2) lsl 8) lor rx (14 + ihl + 3))
+          end else begin
+            uart_puts " proto "; uart_dec proto
+          end
+        end else begin
+          uart_puts "ethertype 0x"; uart_hex16 et
+        end;
+        uart_putc '\n';
+        if debug_rx_hex then begin
+          uart_puts "   ";
+          for i = 0 to 15 do uart_putc ' '; uart_hex8 (rx i) done;
+          uart_putc '\n'
+        end
       end;
       if rx 12 = 0x08 && rx 13 = 0x06 then begin handle_arp len; server_arp_reply len end
       else if rx 12 = 0x08 && rx 13 = 0x00 && len >= 42 then begin
