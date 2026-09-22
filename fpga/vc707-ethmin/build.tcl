@@ -32,9 +32,10 @@ set commit [string trim [exec git -C $repo rev-parse --short=7 HEAD]]
 set dirty 0
 if {[catch {exec git -C $repo diff --quiet HEAD --}]} { set dirty 1 }
 # The flow bits put the value past 2^31, which this Tcl's format will not
-# take, so the word is spelled out: flow 2 and the dirty bit as one nibble,
-# a zero nibble, then the seven digits of the commit.
-set build_id [format "32'h%x0%s" [expr {8 + $dirty}] $commit]
+# take, so the word is spelled out: one nibble for flow 2 and the dirty
+# bit, then the seven digits of the commit -- eight digits in all, or the
+# top bits fall off the 32-bit constant and the flow reads as unsaid.
+set build_id [format "32'h%x%s" [expr {8 + $dirty}] $commit]
 lappend defs "BUILD_ID=$build_id"
 puts "build id $build_id (commit $commit, dirty $dirty, Vivado)"
 synth_design -top vc707_ethmin_vm -part $part -include_dirs [list $repo $here] -verilog_define $defs

@@ -1111,14 +1111,7 @@ let build_id = 0x100a
 let uart_build () =
   (* the switches as the board sees them, so a switch that does nothing can
      be told from a switch read the wrong way round *)
-  let d = io_read dip_sw land 0xFF in
   let digits = "0123456789abcdef" in
-  uart_puts "dip=";
-  uart_putc (string_get digits ((d lsr 4) land 0xF));
-  uart_putc (string_get digits (d land 0xF));
-  uart_puts " btn=";
-  uart_putc (string_get digits (io_read buttons land 0x1F));
-  uart_putc ' ';
   let v = io_read build_id in
   if v = 0 then uart_puts "unstamped"
   else begin
@@ -1129,7 +1122,13 @@ let uart_build () =
     if flow = 1 then uart_puts " open"
     else if flow = 2 then uart_puts " vivado"
     else uart_puts " ?"
-  end
+  end;
+  let d = io_read dip_sw land 0xFF in
+  uart_puts " dip=";
+  uart_putc (string_get digits ((d lsr 4) land 0xF));
+  uart_putc (string_get digits (d land 0xF));
+  uart_puts " btn=";
+  uart_putc (string_get digits (io_read buttons land 0x1F))
 
 (* ==== MAIN ==== *)
 let () =
