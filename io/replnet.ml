@@ -78,6 +78,7 @@ let uart = 0x1005
 let timer_ms = 0x1006
 let uart_rx = 0x1008
 let dip_sw = 0x1009
+let buttons = 0x100b
 let eth_rx_valid = 1
 let eth_tx_busy = 2
 
@@ -325,8 +326,8 @@ let handle_dhcp len =
       deadline := now () + !lease_s * 500;                      (* T1: half the lease, in ms *)
       uart_puts "dhcp: bound ";
       uart_ip my_ip;
-      if io_read dip_sw land 0x7F <> 0 then begin
-        uart_puts " (dip "; uart_dec (io_read dip_sw land 0x7F); uart_putc ')'
+      if io_read dip_sw land 0xFF <> 0 then begin
+        uart_puts " (dip "; uart_dec (io_read dip_sw land 0xFF); uart_putc ')'
       end;
       uart_puts " lease ";
       uart_dec !lease_s;
@@ -1115,6 +1116,8 @@ let uart_build () =
   uart_puts "dip=";
   uart_putc (string_get digits ((d lsr 4) land 0xF));
   uart_putc (string_get digits (d land 0xF));
+  uart_puts " btn=";
+  uart_putc (string_get digits (io_read buttons land 0x1F));
   uart_putc ' ';
   let v = io_read build_id in
   if v = 0 then uart_puts "unstamped"
