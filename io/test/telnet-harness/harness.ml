@@ -118,11 +118,11 @@ let () =
          typ ("echo " ^ String.make 400 'x' ^ "\r") >>= fun () ->
          typ ("echo " ^ String.make 400 'y' ^ "\r")
        else
-         typ "1 + 2 * 3\r" >>= fun () ->
-         typ "let rec f x = if x <= 0 then 1 else f (x-1) * x\r" >>= fun () ->
-         typ "f 10\r" >>= fun () ->
-         typ "let g y = y * y in g 12\r") >>= fun () ->
-      typ "f 12\r" >>= fun () ->
+         typ "let x = try 0/0 with _ -> 0 in x\r" >>= fun () ->
+         typ "try 7/0 with m -> m\r" >>= fun () ->
+         typ "try 6*7 with _ -> 0\r" >>= fun () ->
+         typ "let rec f x = if x <= 0 then 1 else f (x-1) * x in try f 10 with _ -> 0\r") >>= fun () ->
+      typ "try nosuchname with _ -> 99\r" >>= fun () ->
       Lwt_unix.sleep 0.3 >>= fun () ->
       Printf.printf "---- what the client saw ----\n%s\n---- end ----\n"
         (String.concat "" (List.map (fun c -> if Char.code c = 255 then "<IAC>" else String.make 1 c)

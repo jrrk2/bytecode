@@ -144,6 +144,13 @@
     // vm_io_read / vm_io_write: waiting on the trap port
     S_IO_WAIT,
 
+    // exceptions: the trap frame, the raise and the zero-divide raise
+    S_PUSHTRAP_WRITE_FRAME,
+    S_POPTRAP,
+    S_RAISE_ENTER,
+    S_RAISE_READ,
+    S_RAISE_FRAME,
+    S_ZERO_DIVIDE,
     // obsolete states
     S_OFFSETCLOSURE_READ,
     S_OFFSETCLOSURE_ADD,

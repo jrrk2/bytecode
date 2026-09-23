@@ -406,11 +406,19 @@ module ocaml4142_vm_rtl #(
 
   localparam int TAG_CLOSURE = 247;
 
+  // The predefined exceptions live in the global data at the indices
+  // runtime/caml/fail.h fixes; Division_by_zero is the sixth.
+  localparam int ZERO_DIVIDE_EXN = 5;
+
 
 
 
   logic [VALUEW-1:0] env;
   logic [       7:0] extra_args;
+
+  // caml_fresh_oo_id's counter: every exception constructor and every class
+  // takes one at startup, and all that matters is that they differ.
+  logic [VALUEW-1:0] oo_id;
 
 
 
@@ -627,9 +635,13 @@ module ocaml4142_vm_rtl #(
 
 
 
+  // An uncaught exception stops the machine as STOP does; the request comes
+  // from the raise, which has no handler left to run.
+  logic uncaught_exn;
+
   always_ff @(posedge clk) begin
     if (reset) halted <= 1'b0;
-    else if (opcode == STOP && state == S_EXEC) halted <= 1'b1;
+    else if ((opcode == STOP && state == S_EXEC) || uncaught_exn) halted <= 1'b1;
   end
 
 
@@ -846,6 +858,8 @@ module ocaml4142_vm_rtl #(
 
       sp                    <= (1 << STACK_AW) - 1;
       trapsp                <= (1 << STACK_AW) - 1;
+      oo_id                 <= 0;
+      uncaught_exn          <= 1'b0;
 
 
       // the dynamic heap starts above the image, and never at index 0
@@ -1378,9 +1392,12 @@ module ocaml4142_vm_rtl #(
               stack_read_a(sp);  // tos
               hold_for_read();
             end else begin
-              div_start(Int_val(accu), Int_val(st_rd_a), 1'b0);
-              sp    <= sp + 1;
-              state <= S_DIV_ITER;
+              sp <= sp + 1;
+              if (Int_val(st_rd_a) == 0) state <= S_ZERO_DIVIDE;
+              else begin
+                div_start(Int_val(accu), Int_val(st_rd_a), 1'b0);
+                state <= S_DIV_ITER;
+              end
             end
 
             MODINT:
@@ -1388,9 +1405,12 @@ module ocaml4142_vm_rtl #(
               stack_read_a(sp);  // tos
               hold_for_read();
             end else begin
-              div_start(Int_val(accu), Int_val(st_rd_a), 1'b1);
-              sp    <= sp + 1;
-              state <= S_DIV_ITER;
+              sp <= sp + 1;
+              if (Int_val(st_rd_a) == 0) state <= S_ZERO_DIVIDE;
+              else begin
+                div_start(Int_val(accu), Int_val(st_rd_a), 1'b1);
+                state <= S_DIV_ITER;
+              end
             end
 
             ANDINT:
@@ -1742,6 +1762,17 @@ module ocaml4142_vm_rtl #(
 
 
 
+
+            PUSHTRAP: begin
+              op_cycle_count <= 0;
+              state <= S_PUSHTRAP_WRITE_FRAME;
+            end
+
+            POPTRAP: state <= S_POPTRAP;
+
+            // RERAISE and RAISE_NOTRACE differ only in the backtrace, which
+            // this machine does not keep.
+            RAISE, RERAISE, RAISE_NOTRACE: state <= S_RAISE_ENTER;
 
             GETGLOBAL: begin
               temp_globals_addr <= imm[GLOBALS_AW-1:0];
@@ -2172,6 +2203,10 @@ module ocaml4142_vm_rtl #(
                 // with enough top-level definitions does it.  The stack here is
                 // a fixed block RAM, so there is nothing to grow: answer unit.
                 16'h05a: accu <= VAL_UNIT;
+                16'h084: begin  // caml_fresh_oo_id: the next identity
+                  accu  <= Val_int(oo_id);
+                  oo_id <= oo_id + 1;
+                end
                 default: begin
                   $display("Unsupported C_CALL1: 0x%x", imm);
                   accu <= VAL_UNIT;
@@ -2856,6 +2891,93 @@ module ocaml4142_vm_rtl #(
         end else begin
           temp_heap_val <= hm_rd_a;
           state <= next_state_after_mem;
+        end
+
+        // PUSHTRAP: a four-word trap frame -- the handler's address, the
+        // trap stack below it, the environment and the argument count --
+        // and trapsp then points at it.  (interp.c's PUSHTRAP.)
+        S_PUSHTRAP_WRITE_FRAME: begin
+          case (op_cycle_count)
+            0: begin
+              stack_write(sp - 4, Make_codeptr($signed(pc - 1) + $signed(imm)));
+              op_cycle_count <= 1;
+            end
+            1: begin
+              stack_write(sp - 3, {{(VALUEW-STACK_AW-1){1'b0}}, trapsp, 1'b1});  // Val_long(trapsp)
+              op_cycle_count <= 2;
+            end
+            2: begin
+              stack_write(sp - 2, env);
+              op_cycle_count <= 3;
+            end
+            3: begin
+              stack_write(sp - 1, Val_int(extra_args));
+              sp     <= sp - 4;
+              trapsp <= sp - 4;
+              state  <= S_DONE;
+            end
+          endcase
+        end
+
+        // POPTRAP: the frame goes, and with it the handler.
+        S_POPTRAP:
+        if (!rd_phase) begin
+          stack_read_a(sp + 1);  // the trap stack this frame saved
+          hold_for_read();
+        end else begin
+          trapsp <= st_rd_a[STACK_AW:1];
+          sp     <= sp + 4;
+          state  <= S_DONE;
+        end
+
+        // RAISE: the stack goes back to the innermost trap frame and the
+        // handler runs with the exception in accu.  With no frame left the
+        // exception is uncaught, and this machine has nowhere to print it:
+        // it stops, which is what an uncaught exception does to a program.
+        S_RAISE_READ:
+        if (!rd_phase) begin
+          stack_read_a(trapsp);      // the handler
+          stack_read_b(trapsp + 1);  // the trap stack below this frame
+          hold_for_read();
+        end else begin
+          pc             <= Codeptr_val(st_rd_a);
+          trapsp         <= st_rd_b[STACK_AW:1];
+          temp_stack_addr <= trapsp;
+          state          <= S_RAISE_FRAME;
+        end
+
+        S_RAISE_FRAME:
+        if (!rd_phase) begin
+          stack_read_a(temp_stack_addr + 2);  // env
+          stack_read_b(temp_stack_addr + 3);  // extra_args
+          hold_for_read();
+        end else begin
+          env        <= st_rd_a;
+          extra_args <= Int_val(st_rd_b);
+          sp         <= temp_stack_addr + 4;
+          state      <= S_DONE;
+        end
+
+        // Division by zero raises Division_by_zero, which the global data
+        // holds at the index the runtime's fail.h gives it (5).  The value
+        // goes in accu and the raise proceeds as any other.
+        S_ZERO_DIVIDE:
+        if (!rd_phase) begin
+          globals_read_a(ZERO_DIVIDE_EXN[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          accu  <= gm_rd_a;
+          state <= S_RAISE_ENTER;
+        end
+
+        S_RAISE_ENTER: begin
+          if (trapsp == {STACK_AW{1'b1}}) begin
+            uncaught_exn <= 1'b1;   // no handler left: stop, as STOP does
+            state        <= S_DONE;
+          end else begin
+            sp    <= trapsp;
+            state <= S_RAISE_READ;
+          end
         end
 
         S_GLOBALS_READ:

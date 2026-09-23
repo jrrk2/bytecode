@@ -12,8 +12,9 @@
      - = 3628800
 
    The language: integers and booleans; + - * / mod; = <> < > <= >=;
-   if/then/else; let [rec] f x y = e [in e]; fun x y -> e; application by
-   juxtaposition; parentheses.  Top-level lets extend the session.
+   if/then/else; let [rec] f x y = e [in e]; fun x y -> e; try e with _ ->
+   e (or "with m ->" to see the message); application by juxtaposition;
+   parentheses.  Top-level lets extend the session.
 
    Two ways in, one session: typing at the UART (echo, backspace), and UDP
    datagrams to port 7777 -- `nc -u <address> 7777` -- whose lines are
@@ -404,8 +405,10 @@ type expr =
   | Fun of string * expr
   | App of expr * expr
   | Let of bool * string * expr * expr    (* rec?, name, bound, body *)
+  | Try of expr * string * expr           (* try e with x -> e: x names the message *)
 
-let keyword s = string_equal s "let" || string_equal s "rec" || string_equal s "in"
+let keyword s = string_equal s "try" || string_equal s "with"
+                || string_equal s "let" || string_equal s "rec" || string_equal s "in"
                 || string_equal s "if" || string_equal s "then" || string_equal s "else"
                 || string_equal s "fun" || string_equal s "true" || string_equal s "false"
                 || string_equal s "mod"
@@ -451,6 +454,27 @@ let rec parse_expr toks = match toks with
              match parse_expr rest with
              | Err e -> Err e
              | Ok (b, rest) -> Ok (If (c, a, b), rest))
+  (* try e with _ -> e2, or "with x -> e2" to bind the failure's message:
+     an error anywhere in e -- division by zero, an unbound name, a bad
+     operand -- gives e2 instead.  The machine's own exceptions are what
+     this is built on: see io/exc.ml. *)
+  | t :: rest when is_kw t "try" ->
+    (match parse_expr rest with
+     | Err e -> Err e
+     | Ok (body, rest) ->
+       match expect rest "with" with
+       | Err e -> Err e
+       | Ok rest ->
+         let (name, rest) = match rest with
+           | TId x :: r when not (keyword x) -> (x, r)
+           | TSym x :: r when string_equal x "_" -> ("_", r)
+           | _ -> ("_", rest) in
+         match expect rest "->" with
+         | Err e -> Err e
+         | Ok rest ->
+           match parse_expr rest with
+           | Err e -> Err e
+           | Ok (handler, rest) -> Ok (Try (body, name, handler), rest))
   | t :: rest when is_kw t "fun" ->
     let (ps, rest) = params rest [] in
     (match ps with
@@ -564,6 +588,7 @@ and parse_atom toks = match toks with
 type value =
   | VInt of int
   | VBool of bool
+  | VStr of string                        (* a caught failure's message *)
   | VClosure of string * expr * env ref   (* the ref lets a let rec see itself *)
 and env = (string * value) list
 
@@ -625,6 +650,14 @@ let rec eval env e = match e with
         | Err m -> Err m
         | Ok va -> eval ((x, va) :: !cenv) body)
      | Ok _ -> Err "not a function")
+  | Try (body, name, handler) ->
+    (match eval env body with
+     | Ok v -> Ok v
+     | Err m ->
+       (* the handler sees the message as a string value if it asked for a
+          name; "_" discards it *)
+       if string_equal name "_" then eval env handler
+       else eval ((name, VStr m) :: env) handler)
   | Let (recursive, name, bound, body) ->
     (match eval env bound with
      | Err m -> Err m
@@ -638,6 +671,7 @@ let rec eval env e = match e with
 let print_value v = match v with
   | VInt n -> put_int n
   | VBool b -> puts (if b then "true" else "false")
+  | VStr s -> putc '"'; puts s; putc '"'
   | VClosure _ -> puts "<fun>"
 
 let session = ref []
