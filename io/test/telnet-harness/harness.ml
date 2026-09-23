@@ -156,6 +156,19 @@ let () =
          typ ("echo " ^ String.make 400 'x' ^ "\r") >>= fun () ->
          typ ("echo " ^ String.make 400 'y' ^ "\r")
        else
+         typ "1.5 +. 2.25\r" >>= fun () ->
+         typ "let pi = 3.14159\r" >>= fun () ->
+         typ "pi *. 2.\r" >>= fun () ->
+         typ "let rec fact n = if n <= 0 then 1 else n * fact (n-1)\r" >>= fun () ->
+         typ "fact 6\r" >>= fun () ->
+         typ "let id x = x\r" >>= fun () ->
+         typ "id 3\r" >>= fun () ->
+         typ "id 3.5\r" >>= fun () ->
+         typ "1 +. 2.\r" >>= fun () ->
+         typ "1.5 + 2\r" >>= fun () ->
+         typ "if 3 then 1 else 2\r" >>= fun () ->
+         typ "fun x -> x +. 1.\r" >>= fun () ->
+         typ "2 + 3\r" >>= fun () ->
          typ "let fact n = if n <= 0 then 1 else fact (n-1) * n\r" >>= fun () ->
          typ "let rec fact n = if n <= 0 then 1 else fact (n-1) * n\r" >>= fun () ->
          typ "fact 5\r" >>= fun () ->

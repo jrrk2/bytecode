@@ -346,8 +346,22 @@ let dhcp_tick () =
       uart_puts "dhcp: timeout\r\n"; state := Init end
   | Bound -> if now () > !deadline then request ()             (* renew *)
 
+(* ---- floating point ----
+   The processor does these in hardware (fpga/fpu-rtl); here they are just
+   the externals, since this file compiles without the standard library. *)
+external ( +. ) : float -> float -> float = "caml_add_float" "%addfloat"
+external ( -. ) : float -> float -> float = "caml_sub_float" "%subfloat"
+external ( *. ) : float -> float -> float = "caml_mul_float" "%mulfloat"
+external ( /. ) : float -> float -> float = "caml_div_float" "%divfloat"
+external ( ~-. ) : float -> float = "caml_neg_float" "%negfloat"
+external float_of_int : int -> float = "caml_float_of_int" "%floatofint"
+external int_of_float : float -> int = "caml_int_of_float" "%intoffloat"
+external flt_lt : float -> float -> bool = "caml_lt_float" "%lessthan"
+external flt_le : float -> float -> bool = "caml_le_float" "%lessequal"
+external flt_eq : float -> float -> bool = "caml_eq_float" "%equal"
+
 (* ---- tokens ---- *)
-type token = TInt of int | TId of string | TSym of string
+type token = TInt of int | TFloat of float | TId of string | TSym of string
 
 let is_digit c = c >= 48 && c <= 57
 let is_alpha c = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c = 95
@@ -363,7 +377,9 @@ let substring from upto =
 let symbol_len i =
   let c = char_at i in
   let d = if i + 1 < !line_len then char_at (i + 1) else 0 in
-  if (c = 60 && (d = 61 || d = 62)) || (c = 62 && d = 61) || (c = 45 && d = 62) then 2
+  (* +. -. *. /. are two characters, as are <= <> >= -> *)
+  if (c = 60 && (d = 61 || d = 62)) || (c = 62 && d = 61) || (c = 45 && d = 62)
+     || ((c = 43 || c = 45 || c = 42 || c = 47) && d = 46) then 2
   else if c = 43 || c = 45 || c = 42 || c = 47 || c = 61 || c = 60 || c = 62
        || c = 40 || c = 41 then 1
   else 0
@@ -381,7 +397,19 @@ let tokenize () =
         while !j < !line_len && is_digit (char_at !j) do
           n := !n * 10 + (char_at !j - 48); j := !j + 1
         done;
-        go !j (TInt !n :: acc)
+        (* a point with a digit after it, or a point at the end as OCaml
+           allows in "1.", makes this a float rather than an int *)
+        if !j < !line_len && char_at !j = 46 then begin
+          let whole = float_of_int !n in
+          j := !j + 1;
+          let frac = ref 0.0 and scale = ref 1.0 in
+          while !j < !line_len && is_digit (char_at !j) do
+            scale := !scale *. 10.0;
+            frac := !frac *. 10.0 +. float_of_int (char_at !j - 48);
+            j := !j + 1
+          done;
+          go !j (TFloat (whole +. (if flt_eq !scale 1.0 then 0.0 else !frac /. !scale)) :: acc)
+        end else go !j (TInt !n :: acc)
       end else if is_alpha c then begin
         let j = ref i in
         while !j < !line_len && (is_alpha (char_at !j) || is_digit (char_at !j)) do j := !j + 1 done;
@@ -398,6 +426,7 @@ let tokenize () =
 (* ---- syntax ---- *)
 type expr =
   | Int of int
+  | Float of float
   | Bool of bool
   | Var of string
   | Binop of string * expr * expr
@@ -529,7 +558,8 @@ and parse_arith toks =
   | Err e -> Err e
   | Ok (a, rest) -> arith_more a rest
 and arith_more a toks = match toks with
-  | TSym op :: rest when string_equal op "+" || string_equal op "-" ->
+  | TSym op :: rest when string_equal op "+" || string_equal op "-"
+                        || string_equal op "+." || string_equal op "-." ->
     (match parse_term rest with
      | Err e -> Err e
      | Ok (b, rest) -> arith_more (Binop (op, a, b)) rest)
@@ -540,7 +570,8 @@ and parse_term toks =
   | Err e -> Err e
   | Ok (a, rest) -> term_more a rest
 and term_more a toks = match toks with
-  | t :: rest when is_sym t "*" || is_sym t "/" || is_kw t "mod" ->
+  | t :: rest when is_sym t "*" || is_sym t "/" || is_kw t "mod"
+                   || is_sym t "*." || is_sym t "/." ->
     let op = match t with TSym s -> s | _ -> "mod" in
     (match parse_app rest with
      | Err e -> Err e
@@ -559,15 +590,18 @@ and app_more f toks =
   else Ok (f, toks)
 and starts_atom toks = match toks with
   | TInt _ :: _ -> true
+  | TFloat _ :: _ -> true
   | TId x :: _ -> not (keyword x) || string_equal x "true" || string_equal x "false"
   | t :: _ -> is_sym t "("
   | [] -> false
 
 and parse_atom toks = match toks with
   | TInt n :: rest -> Ok (Int n, rest)
+  | TFloat f :: rest -> Ok (Float f, rest)
   | TId x :: rest when string_equal x "true" -> Ok (Bool true, rest)
   | TId x :: rest when string_equal x "false" -> Ok (Bool false, rest)
   | TId x :: rest when not (keyword x) -> Ok (Var x, rest)
+  | TSym s :: TFloat f :: rest when string_equal s "-" -> Ok (Float (~-. f), rest)
   | TSym s :: rest when string_equal s "-" ->
     (match parse_atom rest with
      | Err e -> Err e
@@ -587,6 +621,7 @@ and parse_atom toks = match toks with
 (* ---- evaluation ---- *)
 type value =
   | VInt of int
+  | VFloat of float
   | VBool of bool
   | VStr of string                        (* a caught failure's message *)
   | VClosure of string * expr * env ref   (* the ref lets a let rec see itself *)
@@ -616,8 +651,251 @@ let is_comparison op =
   string_equal op "=" || string_equal op "<>" || string_equal op "<"
   || string_equal op ">" || string_equal op "<=" || string_equal op ">="
 
+let float_arith op a b =
+  if string_equal op "+." then Ok (VFloat (a +. b))
+  else if string_equal op "-." then Ok (VFloat (a -. b))
+  else if string_equal op "*." then Ok (VFloat (a *. b))
+  else Ok (VFloat (a /. b))          (* division by zero gives an infinity,
+                                        as it does in OCaml *)
+
+(* The comparisons are the ones the hardware answers; the rest are built
+   from them, as caml_gt_float and its siblings are. *)
+let compare_floats op (a : float) (b : float) =
+  VBool (if string_equal op "=" then flt_eq a b
+         else if string_equal op "<>" then not (flt_eq a b)
+         else if string_equal op "<" then flt_lt a b
+         else if string_equal op ">" then flt_lt b a
+         else if string_equal op "<=" then flt_le a b
+         else flt_le b a)
+
+let is_float_op op =
+  string_equal op "+." || string_equal op "-." ||
+  string_equal op "*." || string_equal op "/."
+
+
+(* ---- types ----
+   Hindley-Milner, so that "1 +. 2" is refused before it is run and a
+   function's type is worked out rather than declared.  Type variables are
+   mutable cells: unification points one at the type it turned out to be,
+   and everything downstream follows the link.  Generalisation is the plain
+   rule -- a let quantifies the variables its right-hand side left free that
+   the environment does not also mention -- which is enough for a REPL and
+   costs no levels to track. *)
+type ty =
+  | TInt
+  | TBool
+  | TFloat
+  | TString
+  | TArrow of ty * ty
+  | TVar of tv ref
+and tv = Unbound of int | Link of ty
+
+let tvar_count = ref 0
+let fresh_tv () =
+  tvar_count := !tvar_count + 1;
+  TVar (ref (Unbound !tvar_count))
+
+let rec repr t = match t with
+  | TVar r -> (match r.contents with Link u -> repr u | Unbound _ -> t)
+  | _ -> t
+
+let rec occurs id t = match repr t with
+  | TVar r -> (match r.contents with Unbound i -> i = id | Link _ -> false)
+  | TArrow (a, b) -> occurs id a || occurs id b
+  | _ -> false
+
+(* Type variables are numbered as they are created, so a type printed on its
+   own would start at whatever the counter had reached: 'g for the first one
+   the session happens to show.  Naming them in order of appearance instead
+   gives 'a, 'b, ... per type, which is what OCaml prints and what anyone
+   reading it expects. *)
+let type_name t =
+  let seen = ref [] and next = ref 0 in
+  let rec index_of (i : int) l = match l with
+    | [] ->
+      let k = !next in
+      next := k + 1;
+      seen := (i, k) :: !seen;
+      k
+    | (j, k) :: r -> if i = j then k else index_of i r in
+  let letter i =
+    let b = create_bytes 1 in
+    bytes_set b 0 (char_of_int (97 + i mod 26));
+    bytes_to_string b in
+  let rec go t = match repr t with
+    | TInt -> "int"
+    | TBool -> "bool"
+    | TFloat -> "float"
+    | TString -> "string"
+    | TVar r -> (match r.contents with
+                 | Unbound i -> "'" ^^ letter (index_of i !seen)
+                 | Link u -> go u)
+    | TArrow (a, b) ->
+      (match repr a with
+       | TArrow _ -> "(" ^^ go a ^^ ") -> " ^^ go b
+       | _ -> go a ^^ " -> " ^^ go b) in
+  go t
+
+let rec unify a b =
+  let ra = repr a and rb = repr b in
+  match ra, rb with
+  | TInt, TInt -> Ok ()
+  | TBool, TBool -> Ok ()
+  | TFloat, TFloat -> Ok ()
+  | TString, TString -> Ok ()
+  | TArrow (a1, a2), TArrow (b1, b2) ->
+    (match unify a1 b1 with Err m -> Err m | Ok () -> unify a2 b2)
+  | TVar r, _ ->
+    (match r.contents with
+     | Unbound i ->
+       (* the same variable on both sides: every cell carries a distinct
+          number, so the numbers answer this without physical equality *)
+       let same = match rb with
+         | TVar q -> (match q.contents with Unbound j -> i = j | Link _ -> false)
+         | _ -> false in
+       if same then Ok ()
+       else if occurs i rb then Err "this would make a type that contains itself"
+       else begin r.contents <- Link rb; Ok () end
+     | Link u -> unify u rb)
+  | _, TVar _ -> unify rb ra
+  | _ ->
+    Err ("this expression has type " ^^ type_name rb
+         ^^ " but was expected to have type " ^^ type_name ra)
+
+(* A scheme is a type with some of its variables quantified; instantiating
+   gives each of them a fresh cell, which is what lets "let id x = x" serve
+   an int in one place and a float in another. *)
+type scheme = Forall of int list * ty
+
+let rec mem_int (x : int) (l : int list) =
+  match l with [] -> false | y :: r -> x = y || mem_int x r
+
+let rec free_ty t acc = match repr t with
+  | TVar r -> (match r.contents with
+               | Unbound i -> if mem_int i acc then acc else i :: acc
+               | Link u -> free_ty u acc)
+  | TArrow (a, b) -> free_ty b (free_ty a acc)
+  | _ -> acc
+
+let rec free_env env acc = match env with
+  | [] -> acc
+  | (_, Forall (q, t)) :: rest ->
+    let here = free_ty t [] in
+    let rec keep l a = match l with
+      | [] -> a
+      | i :: r -> keep r (if mem_int i q || mem_int i a then a else i :: a) in
+    free_env rest (keep here acc)
+
+let generalize env t =
+  let ft = free_ty t [] and fe = free_env env [] in
+  let rec keep l a = match l with
+    | [] -> a
+    | i :: r -> keep r (if mem_int i fe then a else i :: a) in
+  Forall (keep ft [], t)
+
+let instantiate sc = match sc with
+  | Forall ([], t) -> t
+  | Forall (q, t) ->
+    let subst = ref [] in
+    let rec fresh_for (i : int) l = match l with
+      | [] -> let v = fresh_tv () in subst := (i, v) :: !subst; v
+      | (j, v) :: r -> if i = j then v else fresh_for i r in
+    let rec go t = match repr t with
+      | TVar r -> (match r.contents with
+                   | Unbound i -> if mem_int i q then fresh_for i !subst else t
+                   | Link u -> go u)
+      | TArrow (a, b) -> TArrow (go a, go b)
+      | u -> u in
+    go t
+
+let rec lookup_scheme env x = match env with
+  | [] -> Err ("unbound " ^^ x)
+  | (y, sc) :: rest -> if string_equal x y then Ok (instantiate sc) else lookup_scheme rest x
+
+let int_op op =
+  string_equal op "+" || string_equal op "-" || string_equal op "*"
+  || string_equal op "/" || string_equal op "mod"
+
+let rec infer env e = match e with
+  | Int _ -> Ok TInt
+  | Float _ -> Ok TFloat
+  | Bool _ -> Ok TBool
+  | Var x -> lookup_scheme env x
+  | Fun (x, body) ->
+    let a = fresh_tv () in
+    (match infer ((x, Forall ([], a)) :: env) body with
+     | Err m -> Err m
+     | Ok b -> Ok (TArrow (a, b)))
+  | App (Var f, _) when string_equal f "ms" -> Ok TInt
+  | App (f, a) ->
+    (match infer env f with
+     | Err m -> Err m
+     | Ok tf ->
+       match infer env a with
+       | Err m -> Err m
+       | Ok ta ->
+         let r = fresh_tv () in
+         match unify tf (TArrow (ta, r)) with
+         | Err m -> Err m
+         | Ok () -> Ok r)
+  | Binop (op, a, b) ->
+    (match infer env a with
+     | Err m -> Err m
+     | Ok ta ->
+       match infer env b with
+       | Err m -> Err m
+       | Ok tb ->
+         if is_comparison op then
+           (match unify ta tb with Err m -> Err m | Ok () -> Ok TBool)
+         else begin
+           let want = if int_op op then TInt else TFloat in
+           match unify ta want with
+           | Err m -> Err m
+           | Ok () -> match unify tb want with Err m -> Err m | Ok () -> Ok want
+         end)
+  | If (c, a, b) ->
+    (match infer env c with
+     | Err m -> Err m
+     | Ok tc ->
+       match unify tc TBool with
+       | Err _ -> Err "the condition of an if must be a bool"
+       | Ok () ->
+         match infer env a with
+         | Err m -> Err m
+         | Ok ta ->
+           match infer env b with
+           | Err m -> Err m
+           | Ok tb -> match unify ta tb with Err m -> Err m | Ok () -> Ok ta)
+  | Let (recursive, name, bound, body) ->
+    let inner =
+      if recursive then (name, Forall ([], fresh_tv ())) :: env else env in
+    (match infer inner bound with
+     | Err m -> Err m
+     | Ok tb ->
+       let check =
+         if recursive then
+           (match inner with
+            | (_, Forall (_, a)) :: _ -> unify a tb
+            | [] -> Ok ())
+         else Ok () in
+       match check with
+       | Err m -> Err m
+       | Ok () ->
+         let sc = generalize env tb in
+         infer ((name, sc) :: env) body)
+  | Try (body, name, handler) ->
+    (match infer env body with
+     | Err m -> Err m
+     | Ok tb ->
+       let henv = if string_equal name "_" then env
+                  else (name, Forall ([], TString)) :: env in
+       match infer henv handler with
+       | Err m -> Err m
+       | Ok th -> match unify tb th with Err m -> Err m | Ok () -> Ok tb)
+
 let rec eval env e = match e with
   | Int n -> Ok (VInt n)
+  | Float f -> Ok (VFloat f)
   | Bool b -> Ok (VBool b)
   | Var x -> lookup env x
   | Fun (x, body) -> Ok (VClosure (x, body, ref env))
@@ -630,6 +908,10 @@ let rec eval env e = match e with
        | Ok vb ->
          match va, vb with
          | VInt x, VInt y -> if is_comparison op then Ok (compare_ints op x y) else arith op x y
+         | VFloat x, VFloat y ->
+           if is_comparison op then Ok (compare_floats op x y)
+           else if is_float_op op then float_arith op x y
+           else Err ("float needs " ^^ op ^^ ".")
          | VBool x, VBool y when string_equal op "=" -> Ok (VBool (x = y))
          | VBool x, VBool y when string_equal op "<>" -> Ok (VBool (x <> y))
          | _ -> Err ("bad operands for " ^^ op))
@@ -668,8 +950,59 @@ let rec eval env e = match e with
        eval ((name, v) :: env) body)
 
 (* ---- evaluating a line, whichever way it came ---- *)
+(* Printing a double, without caml_format_float -- which this processor does
+   not have, and which would be a page of C if it did.  Six digits after the
+   point, the last one rounded, and a trailing zero kept so that a float
+   always looks like one: 3. rather than 3.  Values too large for an int are
+   printed as a mantissa and a power of ten, which is what they are. *)
+let print_float (x : float) =
+  if not (flt_eq x x) then puts "nan"
+  else begin
+    let neg = flt_lt x 0.0 in
+    let a = if neg then ~-. x else x in
+    if neg then putc '-';
+    if flt_le 1e18 a then puts "inf"        (* anything this big, near enough *)
+    else begin
+      (* the whole part, digit by digit from the top, so that values beyond
+         an int's range still print *)
+      let rec scale_of p acc = if flt_lt a p then acc else scale_of (p *. 10.0) (acc + 1) in
+      let digits = scale_of 1.0 0 in
+      let rest = ref a in
+      if digits = 0 then putc '0'
+      else begin
+        let p = ref 1.0 in
+        for _ = 2 to digits do p := !p *. 10.0 done;
+        for _ = 1 to digits do
+          let d = int_of_float (!rest /. !p) in
+          putc (char_of_int (48 + d));
+          rest := !rest -. float_of_int d *. !p;
+          p := !p /. 10.0
+        done
+      end;
+      putc '.';
+      (* Six places, rounded at the last, with trailing zeros dropped: OCaml
+         prints 3.75 and 6., not 3.750000 and 6.000000. *)
+      let f = !rest *. 1000000.0 +. 0.5 in
+      let n = ref (int_of_float f) in
+      if !n >= 1000000 then n := 999999;
+      let keep = ref 6 in
+      let m = ref !n in
+      while !keep > 0 && !m mod 10 = 0 do m := !m / 10; keep := !keep - 1 done;
+      let d = ref 1 in
+      for _ = 2 to !keep do d := !d * 10 done;
+      let r = ref !m in
+      for _ = 1 to !keep do
+        let k = !r / !d in
+        putc (char_of_int (48 + k));
+        r := !r - k * !d;
+        d := !d / 10
+      done
+    end
+  end
+
 let print_value v = match v with
   | VInt n -> put_int n
+  | VFloat f -> print_float f
   | VBool b -> puts (if b then "true" else "false")
   | VStr s -> putc '"'; puts s; putc '"'
   | VClosure _ -> puts "<fun>"
@@ -688,6 +1021,7 @@ let rec bound_in names x = match names with
 
 let rec free_name names e = match e with
   | Int _ -> Ok ()
+  | Float _ -> Ok ()
   | Bool _ -> Ok ()
   | Var x -> if bound_in names x then Ok () else Err x
   | Fun (p, body) -> free_name (p :: names) body
@@ -716,6 +1050,27 @@ let session_names () =
 (* "ms" is the one name the evaluator answers for without a binding *)
 let scope_check e = free_name ("ms" :: session_names ()) e
 
+(* The session's types, beside its values.  A top-level binding is parsed as
+   "let x = e in x", so its scheme is generalised from the right-hand side
+   and kept here; everything else is inferred against what is already bound. *)
+let type_session : (string * scheme) list ref = ref []
+
+let infer_line e = match e with
+  | Let (recursive, name, bound, Var v) when string_equal v name ->
+    let self = fresh_tv () in
+    let inner = if recursive then (name, Forall ([], self)) :: !type_session
+                else !type_session in
+    (match infer inner bound with
+     | Err m -> Err m
+     | Ok tb ->
+       let check = if recursive then unify self tb else Ok () in
+       match check with
+       | Err m -> Err m
+       | Ok () -> Ok (name, generalize !type_session tb, tb))
+  | _ -> (match infer !type_session e with
+          | Err m -> Err m
+          | Ok t -> Ok ("", Forall ([], t), t))
+
 let evaluate_line () =
   if !line_len > 0 then begin
     match tokenize () with
@@ -740,6 +1095,9 @@ let evaluate_line () =
            | _ -> ());
           newline ()
         | Ok () ->
+        match infer_line e with
+        | Err m -> puts "error: "; puts m; newline ()
+        | Ok (bound_name, sc, ty) ->
         let t0 = now () in
         match eval !session e with
         | Err m -> puts "error: "; puts m; newline ()
@@ -748,8 +1106,9 @@ let evaluate_line () =
           (match top_let, e with
            | true, Let (_, name, _, Var _) ->
              session := (name, v) :: !session;
-             puts "val "; puts name; puts " = "
-           | _ -> puts "- = ");
+             type_session := (bound_name, sc) :: !type_session;
+             puts "val "; puts name; puts " : "; puts (type_name ty); puts " = "
+           | _ -> puts "- : "; puts (type_name ty); puts " = ");
           print_value v;
           (* what it cost on the board, with the network and the UART left
              out: the millisecond counter around eval alone *)
