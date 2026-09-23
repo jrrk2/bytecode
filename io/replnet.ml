@@ -1025,6 +1025,10 @@ let parse_typedecl toks =
               let l = match te with TETuple parts -> parts | _ -> [te] in
               more ((c, l) :: acc) rest3)
          | TId c :: rest2 when is_ctor c -> more ((c, []) :: acc) rest2
+         (* the usual slip: false, true, or any other ordinary name, which
+            the parser tells apart from a constructor by its first letter *)
+         | TId x :: _ when not (is_tyvar x) ->
+           Err (x ^^ " cannot be a constructor: they start with a capital letter")
          | _ -> Err "expected a constructor name"
        and more acc toks = match toks with
          | t :: rest2 when is_sym t "|" -> arms rest2 acc
@@ -1768,7 +1772,10 @@ let evaluate_line () =
        | Err m -> puts "error: "; puts m; newline ()
        | Ok (name, ps, arms, rest) ->
          match rest with
-         | _ :: _ -> puts "error: unexpected input at the end"; newline ()
+         | t :: _ ->
+           puts "error: unexpected input at the end";
+           if is_kw t "or" then puts " (constructors are separated by |)";
+           newline ()
          | [] ->
            let rec add l = match l with
              | [] -> ()
