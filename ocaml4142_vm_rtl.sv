@@ -392,6 +392,19 @@ module ocaml4142_vm_rtl #(
   endfunction
 
 
+  // "index out of bounds", the message OCaml's caml_array_bound_error
+  // raises, packed little-endian with the padding byte OCaml's strings end
+  // with: 19 characters in five words, so the last byte is zero.
+  function automatic logic [31:0] bound_msg_word(input logic [2:0] i);
+    unique case (i)
+      3'd0: bound_msg_word = 32'h65646E69;    // "inde"
+      3'd1: bound_msg_word = 32'h756F2078;    // "x ou"
+      3'd2: bound_msg_word = 32'h666F2074;    // "t of"
+      3'd3: bound_msg_word = 32'h756F6220;    // " bou"
+      default: bound_msg_word = 32'h0073646E; // "nds" and the padding
+    endcase
+  endfunction
+
   function automatic logic [VALUEW-1:0] Make_header(input int wosize, input int tag);
     logic [ 7:0] tag8 = tag;
     logic [15:0] wosize16 = wosize;
@@ -407,8 +420,22 @@ module ocaml4142_vm_rtl #(
   localparam int TAG_CLOSURE = 247;
 
   // The predefined exceptions live in the global data at the indices
-  // runtime/caml/fail.h fixes; Division_by_zero is the sixth.
+  // runtime/caml/fail.h fixes; Division_by_zero is the sixth and
+  // Stack_overflow the ninth.
   localparam int ZERO_DIVIDE_EXN = 5;
+  localparam int STACK_OVERFLOW_EXN = 8;
+  // The stack grows down from the top of stack_mem and nothing stopped it
+  // reaching zero, where it wrapped and quietly took the machine with it.
+  // The check is made once per instruction, so the margin has to cover
+  // everything a single one can push before the next fetch looks again.
+  localparam int STACK_MARGIN = 256;
+  // Invalid_argument carries a string, so unlike Division_by_zero it cannot
+  // simply be read out of the globals.  The value is built once coming out
+  // of reset and parked in a slot above the ones the image loads, where the
+  // collector's root scan finds it and forwards it like any other root.
+  localparam int INVALID_EXN = 3;
+  localparam int BOUND_EXN_SLOT = (1 << GLOBALS_AW) - 1;
+  localparam int BOUND_MSG_WORDS = 5;   // "index out of bounds", padded
 
 
 
@@ -474,6 +501,7 @@ module ocaml4142_vm_rtl #(
   logic [VALUEW-1:0] temp_index;
   logic [VALUEW-1:0] temp_array_ptr;
   logic [VALUEW-1:0] temp_base_ptr;
+  state_t bound_next;   // the access to make once its index has been checked
   logic [VALUEW-1:0] temp_return_pc, temp_return_env;
   logic [7:0] temp_extra_args;
 
@@ -740,10 +768,13 @@ module ocaml4142_vm_rtl #(
       `ifndef SYNTHESIS
       $display("caml_string_get %x %x", accu, Int_val(st_rd_a));
       `endif
-      // bytes pack little-endian after the header; index = Int_val(tos)
-      temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW+2:3];
-      str_byte <= st_rd_a[2:1];
-      state <= S_STRGET_READ;
+      // bytes pack little-endian after the header; index = Int_val(tos).
+      // The safe accessor checks first, and S_STRBOUND_LAST works out the
+      // word and the byte once the length is known.
+      temp_base_ptr <= accu;
+      temp_index    <= Int_val(st_rd_a);
+      bound_next    <= S_STRGET_READ;
+      state         <= S_STRBOUND_HDR;
     end
   endtask
 
@@ -879,7 +910,8 @@ module ocaml4142_vm_rtl #(
       rd_phase     <= 1'b0;
       tos_q        <= '0;
       st_a_was_tos <= 1'b0;
-      state        <= S_FETCH;
+      state        <= S_BOUNDEXN_MSG_HDR;
+      bound_next   <= S_DONE;
       pc                    <= '0;
       opcode                <= STOP;
       imm                   <= '0;
@@ -933,6 +965,7 @@ module ocaml4142_vm_rtl #(
 
         S_FETCH:
         if (!code_valid) ;  // wait for the fetch unit
+        else if (sp < STACK_MARGIN[STACK_AW-1:0]) state <= S_STACK_OVERFLOW;
         else begin
           opcode <= opcode_t'(code_rdata[7:0]);
           imm <= '0;
@@ -2288,9 +2321,12 @@ module ocaml4142_vm_rtl #(
               unique case (imm)
                 16'h108: caml_ml_output_char();
                 16'h00d, 16'h00c: begin  // caml_array_get_addr, caml_array_get: Field(accu, Int_val(tos))
-                  temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW:1];
+                  // the safe accessor, so the index is checked: read the
+                  // header, not the field, and decide there
+                  temp_index     <= Int_val(st_rd_a);
+                  temp_heap_addr <= Heap_index_of_ptr(accu);
                   state <= S_HEAP_READ;
-                  next_state_after_mem <= S_GETFIELD_DONE;
+                  next_state_after_mem <= S_ARRBOUND_GET;
                 end
                 16'h15b, 16'h03a: caml_string_get();  // caml_string_get, caml_bytes_get
                 16'h15a, 16'h163: begin  // caml_string_equal, caml_string_notequal
@@ -2331,12 +2367,13 @@ module ocaml4142_vm_rtl #(
                 stack_read_b(sp + 1);  // the char
                 hold_for_read();
               end else begin
-                temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW+2:3];
-                str_byte <= st_rd_a[2:1];
-                byte_value <= st_rd_b[8:1];
-                sp <= sp + 2;
+                temp_base_ptr <= accu;
+                temp_index    <= Int_val(st_rd_a);
+                byte_value    <= st_rd_b[8:1];
+                sp   <= sp + 2;
                 accu <= VAL_UNIT;
-                state <= S_BYTESET_RMW;
+                bound_next <= S_BYTESET_RMW;
+                state      <= S_STRBOUND_HDR;
               end
             end else if (imm == 16'h00f || imm == 16'h00e) begin  // caml_array_set_addr, caml_array_set
               if (!rd_phase) begin
@@ -2347,7 +2384,9 @@ module ocaml4142_vm_rtl #(
                 temp_index <= Int_val(st_rd_a);
                 temp_value <= st_rd_b;
                 temp_base_ptr <= accu;
-                state <= S_SETVECTITEM_WRITE;  // pops both, accu = unit
+                temp_heap_addr <= Heap_index_of_ptr(accu);
+                state <= S_HEAP_READ;             // the header, to check the index
+                next_state_after_mem <= S_ARRBOUND_SET;
               end
             end else begin
               `ifndef SYNTHESIS
@@ -3153,6 +3192,119 @@ module ocaml4142_vm_rtl #(
         end else begin
           accu  <= gm_rd_a;
           state <= S_RAISE_ENTER;
+        end
+
+        // Too deep to go on: raise Stack_overflow, which unwinds to the
+        // innermost handler and in doing so gives the stack back.  A handler
+        // installed deep enough to be under the margin itself re-raises here
+        // on its first instruction, unwinding further -- trapsp rises each
+        // time, so this walks out rather than spinning.
+        S_STACK_OVERFLOW:
+        if (!rd_phase) begin
+          globals_read_a(STACK_OVERFLOW_EXN[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          accu  <= gm_rd_a;
+          state <= S_RAISE_ENTER;
+        end
+
+        // Built once, coming out of reset and before the first instruction:
+        // the message string, the two-word exception block that carries it,
+        // and the globals slot that keeps it reachable.
+        S_BOUNDEXN_MSG_HDR: begin
+          heap_write(hp, Make_header(BOUND_MSG_WORDS, STRING_TAG));
+          temp_heap_addr <= hp;        // the string's header, so its pointer
+          alloc_i <= 0;
+          state <= S_BOUNDEXN_MSG;
+        end
+
+        S_BOUNDEXN_MSG:
+        if (alloc_i == BOUND_MSG_WORDS) begin
+          hp <= hp + 1 + BOUND_MSG_WORDS[HEAP_AW-1:0];
+          state <= S_BOUNDEXN_EXN_HDR;
+        end else begin
+          heap_write(temp_heap_addr + 1 + HEAP_AW'(alloc_i), bound_msg_word(alloc_i[2:0]));
+          alloc_i <= alloc_i + 1;
+        end
+
+        S_BOUNDEXN_EXN_HDR: begin
+          heap_write(hp, Make_header(2, 0));
+          temp_field1 <= Ptr_of_heap_index(hp);
+          state <= S_BOUNDEXN_ID;
+        end
+
+        // field 0 is the exception's identity, which the image's globals
+        // hold at the index fail.h fixes for Invalid_argument
+        S_BOUNDEXN_ID:
+        if (!rd_phase) begin
+          globals_read_a(INVALID_EXN[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          heap_write(Heap_index_of_ptr(temp_field1) + 1, gm_rd_a);
+          state <= S_BOUNDEXN_MSG_FIELD;
+        end
+
+        S_BOUNDEXN_MSG_FIELD: begin
+          heap_write(Heap_index_of_ptr(temp_field1) + 2, Ptr_of_heap_index(temp_heap_addr));
+          hp <= hp + 3;
+          state <= S_BOUNDEXN_STORE;
+        end
+
+        S_BOUNDEXN_STORE: begin
+          globals_write(BOUND_EXN_SLOT[GLOBALS_AW-1:0], temp_field1);
+          state <= S_FETCH;
+        end
+
+        // An index outside its array or string: raise the exception built at
+        // reset, and unwind as any other raise does.
+        S_BOUND_ERROR:
+        if (!rd_phase) begin
+          globals_read_a(BOUND_EXN_SLOT[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          accu  <= gm_rd_a;
+          state <= S_RAISE_ENTER;
+        end
+
+        // caml_array_get/set: the block's header is in temp_heap_val, so the
+        // index is checked against its size before the field is touched.
+        // The compare is unsigned, so a negative index -- which Int_val
+        // leaves as a very large one -- fails the same test.
+        S_ARRBOUND_GET:
+        if (temp_index >= Wosize_hd(temp_heap_val)) state <= S_BOUND_ERROR;
+        else begin
+          temp_heap_addr <= temp_heap_addr + 1 + temp_index[HEAP_AW-1:0];
+          state <= S_HEAP_READ;
+          next_state_after_mem <= S_GETFIELD_DONE;
+        end
+
+        S_ARRBOUND_SET:
+        if (temp_index >= Wosize_hd(temp_heap_val)) state <= S_BOUND_ERROR;
+        else state <= S_SETVECTITEM_WRITE;
+
+        // A string or bytes index needs the length, not the word count: the
+        // header gives the words and the last byte the padding, as
+        // caml_ml_string_length computes it.
+        S_STRBOUND_HDR:
+        if (!rd_phase) begin
+          heap_read_a(Heap_index_of_ptr(temp_base_ptr));
+          hold_for_read();
+        end else begin
+          str_words <= hm_rd_a[31:16];
+          temp_heap_addr <= Heap_index_of_ptr(temp_base_ptr) + hm_rd_a[31:16];
+          state <= S_STRBOUND_LAST;
+        end
+
+        S_STRBOUND_LAST:
+        if (!rd_phase) begin
+          heap_read_a(temp_heap_addr);
+          hold_for_read();
+        end else if (temp_index >= ({str_words, 2'b00} - 1 - hm_rd_a[31:24]))
+          state <= S_BOUND_ERROR;
+        else begin
+          temp_heap_addr <= Heap_index_of_ptr(temp_base_ptr) + 1 + temp_index[HEAP_AW+1:2];
+          str_byte       <= temp_index[1:0];
+          state          <= bound_next;
         end
 
         S_RAISE_ENTER: begin

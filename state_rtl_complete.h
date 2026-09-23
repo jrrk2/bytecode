@@ -151,6 +151,18 @@
     S_RAISE_READ,
     S_RAISE_FRAME,
     S_ZERO_DIVIDE,
+    S_STACK_OVERFLOW,
+    S_BOUND_ERROR,
+    S_BOUNDEXN_MSG_HDR,
+    S_BOUNDEXN_MSG,
+    S_BOUNDEXN_EXN_HDR,
+    S_BOUNDEXN_ID,
+    S_BOUNDEXN_MSG_FIELD,
+    S_BOUNDEXN_STORE,
+    S_ARRBOUND_GET,
+    S_ARRBOUND_SET,
+    S_STRBOUND_HDR,
+    S_STRBOUND_LAST,
     // floating point: the operands out of their boxes, through the FPU
     // peripheral on the trap port, and the answer back into a fresh box
     S_FP_READ_A,
