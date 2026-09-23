@@ -360,6 +360,172 @@ external flt_lt : float -> float -> bool = "caml_lt_float" "%lessthan"
 external flt_le : float -> float -> bool = "caml_le_float" "%lessequal"
 external flt_eq : float -> float -> bool = "caml_eq_float" "%equal"
 
+(* ---- the transcendental functions ----
+   Built on what the FPU answers -- add, multiply, divide, square root and
+   the comparisons -- by range reduction and a series, and kept identical
+   to io/trig.ml, whose accuracy io/test/trig measures against libm: a few
+   parts in 1e16 for sine, cosine, exponential and logarithm. *)
+external sqrt : float -> float = "caml_sqrt_float" "%sqrtfloat"
+external abs_float : float -> float = "caml_abs_float" "%absfloat"
+let ( <. ) (a : float) (b : float) = flt_lt a b
+let ( <=. ) (a : float) (b : float) = flt_le a b
+let ( =. ) (a : float) (b : float) = flt_eq a b
+(* ==== MATH ==== *)
+
+let pi      = 3.14159265358979312
+let pio2    = 1.57079632679489656
+let pio6    = 0.523598775598298927
+let sqrt3   = 1.73205080756887730
+(* pi/2 and ln 2 in two pieces: subtracting k * pi/2 from a large argument
+   loses the low bits of pi/2 to rounding, so the high part is kept short
+   enough to multiply exactly and the remainder is taken off afterwards. *)
+let pio2_hi = 1.57079632673412562
+let pio2_lo = 6.07710050650619225e-11
+let ln2_hi  = 0.693147180369123816
+let ln2_lo  = 1.90821492927058770e-10
+let ln2     = 0.693147180559945286
+let two_over_pi = 0.636619772367581343
+
+(* 2^n, by squaring rather than n multiplications *)
+let pow2 n =
+  let rec go b e acc =
+    if e = 0 then acc
+    else go (b *. b) (e / 2) (if e mod 2 = 1 then acc *. b else acc) in
+  if n >= 0 then go 2.0 n 1.0 else 1.0 /. go 2.0 (0 - n) 1.0
+
+(* nearest integer, as an int: the reduction needs round-to-nearest and
+   int_of_float truncates *)
+let round_to_int x = int_of_float (if x <. 0.0 then x -. 0.5 else x +. 0.5)
+
+(* ---- exp and log ---- *)
+
+let exp x =
+  if x <. -745.0 then 0.0
+  else if 709.8 <. x then 1.0 /. 0.0
+  else begin
+    let k = round_to_int (x /. ln2) in
+    let kf = float_of_int k in
+    let r = x -. kf *. ln2_hi -. kf *. ln2_lo in
+    (* Taylor about zero on |r| <= ln2/2; the term after the last is about
+       1e-19 of the sum *)
+    let sum = ref 1.0 and term = ref 1.0 in
+    for i = 1 to 14 do
+      term := !term *. r /. float_of_int i;
+      sum := !sum +. !term
+    done;
+    !sum *. pow2 k
+  end
+
+let log x =
+  if x <. 0.0 then 0.0 /. 0.0
+  else if x =. 0.0 then ~-. (1.0 /. 0.0)
+  else begin
+    (* x = m * 2^e with m in [sqrt(1/2), sqrt(2)), coarsely first so that a
+       huge argument does not take a thousand halvings *)
+    let e = ref 0 and m = ref x in
+    while 65536.0 <=. !m do m := !m /. 65536.0; e := !e + 16 done;
+    while !m <. 1.52587890625e-05 do m := !m *. 65536.0; e := !e - 16 done;
+    while 1.41421356237309515 <=. !m do m := !m /. 2.0; e := !e + 1 done;
+    while !m <. 0.707106781186547524 do m := !m *. 2.0; e := !e - 1 done;
+    (* log m = 2 atanh s, s = (m-1)/(m+1), |s| <= 0.1716 *)
+    let s = (!m -. 1.0) /. (!m +. 1.0) in
+    let s2 = s *. s in
+    let acc = ref 0.0 and t = ref s in
+    for i = 0 to 12 do
+      acc := !acc +. !t /. float_of_int (2 * i + 1);
+      t := !t *. s2
+    done;
+    2.0 *. !acc +. float_of_int !e *. ln2
+  end
+
+(* ---- sine, cosine, tangent ---- *)
+
+let sin_small r =
+  let r2 = r *. r in
+  let term = ref r and sum = ref r in
+  for n = 1 to 10 do
+    term := ~-. (!term *. r2 /. float_of_int ((2 * n) * (2 * n + 1)));
+    sum := !sum +. !term
+  done;
+  !sum
+
+let cos_small r =
+  let r2 = r *. r in
+  let term = ref 1.0 and sum = ref 1.0 in
+  for n = 1 to 10 do
+    term := ~-. (!term *. r2 /. float_of_int ((2 * n - 1) * (2 * n)));
+    sum := !sum +. !term
+  done;
+  !sum
+
+(* x = k * pi/2 + r with |r| <= pi/4; which of sine and cosine to use, and
+   with which sign, follows k around the circle *)
+let quadrant x =
+  let k = round_to_int (x *. two_over_pi) in
+  let kf = float_of_int k in
+  let r = x -. kf *. pio2_hi -. kf *. pio2_lo in
+  (((k mod 4) + 4) mod 4, r)
+
+let sin x =
+  let (q, r) = quadrant x in
+  if q = 0 then sin_small r
+  else if q = 1 then cos_small r
+  else if q = 2 then ~-. (sin_small r)
+  else ~-. (cos_small r)
+
+let cos x =
+  let (q, r) = quadrant x in
+  if q = 0 then cos_small r
+  else if q = 1 then ~-. (sin_small r)
+  else if q = 2 then ~-. (cos_small r)
+  else sin_small r
+
+let tan x = sin x /. cos x
+
+(* ---- the inverses ---- *)
+
+let atan_small t =
+  let t2 = t *. t in
+  let p = ref t and sum = ref t in
+  for n = 1 to 16 do
+    p := ~-. (!p *. t2);
+    sum := !sum +. !p /. float_of_int (2 * n + 1)
+  done;
+  !sum
+
+(* 0 <= a: fold a > 1 through atan a = pi/2 - atan (1/a), then the rest
+   through atan a = pi/6 + atan ((a sqrt3 - 1)/(sqrt3 + a)), which leaves
+   |t| <= tan(pi/12) = 0.268 and a series that falls by 14 each term *)
+let atan_pos a =
+  let reduce b =
+    if 0.267949192431122706 <. b then
+      pio6 +. atan_small ((b *. sqrt3 -. 1.0) /. (sqrt3 +. b))
+    else atan_small b in
+  if 1.0 <. a then pio2 -. reduce (1.0 /. a) else reduce a
+
+let atan x = if x <. 0.0 then ~-. (atan_pos (~-. x)) else atan_pos x
+
+let atan2 y x =
+  if 0.0 <. x then atan (y /. x)
+  else if x <. 0.0 then
+    (if y <. 0.0 then atan (y /. x) -. pi else atan (y /. x) +. pi)
+  else if 0.0 <. y then pio2
+  else if y <. 0.0 then ~-. pio2
+  else 0.0
+
+(* asin a = atan (a / sqrt (1 - a^2)) loses its footing as a nears one,
+   where the square root is the difference of two close numbers; the half
+   angle moves the work back to the middle of the range *)
+let rec asin_pos a =
+  if a <=. 0.7 then atan (a /. sqrt (1.0 -. a *. a))
+  else if 1.0 <. a then 0.0 /. 0.0
+  else pio2 -. 2.0 *. asin_pos (sqrt ((1.0 -. a) /. 2.0))
+
+let asin x = if x <. 0.0 then ~-. (asin_pos (~-. x)) else asin_pos x
+let acos x = pio2 -. asin x
+
+let pow x y = exp (y *. log x)
+
 (* ---- tokens ---- *)
 type token = TInt of int | TFloat of float | TId of string | TSym of string
 
@@ -622,10 +788,44 @@ and parse_atom toks = match toks with
 type value =
   | VInt of int
   | VFloat of float
+  (* name, how many arguments it wants, and the ones it has been given:
+     a builtin is an ordinary value, so "let sin x = x" shadows it and
+     "atan2 1." is a function waiting for its second argument *)
+  | VBuiltin of string * int * value list
   | VBool of bool
   | VStr of string                        (* a caught failure's message *)
   | VClosure of string * expr * env ref   (* the ref lets a let rec see itself *)
 and env = (string * value) list
+
+let rec rev_list l acc = match l with [] -> acc | x :: r -> rev_list r (x :: acc)
+let rec list_len l = match l with [] -> 0 | _ :: r -> 1 + list_len r
+
+(* The ones the FPU makes worth having.  Everything here is either a float
+   function or a conversion; the types are seeded into the session below so
+   that inference knows them without a declaration. *)
+let call_builtin name args = match args with
+  | [VFloat x] ->
+    if string_equal name "sin" then Ok (VFloat (sin x))
+    else if string_equal name "cos" then Ok (VFloat (cos x))
+    else if string_equal name "tan" then Ok (VFloat (tan x))
+    else if string_equal name "asin" then Ok (VFloat (asin x))
+    else if string_equal name "acos" then Ok (VFloat (acos x))
+    else if string_equal name "atan" then Ok (VFloat (atan x))
+    else if string_equal name "exp" then Ok (VFloat (exp x))
+    else if string_equal name "log" then Ok (VFloat (log x))
+    else if string_equal name "sqrt" then Ok (VFloat (sqrt x))
+    else if string_equal name "abs_float" then Ok (VFloat (abs_float x))
+    else if string_equal name "int_of_float" then Ok (VInt (int_of_float x))
+    else Err ("bad argument for " ^^ name)
+  | [VInt n] ->
+    if string_equal name "float_of_int" then Ok (VFloat (float_of_int n))
+    else Err ("bad argument for " ^^ name)
+  | [VFloat a; VFloat b] ->
+    if string_equal name "atan2" then Ok (VFloat (atan2 a b))
+    else if string_equal name "pow" then Ok (VFloat (pow a b))
+    else Err ("bad argument for " ^^ name)
+  | _ -> Err ("bad argument for " ^^ name)
+
 
 let rec lookup env x = match env with
   | [] -> Err ("unbound " ^^ x)
@@ -931,6 +1131,13 @@ let rec eval env e = match e with
        (match eval env a with
         | Err m -> Err m
         | Ok va -> eval ((x, va) :: !cenv) body)
+     | Ok (VBuiltin (name, arity, got)) ->
+       (match eval env a with
+        | Err m -> Err m
+        | Ok va ->
+          let got2 = va :: got in
+          if list_len got2 = arity then call_builtin name (rev_list got2 [])
+          else Ok (VBuiltin (name, arity, got2)))
      | Ok _ -> Err "not a function")
   | Try (body, name, handler) ->
     (match eval env body with
@@ -1006,8 +1213,31 @@ let print_value v = match v with
   | VBool b -> puts (if b then "true" else "false")
   | VStr s -> putc '"'; puts s; putc '"'
   | VClosure _ -> puts "<fun>"
+  | VBuiltin _ -> puts "<fun>"
 
-let session = ref []
+(* The pervasives: a value and a type for each, so that "sin 0.5" needs no
+   declaration and "sin 1" is refused before it runs. *)
+let f2f  = TArrow (TFloat, TFloat)
+let ff2f = TArrow (TFloat, TArrow (TFloat, TFloat))
+
+let builtins =
+  [ ("sin", 1, f2f); ("cos", 1, f2f); ("tan", 1, f2f);
+    ("asin", 1, f2f); ("acos", 1, f2f); ("atan", 1, f2f);
+    ("exp", 1, f2f); ("log", 1, f2f); ("sqrt", 1, f2f);
+    ("abs_float", 1, f2f);
+    ("atan2", 2, ff2f); ("pow", 2, ff2f);
+    ("float_of_int", 1, TArrow (TInt, TFloat));
+    ("int_of_float", 1, TArrow (TFloat, TInt)) ]
+
+let rec builtin_values l = match l with
+  | [] -> []
+  | (n, arity, _) :: rest -> (n, VBuiltin (n, arity, [])) :: builtin_values rest
+
+let rec builtin_types l = match l with
+  | [] -> []
+  | (n, _, t) :: rest -> (n, Forall ([], t)) :: builtin_types rest
+
+let session = ref (builtin_values builtins)
 
 
 (* A name used but never bound is an error in the definition, not in the
@@ -1015,32 +1245,6 @@ let session = ref []
    that waits until the closure runs gives "unbound fact" to someone who
    has just seen "val fact = <fun>".  This walks an expression for the
    first free name, with the session's own bindings counted as bound. *)
-let rec bound_in names x = match names with
-  | [] -> false
-  | y :: rest -> if string_equal x y then true else bound_in rest x
-
-let rec free_name names e = match e with
-  | Int _ -> Ok ()
-  | Float _ -> Ok ()
-  | Bool _ -> Ok ()
-  | Var x -> if bound_in names x then Ok () else Err x
-  | Fun (p, body) -> free_name (p :: names) body
-  | App (f, a) ->
-    (match free_name names f with Err m -> Err m | Ok () -> free_name names a)
-  | Binop (_, a, b) ->
-    (match free_name names a with Err m -> Err m | Ok () -> free_name names b)
-  | If (c, a, b) ->
-    (match free_name names c with
-     | Err m -> Err m
-     | Ok () -> match free_name names a with Err m -> Err m | Ok () -> free_name names b)
-  | Try (body, x, handler) ->
-    (match free_name names body with Err m -> Err m | Ok () -> free_name (x :: names) handler)
-  | Let (recursive, name, bound, body) ->
-    let inner = if recursive then name :: names else names in
-    (match free_name inner bound with
-     | Err m -> Err m
-     | Ok () -> free_name (name :: names) body)
-
 let session_names () =
   let rec go env acc = match env with
     | [] -> acc
@@ -1048,12 +1252,10 @@ let session_names () =
   go !session []
 
 (* "ms" is the one name the evaluator answers for without a binding *)
-let scope_check e = free_name ("ms" :: session_names ()) e
-
 (* The session's types, beside its values.  A top-level binding is parsed as
    "let x = e in x", so its scheme is generalised from the right-hand side
    and kept here; everything else is inferred against what is already bound. *)
-let type_session : (string * scheme) list ref = ref []
+let type_session : (string * scheme) list ref = ref (builtin_types builtins)
 
 let infer_line e = match e with
   | Let (recursive, name, bound, Var v) when string_equal v name ->
@@ -1084,19 +1286,17 @@ let evaluate_line () =
       | Err m -> puts "error: "; puts m; newline ()
       | Ok (_, _ :: _) -> puts "error: unexpected input at the end"; newline ()
       | Ok (e, []) ->
-        match scope_check e with
-        | Err x ->
-          puts "error: unbound "; puts x;
-          (* the usual cause: a function that calls itself, written without
-             rec, which binds nothing for its own body *)
+        match infer_line e with
+        | Err m ->
+          puts "error: "; puts m;
+          (* the usual cause of an unbound name: a function that calls
+             itself, written without rec, which binds nothing for its own
+             body *)
           (match e with
-           | Let (false, name, _, _) when string_equal name x ->
+           | Let (false, name, _, _) when string_equal m ("unbound " ^^ name) ->
              puts " (did you mean \"let rec\"?)"
            | _ -> ());
           newline ()
-        | Ok () ->
-        match infer_line e with
-        | Err m -> puts "error: "; puts m; newline ()
         | Ok (bound_name, sc, ty) ->
         let t0 = now () in
         match eval !session e with

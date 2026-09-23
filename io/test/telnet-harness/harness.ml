@@ -156,18 +156,18 @@ let () =
          typ ("echo " ^ String.make 400 'x' ^ "\r") >>= fun () ->
          typ ("echo " ^ String.make 400 'y' ^ "\r")
        else
-         typ "1.5 +. 2.25\r" >>= fun () ->
-         typ "let pi = 3.14159\r" >>= fun () ->
-         typ "pi *. 2.\r" >>= fun () ->
-         typ "let rec fact n = if n <= 0 then 1 else n * fact (n-1)\r" >>= fun () ->
-         typ "fact 6\r" >>= fun () ->
-         typ "let id x = x\r" >>= fun () ->
-         typ "id 3\r" >>= fun () ->
-         typ "id 3.5\r" >>= fun () ->
-         typ "1 +. 2.\r" >>= fun () ->
-         typ "1.5 + 2\r" >>= fun () ->
-         typ "if 3 then 1 else 2\r" >>= fun () ->
-         typ "fun x -> x +. 1.\r" >>= fun () ->
+         typ "sin 0.5\r" >>= fun () ->
+         typ "cos 0.5 *. cos 0.5 +. sin 0.5 *. sin 0.5\r" >>= fun () ->
+         typ "exp 1.\r" >>= fun () ->
+         typ "log (exp 3.)\r" >>= fun () ->
+         typ "sqrt 2.\r" >>= fun () ->
+         typ "atan2 1. 1. *. 4.\r" >>= fun () ->
+         typ "pow 2. 10.\r" >>= fun () ->
+         typ "asin (sin 0.3)\r" >>= fun () ->
+         typ "sin\r" >>= fun () ->
+         typ "sin 1\r" >>= fun () ->
+         typ "let rec area n acc = if n <= 0 then acc else area (n-1) (acc +. sin (float_of_int n /. 100.) /. 100.)\r" >>= fun () ->
+         typ "area 314 0.\r" >>= fun () ->
          typ "2 + 3\r" >>= fun () ->
          typ "let fact n = if n <= 0 then 1 else fact (n-1) * n\r" >>= fun () ->
          typ "let rec fact n = if n <= 0 then 1 else fact (n-1) * n\r" >>= fun () ->
