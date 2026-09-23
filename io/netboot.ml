@@ -541,7 +541,7 @@ let uart_build () =
     let digits = "0123456789abcdef" in
     for k = 6 downto 0 do uart_putc (string_get digits ((v lsr (4 * k)) land 0xF)) done;
     if v land 0x10000000 <> 0 then uart_putc '+';
-    let flow = (v lsr 30) land 3 in
+    let flow = (v lsr 29) land 3 in   (* 30:29: bit 31 is past a 31-bit int *)
     if flow = 1 then uart_puts " open"
     else if flow = 2 then uart_puts " vivado"
     else uart_puts " ?"

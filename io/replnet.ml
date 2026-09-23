@@ -804,6 +804,15 @@ let snd_nxt = [| 0; 0 |]           (* the next byte we will send *)
 let out = create_bytes out_max     (* snd_una .. snd_una + out_len *)
 let out_len = ref 0
 let rtx_at = ref 0                 (* ms: retransmit the unacked head then *)
+let rtx_left = ref 0               (* retransmissions before the peer is declared gone *)
+let knocked = ref false            (* someone was turned away: is the incumbent still there? *)
+let idle_at = ref 0                (* ms: with nothing heard by then, the peer is gone *)
+let idle_ms = 600000               (* ten minutes of silence ends a session: long
+                                      enough to read what is on the screen, and a
+                                      backstop only -- a peer that goes away while
+                                      we have something to send is caught by the
+                                      retransmission count, in seconds *)
+let rtx_max = 8
 let close_after = ref false        (* the application asked to hang up *)
 
 let out_room () = out_max - !out_len
@@ -886,8 +895,10 @@ let send_rst_to seq_hi seq_lo =
 
 let close_connection () =
   tcp_state := Closed;
+  knocked := false;
   out_len := 0;
   close_after := false;
+  rtx_left := 0;
   uart_puts "tcp: closed\n"
 
 (* ---- the application behind the connection: the REPL ---- *)
@@ -960,6 +971,16 @@ let feed_byte v =
   else if v = 0 then ()                             (* CR NUL: the NUL is padding *)
   else app_byte (char_of_int v)
 
+(* A sequence number for a connection we refuse, made only of theirs: the
+   same SYN always earns the same answer, so the second segment can check
+   the ACK without having kept anything. *)
+let cookie isn =
+  [| ((array_get isn 0) lxor 0x5A3C) land 0xFFFF;
+     ((array_get isn 1) + 0x1D7B) land 0xFFFF |]
+
+let busy_msg =
+  "\r\nbusy: this processor serves one session at a time, and another is connected.\r\nplease try again shortly.\r\n"
+
 (* ---- the TCP input path ---- *)
 let handle_tcp len ihl =
   let t = 14 + ihl in
@@ -995,6 +1016,8 @@ let handle_tcp len ihl =
         line_len := 0;
         telnet_state := 0;
         tcp_state := SynRcvd;
+        idle_at := now () + idle_ms;
+        rtx_left := rtx_max;
         uart_puts "tcp: syn from ";
         uart_ip peer_ip;
         uart_putc ':';
@@ -1003,24 +1026,59 @@ let handle_tcp len ihl =
         send_segment 0x12 snd_nxt 0 true;                          (* SYN|ACK with MSS *)
         seq_add snd_nxt 1;
         rtx_at := now () + 400
-      end else if syn && not ack && !tcp_state <> Closed then
-        (* a second client while we are busy: refuse it *)
-        (let s = [| 0; 0 |] in
-         seq_copy s seg_ack;
-         let saved_port = !peer_port and saved_mac = [| 0; 0; 0; 0; 0; 0 |]
-         and saved_ip = [| 0; 0; 0; 0 |] in
+      end else if not from_peer && !tcp_state <> Closed then
+        (* Someone else knocks while a session is in progress.  We have room
+           for exactly one connection, so instead of a bare RST ("connection
+           refused", which tells the person nothing) we answer the handshake
+           and say why -- and we do it without a second connection block, by
+           deriving our sequence number from theirs the way a SYN cookie
+           does, so nothing is remembered between the two segments. *)
+        (let saved_port = !peer_port and saved_mac = [| 0; 0; 0; 0; 0; 0 |]
+         and saved_ip = [| 0; 0; 0; 0 |] and saved_rcv = [| 0; 0 |] in
          for i = 0 to 5 do array_set saved_mac i (array_get peer_mac i) done;
          for i = 0 to 3 do array_set saved_ip i (array_get peer_ip i) done;
+         seq_copy saved_rcv rcv_nxt;
          for i = 0 to 5 do array_set peer_mac i (rx (6 + i)) done;
          for i = 0 to 3 do array_set peer_ip i (rx (26 + i)) done;
          peer_port := sport;
+         (* The cookie is made from the byte after their SYN -- the number
+            the SYN names and every later segment of theirs carries -- so
+            both halves of this exchange arrive at it independently. *)
          seq_copy rcv_nxt seg_seq;
-         seq_add rcv_nxt 1;
-         send_rst_to 0 0;
+         if syn then seq_add rcv_nxt 1;
+         let ck = cookie rcv_nxt in
+         if syn && not ack then begin
+           uart_puts "tcp: busy, turning away ";
+           uart_ip peer_ip; uart_putc ':'; uart_dec sport; uart_putc '\n';
+           knocked := true;   (* and ask the incumbent, once we are back on it,
+                                 whether it is still listening: a frame lost in
+                                 the one-frame receive window can leave us
+                                 holding a session whose peer has gone home *)
+           send_segment 0x12 ck 0 true                       (* SYN|ACK, our cookie *)
+         end else if ack && seg_len = 0 && not fin then begin
+           let want = [| array_get ck 0; array_get ck 1 |] in
+           seq_add want 1;
+           if seq_eq seg_ack want then begin
+             (* their ACK of our SYN: the whole refusal in one segment *)
+             let n = string_length busy_msg in
+             for i = 0 to n - 1 do
+               tx (data_off + i) (int_of_char (string_get busy_msg i))
+             done;
+             send_segment 0x19 want n false                  (* FIN|PSH|ACK *)
+           end
+         end else if fin then begin
+           (* their half closing: acknowledge it and we are done with them *)
+           seq_add rcv_nxt (seg_len + 1);
+           let s = [| array_get ck 0; array_get ck 1 |] in
+           seq_add s (string_length busy_msg + 2);
+           send_segment 0x10 s 0 false
+         end;
          for i = 0 to 5 do array_set peer_mac i (array_get saved_mac i) done;
          for i = 0 to 3 do array_set peer_ip i (array_get saved_ip i) done;
+         seq_copy rcv_nxt saved_rcv;
          peer_port := saved_port)
       else if from_peer then begin
+        idle_at := now () + idle_ms;
         (* acknowledgement first: drop what the peer has taken *)
         if ack then begin
           let acked = seq_diff seg_ack snd_una in
@@ -1070,7 +1128,20 @@ let handle_tcp len ihl =
 let tcp_tick () =
   if !tcp_state = Estab || !tcp_state = SynRcvd || !tcp_state = LastAck then begin
     let in_flight = seq_diff snd_nxt snd_una in
-    if in_flight > 0 && !rtx_at <> 0 && now () > !rtx_at then begin
+    if now () > !idle_at then begin
+      (* the peer stopped answering: a closed laptop, a pulled cable, a
+         client that died.  Without this the session stays Established for
+         ever and every later client is refused a connection it could have
+         had. *)
+      uart_puts "tcp: peer gone, session dropped\n";
+      send_segment 0x04 snd_nxt 0 false;            (* RST: it may still be there *)
+      close_connection ()
+    end else if in_flight > 0 && !rtx_at <> 0 && now () > !rtx_at && !rtx_left = 0 then begin
+      uart_puts "tcp: no answer, session dropped\n";
+      send_segment 0x04 snd_nxt 0 false;
+      close_connection ()
+    end else if in_flight > 0 && !rtx_at <> 0 && now () > !rtx_at then begin
+      rtx_left := !rtx_left - 1;
       (* the head of the window again: SYN, data or FIN, whichever it was *)
       if !tcp_state = SynRcvd then send_segment 0x12 snd_una 0 true
       else if !tcp_state = LastAck then send_segment 0x11 snd_una 0 false
@@ -1079,6 +1150,13 @@ let tcp_tick () =
         send_data ()
       end;
       rtx_at := now () + 800
+    end else if !knocked && !tcp_state = Estab && in_flight = 0 && !out_len = 0 then begin
+      (* a bare ACK to the peer we are keeping the session for.  A peer that
+         is still there ignores it; a peer that has gone answers with a reset
+         (or nothing at all, and the silence is caught above), and the next
+         caller gets the session instead of the same refusal for ever. *)
+      knocked := false;
+      send_ack ()
     end else if !tcp_state = Estab && in_flight = 0 && !out_len > 0 then
       send_data ()
     else if !tcp_state = Estab && !close_after && !out_len = 0 && in_flight = 0 then begin
@@ -1203,7 +1281,7 @@ let uart_build () =
     let digits = "0123456789abcdef" in
     for k = 6 downto 0 do uart_putc (string_get digits ((v lsr (4 * k)) land 0xF)) done;
     if v land 0x10000000 <> 0 then uart_putc '+';
-    let flow = (v lsr 30) land 3 in
+    let flow = (v lsr 29) land 3 in   (* 30:29: bit 31 is past a 31-bit int *)
     if flow = 1 then uart_puts " open"
     else if flow = 2 then uart_puts " vivado"
     else uart_puts " ?"

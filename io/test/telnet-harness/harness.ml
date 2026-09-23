@@ -113,7 +113,45 @@ let () =
             | _ -> Lwt.return_unit in rd ());
       let typ s = Tcp.write flow (Cstruct.of_string s) >>= fun _ -> Lwt_unix.sleep 0.05 in
       Lwt_unix.sleep 0.1 >>= fun () ->
-      (if Array.length Sys.argv > 1 && Sys.argv.(1) = "big" then
+      (if Array.length Sys.argv > 1 && Sys.argv.(1) = "reuse" then
+         (* a session closed properly must give the next customer the door:
+            the device has one connection, so a close that does not free it
+            locks everyone out until something resets it *)
+         Tcp.close flow >>= fun () ->
+         Lwt_unix.sleep 0.5 >>= fun () ->
+         Printf.printf "first session closed; device says: %s%!" (uart ());
+         Tcp.create_connection tcp (dev_ip, 23) >>= (function
+           | Error e -> Format.printf "SECOND CONNECTION REFUSED: %a@." Tcp.pp_error e; Lwt.return_unit
+           | Ok f2 ->
+             let got2 = Buffer.create 256 in
+             Lwt.async (fun () ->
+                 let rec rd () = Tcp.read f2 >>= function
+                   | Ok (`Data b) -> Buffer.add_string got2 (Cstruct.to_string b); rd ()
+                   | _ -> Lwt.return_unit in rd ());
+             Lwt_unix.sleep 1.0 >>= fun () ->
+             let t = Buffer.contents got2 in
+             Printf.printf "second session got: %s\n"
+               (if t = "" then "NOTHING"
+                else if String.length t > 8 &&
+                        (try ignore (Str.search_forward (Str.regexp_string "busy") t 0); true
+                         with Not_found -> false) then "BUSY (the closed session is still held)"
+                else "the banner -- the session was released");
+             Lwt.return_unit)
+       else if Array.length Sys.argv > 1 && Sys.argv.(1) = "busy" then
+         (* a second customer while the first holds the session *)
+         Tcp.create_connection tcp (dev_ip, 23) >>= (function
+           | Error e ->
+             Format.printf "second connection refused outright: %a@." Tcp.pp_error e;
+             Lwt.return_unit
+           | Ok f2 ->
+             Printf.printf "second connection accepted; what it was told:\n";
+             let rec rd () = Tcp.read f2 >>= function
+               | Ok (`Data b) -> print_string (Cstruct.to_string b); rd ()
+               | Ok `Eof -> Printf.printf "[closed by the device]\n%!"; Lwt.return_unit
+               | Error e -> Format.printf "[read error: %a]@." Tcp.pp_error e; Lwt.return_unit in
+             Lwt.pick [ rd (); Lwt_unix.sleep 2.0 ] >>= fun () ->
+             Tcp.close f2)
+       else if Array.length Sys.argv > 1 && Sys.argv.(1) = "big" then
          (* one long line: a paste into the session, so the frames are full *)
          typ ("echo " ^ String.make 400 'x' ^ "\r") >>= fun () ->
          typ ("echo " ^ String.make 400 'y' ^ "\r")
@@ -124,7 +162,9 @@ let () =
          typ "let x = try 0/0 with _ -> 0 in x\r" >>= fun () ->
          typ "try 7/0 with m -> m\r" >>= fun () ->
          typ "nosuch 3\r") >>= fun () ->
-      typ "let g y = y * nosuchthing\r" >>= fun () ->
+      (if Array.length Sys.argv > 1 && Sys.argv.(1) = "busy" then typ "fact 6\r"
+       else if Array.length Sys.argv > 1 && Sys.argv.(1) = "reuse" then Lwt.return_unit
+       else typ "let g y = y * nosuchthing\r") >>= fun () ->
       Lwt_unix.sleep 0.3 >>= fun () ->
       Printf.printf "---- what the client saw ----\n%s\n---- end ----\n"
         (String.concat "" (List.map (fun c -> if Char.code c = 255 then "<IAC>" else String.make 1 c)

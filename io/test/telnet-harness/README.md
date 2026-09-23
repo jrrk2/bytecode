@@ -18,3 +18,19 @@ those to the device logic with nothing else running, so
 instructions one telnet session costs (see docs/minimal-tcp.md).
 `bench.bc` does the same for the checksum, the echo path and the copy into
 the transmit window, one byte at a time.
+
+## The other two customers
+
+`harness.exe busy` opens a second connection while the first is in session:
+the device has room for one, and answers the second with the handshake and a
+sentence saying so rather than a reset, so the person at the other end is
+told why.  `harness.exe reuse` closes the first session properly and connects
+again -- a close that does not free the session locks everyone out.
+
+`probe/synprobe.exe` puts frames the wire produces in front of the device's
+TCP with nothing else in the process: a SYN carrying the twenty bytes of
+options Linux sends, a peer that stops answering, and a caller knocking while
+a session is held by a peer that has gone home.  That last one is what a lost
+FIN leaves behind -- the receive window holds one frame -- and it is why a
+knock makes the device ask the incumbent, with a bare ACK, whether it is
+still there.

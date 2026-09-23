@@ -4,7 +4,7 @@
 (executable
  (name harness)
  (modules host_hw telnet_core harness)
- (libraries tcpip.tcp tcpip.ipv4 ethernet mirage-vnetif mirage-clock-unix lwt lwt.unix))
+ (libraries tcpip.tcp tcpip.ipv4 ethernet mirage-vnetif mirage-clock-unix lwt lwt.unix str))
 
 (executable
  (name replay)

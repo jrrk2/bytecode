@@ -5,3 +5,5 @@ telnet_core_b.ml
 host_hw_r.ml
 host_hw_b.ml
 session*.frames
+probe/telnet_core.ml
+probe/host_hw.ml
