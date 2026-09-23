@@ -151,6 +151,36 @@ let () =
                | Error e -> Format.printf "[read error: %a]@." Tcp.pp_error e; Lwt.return_unit in
              Lwt.pick [ rd (); Lwt_unix.sleep 2.0 ] >>= fun () ->
              Tcp.close f2)
+       else if Array.length Sys.argv > 1 && Sys.argv.(1) = "adt" then
+         typ "[1; 2; 3]\r" >>= fun () ->
+         typ "1 :: 2 :: []\r" >>= fun () ->
+         typ "(1, true, 2.5)\r" >>= fun () ->
+         typ "let rec len l = match l with [] -> 0 | _ :: t -> 1 + len t\r" >>= fun () ->
+         typ "len [1; 2; 3; 4]\r" >>= fun () ->
+         typ "let rec map f l = match l with [] -> [] | h :: t -> f h :: map f t\r" >>= fun () ->
+         typ "map (fun x -> x * x) [1; 2; 3; 4]\r" >>= fun () ->
+         typ "map (fun x -> x +. 1.) [1.5; 2.5]\r" >>= fun () ->
+         typ "let rec sum l = match l with [] -> 0 | h :: t -> h + sum t\r" >>= fun () ->
+         typ "let rec upto n = if n = 0 then [] else n :: upto (n - 1)\r" >>= fun () ->
+         typ "sum (upto 100)\r" >>= fun () ->
+         typ "type 'a option = None | Some of 'a\r" >>= fun () ->
+         typ "Some 3\r" >>= fun () ->
+         typ "Some (Some 3)\r" >>= fun () ->
+         typ "let get d o = match o with None -> d | Some x -> x\r" >>= fun () ->
+         typ "get 0 (Some 7)\r" >>= fun () ->
+         typ "get 0 None\r" >>= fun () ->
+         typ "type shape = Circle of float | Rect of float * float\r" >>= fun () ->
+         typ "let area s = match s with Circle r -> 3.14159 *. r *. r | Rect (w, h) -> w *. h\r" >>= fun () ->
+         typ "area (Circle 1.)\r" >>= fun () ->
+         typ "area (Rect (3., 4.))\r" >>= fun () ->
+         typ "[Circle 1.; Rect (2., 3.)]\r" >>= fun () ->
+         typ "(1, 2) = (1, 2)\r" >>= fun () ->
+         typ "[1; 2] = [1; 3]\r" >>= fun () ->
+         typ "Some 1 = Some 1\r" >>= fun () ->
+         typ "1 :: [true]\r" >>= fun () ->
+         typ "map\r" >>= fun () ->
+         typ "len [1; 2] + len [true]\r" >>= fun () ->
+         typ "match Some 1 with None -> 0\r"
        else if Array.length Sys.argv > 1 && Sys.argv.(1) = "big" then
          (* one long line: a paste into the session, so the frames are full *)
          typ ("echo " ^ String.make 400 'x' ^ "\r") >>= fun () ->

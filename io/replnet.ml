@@ -543,11 +543,12 @@ let substring from upto =
 let symbol_len i =
   let c = char_at i in
   let d = if i + 1 < !line_len then char_at (i + 1) else 0 in
-  (* +. -. *. /. are two characters, as are <= <> >= -> *)
+  (* +. -. *. /. are two characters, as are <= <> >= -> :: *)
   if (c = 60 && (d = 61 || d = 62)) || (c = 62 && d = 61) || (c = 45 && d = 62)
+     || (c = 58 && d = 58)
      || ((c = 43 || c = 45 || c = 42 || c = 47) && d = 46) then 2
   else if c = 43 || c = 45 || c = 42 || c = 47 || c = 61 || c = 60 || c = 62
-       || c = 40 || c = 41 then 1
+       || c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 124 || c = 59 then 1
   else 0
 
 type 'a result = Ok of 'a | Err of string
@@ -580,6 +581,10 @@ let tokenize () =
         let j = ref i in
         while !j < !line_len && (is_alpha (char_at !j) || is_digit (char_at !j)) do j := !j + 1 done;
         go !j (TId (substring i !j) :: acc)
+      end else if c = 39 && i + 1 < !line_len && is_alpha (char_at (i + 1)) then begin
+        let j = ref (i + 1) in
+        while !j < !line_len && (is_alpha (char_at !j) || is_digit (char_at !j)) do j := !j + 1 done;
+        go !j (TId (substring i !j) :: acc)
       end else begin
         let n = symbol_len i in
         if n = 0 then Err "unexpected character"
@@ -601,8 +606,30 @@ type expr =
   | App of expr * expr
   | Let of bool * string * expr * expr    (* rec?, name, bound, body *)
   | Try of expr * string * expr           (* try e with x -> e: x names the message *)
+  | Tuple of expr list
+  (* a constructor and its arguments: [] and :: are the list ones, which the
+     parser writes for [] and for x :: xs and [a; b; c] *)
+  | Con of string * expr list
+  | Match of expr * (pat * expr) list
+and pat =
+  | PWild
+  | PVar of string
+  | PInt of int
+  | PBool of bool
+  | PTuple of pat list
+  | PCon of string * pat list
+
+(* A type as it is written in a declaration, before it becomes a ty: the
+   declaration is read once and its argument types instantiated afresh at
+   every use, so the parameters stay names until then. *)
+type tyexp =
+  | TEVar of string
+  | TECon of string * tyexp list
+  | TEArrow of tyexp * tyexp
+  | TETuple of tyexp list
 
 let keyword s = string_equal s "try" || string_equal s "with"
+                || string_equal s "match" || string_equal s "type" || string_equal s "of"
                 || string_equal s "let" || string_equal s "rec" || string_equal s "in"
                 || string_equal s "if" || string_equal s "then" || string_equal s "else"
                 || string_equal s "fun" || string_equal s "true" || string_equal s "false"
@@ -610,6 +637,12 @@ let keyword s = string_equal s "try" || string_equal s "with"
 
 let is_sym t s = match t with TSym x -> string_equal x s | _ -> false
 let is_kw t s = match t with TId x -> string_equal x s | _ -> false
+
+let rec rev_acc l acc = match l with [] -> acc | x :: r -> rev_acc r (x :: acc)
+(* a constructor starts with a capital, a type variable with a quote *)
+let is_ctor s =
+  string_length s > 0 && (let c = int_of_char (string_get s 0) in c >= 65 && c <= 90)
+let is_tyvar s = string_length s > 0 && int_of_char (string_get s 0) = 39
 
 let ( ^^ ) a b =
   let n = string_length a and m = string_length b in
@@ -630,6 +663,68 @@ let rec params toks acc = match toks with
 let rec wrap_funs ps body = match ps with
   | [] -> body
   | p :: rest -> wrap_funs rest (Fun (p, body))
+
+let rec parse_pat toks =
+  match parse_pat_app toks with
+  | Err e -> Err e
+  | Ok (p, rest) ->
+    match rest with
+    | t :: rest2 when is_sym t "::" ->
+      (match parse_pat rest2 with
+       | Err e -> Err e
+       | Ok (q, rest3) -> Ok (PCon ("::", [p; q]), rest3))
+    | _ -> Ok (p, rest)
+
+and parse_pat_app toks = match toks with
+  | TId c :: rest when is_ctor c ->
+    if starts_pat rest then
+      (match parse_pat_atom rest with
+       | Err e -> Err e
+       | Ok (a, rest2) -> Ok (PCon (c, (match a with PTuple l -> l | _ -> [a])), rest2))
+    else Ok (PCon (c, []), rest)
+  | _ -> parse_pat_atom toks
+
+and starts_pat toks = match toks with
+  | TInt _ :: _ -> true
+  | TId x :: _ -> not (keyword x) || string_equal x "true" || string_equal x "false"
+  | t :: _ -> is_sym t "(" || is_sym t "["
+  | [] -> false
+
+and parse_pat_atom toks = match toks with
+  | TInt n :: rest -> Ok (PInt n, rest)
+  | TId x :: rest when string_equal x "true" -> Ok (PBool true, rest)
+  | TId x :: rest when string_equal x "false" -> Ok (PBool false, rest)
+  | TId x :: rest when string_equal x "_" -> Ok (PWild, rest)
+  | TId c :: rest when is_ctor c -> Ok (PCon (c, []), rest)
+  | TId x :: rest when not (keyword x) -> Ok (PVar x, rest)
+  | t :: t2 :: rest when is_sym t "[" && is_sym t2 "]" -> Ok (PCon ("[]", []), rest)
+  | t :: rest when is_sym t "[" -> parse_pat_list rest
+  | t :: rest when is_sym t "(" ->
+    (match parse_pat rest with
+     | Err e -> Err e
+     | Ok (q, rest2) -> parse_pat_tuple [q] rest2)
+  | _ -> Err "syntax error in a pattern"
+
+and parse_pat_tuple acc toks = match toks with
+  | t :: rest when is_sym t "," ->
+    (match parse_pat rest with
+     | Err e -> Err e
+     | Ok (q, rest2) -> parse_pat_tuple (q :: acc) rest2)
+  | t :: rest when is_sym t ")" ->
+    Ok ((match acc with [q] -> q | _ -> PTuple (rev_acc acc [])), rest)
+  | _ -> Err "expected , or ) in a pattern"
+
+and parse_pat_list toks =
+  match parse_pat toks with
+  | Err e -> Err e
+  | Ok (q, rest) ->
+    match rest with
+    | t :: rest2 when is_sym t ";" ->
+      (match parse_pat_list rest2 with
+       | Err e -> Err e
+       | Ok (tl, rest3) -> Ok (PCon ("::", [q; tl]), rest3))
+    | t :: rest2 when is_sym t "]" -> Ok (PCon ("::", [q; PCon ("[]", [])]), rest2)
+    | _ -> Err "expected ; or ] in a list pattern"
 
 let rec parse_expr toks = match toks with
   | t :: rest when is_kw t "let" -> parse_let rest true
@@ -670,6 +765,17 @@ let rec parse_expr toks = match toks with
            match parse_expr rest with
            | Err e -> Err e
            | Ok (handler, rest) -> Ok (Try (body, name, handler), rest))
+  | t :: rest when is_kw t "match" ->
+    (match parse_expr rest with
+     | Err e -> Err e
+     | Ok (scrut, rest) ->
+       match expect rest "with" with
+       | Err e -> Err e
+       | Ok rest ->
+         let rest = match rest with t2 :: r when is_sym t2 "|" -> r | _ -> rest in
+         match parse_arms rest [] with
+         | Err e -> Err e
+         | Ok (arms, rest) -> Ok (Match (scrut, arms), rest))
   | t :: rest when is_kw t "fun" ->
     let (ps, rest) = params rest [] in
     (match ps with
@@ -707,16 +813,43 @@ and parse_let toks need_in =
            else Ok (Let (recursive, name, bound, Var name), rest))
   | _ -> Err "expected a name after let"
 
+and parse_arms toks acc =
+  match parse_pat toks with
+  | Err e -> Err e
+  | Ok (q, rest) ->
+    match expect rest "->" with
+    | Err e -> Err e
+    | Ok rest ->
+      match parse_expr rest with
+      | Err e -> Err e
+      | Ok (body, rest) ->
+        match rest with
+        | t :: rest2 when is_sym t "|" -> parse_arms rest2 ((q, body) :: acc)
+        | _ -> Ok (rev_acc ((q, body) :: acc) [], rest)
+
 and parse_cmp toks =
-  match parse_arith toks with
+  match parse_cons toks with
   | Err e -> Err e
   | Ok (a, rest) ->
     match rest with
     | TSym op :: rest2 when string_equal op "=" || string_equal op "<>" || string_equal op "<"
                            || string_equal op ">" || string_equal op "<=" || string_equal op ">=" ->
-      (match parse_arith rest2 with
+      (match parse_cons rest2 with
        | Err e -> Err e
        | Ok (b, rest3) -> Ok (Binop (op, a, b), rest3))
+    | _ -> Ok (a, rest)
+
+(* :: binds tighter than a comparison and looser than +, and associates to
+   the right, so 1 :: 2 :: xs is 1 :: (2 :: xs) *)
+and parse_cons toks =
+  match parse_arith toks with
+  | Err e -> Err e
+  | Ok (a, rest) ->
+    match rest with
+    | t :: rest2 when is_sym t "::" ->
+      (match parse_cons rest2 with
+       | Err e -> Err e
+       | Ok (b, rest3) -> Ok (Con ("::", [a; b]), rest3))
     | _ -> Ok (a, rest)
 
 and parse_arith toks =
@@ -752,13 +885,17 @@ and app_more f toks =
   if starts_atom toks then
     match parse_atom toks with
     | Err e -> Err e
-    | Ok (a, rest) -> app_more (App (f, a)) rest
+    | Ok (a, rest) ->
+      let applied = match f with
+        | Con (c, []) -> Con (c, (match a with Tuple l -> l | _ -> [a]))
+        | _ -> App (f, a) in
+      app_more applied rest
   else Ok (f, toks)
 and starts_atom toks = match toks with
   | TInt _ :: _ -> true
   | TFloat _ :: _ -> true
   | TId x :: _ -> not (keyword x) || string_equal x "true" || string_equal x "false"
-  | t :: _ -> is_sym t "("
+  | t :: _ -> is_sym t "(" || is_sym t "["
   | [] -> false
 
 and parse_atom toks = match toks with
@@ -766,7 +903,10 @@ and parse_atom toks = match toks with
   | TFloat f :: rest -> Ok (Float f, rest)
   | TId x :: rest when string_equal x "true" -> Ok (Bool true, rest)
   | TId x :: rest when string_equal x "false" -> Ok (Bool false, rest)
+  | TId c :: rest when is_ctor c -> Ok (Con (c, []), rest)
   | TId x :: rest when not (keyword x) -> Ok (Var x, rest)
+  | t :: t2 :: rest when is_sym t "[" && is_sym t2 "]" -> Ok (Con ("[]", []), rest)
+  | t :: rest when is_sym t "[" -> parse_list_lit rest
   | TSym s :: TFloat f :: rest when string_equal s "-" -> Ok (Float (~-. f), rest)
   | TSym s :: rest when string_equal s "-" ->
     (match parse_atom rest with
@@ -778,11 +918,119 @@ and parse_atom toks = match toks with
   | t :: rest when is_sym t "(" ->
     (match parse_expr rest with
      | Err e -> Err e
-     | Ok (e, rest) ->
-       match expect rest ")" with
-       | Err e -> Err e
-       | Ok rest -> Ok (e, rest))
+     | Ok (e, rest) -> parse_tuple_rest [e] rest)
   | _ -> Err "syntax error"
+
+and parse_tuple_rest acc toks = match toks with
+  | t :: rest when is_sym t "," ->
+    (match parse_expr rest with
+     | Err e -> Err e
+     | Ok (e, rest) -> parse_tuple_rest (e :: acc) rest)
+  | t :: rest when is_sym t ")" ->
+    Ok ((match acc with [e] -> e | _ -> Tuple (rev_acc acc [])), rest)
+  | _ -> Err "expected , or ) "
+
+and parse_list_lit toks =
+  match parse_expr toks with
+  | Err e -> Err e
+  | Ok (e, rest) ->
+    match rest with
+    | t :: rest2 when is_sym t ";" ->
+      (match parse_list_lit rest2 with
+       | Err e -> Err e
+       | Ok (tl, rest3) -> Ok (Con ("::", [e; tl]), rest3))
+    | t :: rest2 when is_sym t "]" -> Ok (Con ("::", [e; Con ("[]", [])]), rest2)
+    | _ -> Err "expected ; or ] in a list"
+
+(* ---- the types written in a declaration ---- *)
+let rec parse_tyexp toks =
+  match parse_ty_tuple toks with
+  | Err e -> Err e
+  | Ok (a, rest) ->
+    match rest with
+    | t :: rest2 when is_sym t "->" ->
+      (match parse_tyexp rest2 with
+       | Err e -> Err e
+       | Ok (b, rest3) -> Ok (TEArrow (a, b), rest3))
+    | _ -> Ok (a, rest)
+
+and parse_ty_tuple toks =
+  match parse_ty_app toks with
+  | Err e -> Err e
+  | Ok (a, rest) -> ty_tuple_more [a] rest
+and ty_tuple_more acc toks = match toks with
+  | t :: rest when is_sym t "*" ->
+    (match parse_ty_app rest with
+     | Err e -> Err e
+     | Ok (a, rest2) -> ty_tuple_more (a :: acc) rest2)
+  | _ -> Ok ((match acc with [a] -> a | _ -> TETuple (rev_acc acc [])), toks)
+
+(* the argument comes first and can repeat: int list, int list list *)
+and parse_ty_app toks =
+  match parse_ty_atom toks with
+  | Err e -> Err e
+  | Ok (a, rest) -> ty_app_more a rest
+and ty_app_more a toks = match toks with
+  | TId n :: rest when not (keyword n) && not (is_tyvar n) -> ty_app_more (TECon (n, [a])) rest
+  | _ -> Ok (a, toks)
+
+and parse_ty_atom toks = match toks with
+  | TId v :: rest when is_tyvar v -> Ok (TEVar v, rest)
+  | TId n :: rest when not (keyword n) -> Ok (TECon (n, []), rest)
+  | t :: rest when is_sym t "(" ->
+    (match parse_tyexp rest with
+     | Err e -> Err e
+     | Ok (a, rest2) -> ty_paren [a] rest2)
+  | _ -> Err "syntax error in a type"
+and ty_paren acc toks = match toks with
+  | t :: rest when is_sym t "," ->
+    (match parse_tyexp rest with
+     | Err e -> Err e
+     | Ok (a, rest2) -> ty_paren (a :: acc) rest2)
+  | t :: rest when is_sym t ")" ->
+    (match acc with
+     | [a] -> Ok (a, rest)
+     (* several arguments are written before the name: (int, string) table *)
+     | _ ->
+       match rest with
+       | TId n :: rest2 when not (keyword n) && not (is_tyvar n) ->
+         Ok (TECon (n, rev_acc acc []), rest2)
+       | _ -> Err "expected a type name after (...)")
+  | _ -> Err "expected , or ) in a type"
+
+(* type 'a option = None | Some of 'a  -- the name, its parameters, and a
+   constructor list, each with the types of its arguments *)
+let parse_typedecl toks =
+  let (ps, toks) = match toks with
+    | TId v :: rest when is_tyvar v -> ([v], rest)
+    | t :: rest when is_sym t "(" ->
+      let rec go toks acc = match toks with
+        | TId v :: (t2 :: r) when is_tyvar v && is_sym t2 "," -> go r (v :: acc)
+        | TId v :: (t2 :: r) when is_tyvar v && is_sym t2 ")" -> (rev_acc (v :: acc) [], r)
+        | _ -> ([], toks) in
+      go rest []
+    | _ -> ([], toks) in
+  match toks with
+  | TId name :: rest when not (keyword name) && not (is_tyvar name) ->
+    (match expect rest "=" with
+     | Err e -> Err e
+     | Ok rest ->
+       let rest = match rest with t :: r when is_sym t "|" -> r | _ -> rest in
+       let rec arms toks acc = match toks with
+         | TId c :: (t :: rest2) when is_ctor c && is_kw t "of" ->
+           (match parse_tyexp rest2 with
+            | Err e -> Err e
+            | Ok (te, rest3) ->
+              (* C of a * b takes two arguments, not one pair *)
+              let l = match te with TETuple parts -> parts | _ -> [te] in
+              more ((c, l) :: acc) rest3)
+         | TId c :: rest2 when is_ctor c -> more ((c, []) :: acc) rest2
+         | _ -> Err "expected a constructor name"
+       and more acc toks = match toks with
+         | t :: rest2 when is_sym t "|" -> arms rest2 acc
+         | _ -> Ok (name, ps, rev_acc acc [], toks) in
+       arms rest [])
+  | _ -> Err "expected a type name"
 
 (* ---- evaluation ---- *)
 type value =
@@ -795,6 +1043,8 @@ type value =
   | VBool of bool
   | VStr of string                        (* a caught failure's message *)
   | VClosure of string * expr * env ref   (* the ref lets a let rec see itself *)
+  | VTuple of value list
+  | VCon of string * value list
 and env = (string * value) list
 
 let rec rev_list l acc = match l with [] -> acc | x :: r -> rev_list r (x :: acc)
@@ -826,6 +1076,24 @@ let call_builtin name args = match args with
     else Err ("bad argument for " ^^ name)
   | _ -> Err ("bad argument for " ^^ name)
 
+
+let bool_eq (a : bool) (b : bool) = if a then b else if b then false else true
+let not_b (a : bool) = if a then false else true
+
+(* = and <> on the structured values: two constructors are equal when they
+   are the same one and their arguments are *)
+let rec val_eq a b = match a, b with
+  | VInt x, VInt y -> x = y
+  | VBool x, VBool y -> bool_eq x y
+  | VFloat x, VFloat y -> flt_eq x y
+  | VStr x, VStr y -> string_equal x y
+  | VTuple l, VTuple m -> val_eq_list l m
+  | VCon (n, l), VCon (m, k) -> string_equal n m && val_eq_list l k
+  | _ -> false
+and val_eq_list l m = match l, m with
+  | [], [] -> true
+  | x :: r, y :: s -> val_eq x y && val_eq_list r s
+  | _ -> false
 
 let rec lookup env x = match env with
   | [] -> Err ("unbound " ^^ x)
@@ -887,6 +1155,9 @@ type ty =
   | TFloat
   | TString
   | TArrow of ty * ty
+  (* a declared type and its arguments: int list is TCon ("list", [TInt]) *)
+  | TCon of string * ty list
+  | TTuple of ty list
   | TVar of tv ref
 and tv = Unbound of int | Link of ty
 
@@ -902,7 +1173,12 @@ let rec repr t = match t with
 let rec occurs id t = match repr t with
   | TVar r -> (match r.contents with Unbound i -> i = id | Link _ -> false)
   | TArrow (a, b) -> occurs id a || occurs id b
+  | TCon (_, l) -> occurs_list id l
+  | TTuple l -> occurs_list id l
   | _ -> false
+and occurs_list id l = match l with
+  | [] -> false
+  | x :: r -> occurs id x || occurs_list id r
 
 (* Type variables are numbered as they are created, so a type printed on its
    own would start at whatever the counter had reached: 'g for the first one
@@ -931,9 +1207,27 @@ let type_name t =
                  | Unbound i -> "'" ^^ letter (index_of i !seen)
                  | Link u -> go u)
     | TArrow (a, b) ->
-      (match repr a with
-       | TArrow _ -> "(" ^^ go a ^^ ") -> " ^^ go b
-       | _ -> go a ^^ " -> " ^^ go b) in
+      let l = (match repr a with TArrow _ -> "(" ^^ go a ^^ ")" | _ -> go a) in
+      let r = go b in
+      l ^^ " -> " ^^ r
+    (* int list, (int, string) table, and a tuple or an arrow argument
+       parenthesised so that (int -> int) list does not read as int -> int list *)
+    | TCon (n, []) -> n
+    | TCon (n, [a]) -> let l = atom a in l ^^ " " ^^ n
+    | TCon (n, l) -> "(" ^^ commas l ^^ ") " ^^ n
+    | TTuple l -> stars l
+  and atom t = match repr t with
+    | TArrow _ -> "(" ^^ go t ^^ ")"
+    | TTuple _ -> "(" ^^ go t ^^ ")"
+    | _ -> go t
+  and commas l = match l with
+    | [] -> ""
+    | [a] -> go a
+    | a :: r -> let h = go a in h ^^ ", " ^^ commas r
+  and stars l = match l with
+    | [] -> ""
+    | [a] -> atom a
+    | a :: r -> let h = atom a in h ^^ " * " ^^ stars r in
   go t
 
 let rec unify a b =
@@ -945,6 +1239,9 @@ let rec unify a b =
   | TString, TString -> Ok ()
   | TArrow (a1, a2), TArrow (b1, b2) ->
     (match unify a1 b1 with Err m -> Err m | Ok () -> unify a2 b2)
+  | TCon (n1, l1), TCon (n2, l2) when string_equal n1 n2 ->
+    unify_list l1 l2 ra rb
+  | TTuple l1, TTuple l2 -> unify_list l1 l2 ra rb
   | TVar r, _ ->
     (match r.contents with
      | Unbound i ->
@@ -958,6 +1255,13 @@ let rec unify a b =
        else begin r.contents <- Link rb; Ok () end
      | Link u -> unify u rb)
   | _, TVar _ -> unify rb ra
+  | _ ->
+    Err ("this expression has type " ^^ type_name rb
+         ^^ " but was expected to have type " ^^ type_name ra)
+and unify_list l1 l2 ra rb = match l1, l2 with
+  | [], [] -> Ok ()
+  | a :: r1, b :: r2 ->
+    (match unify a b with Err m -> Err m | Ok () -> unify_list r1 r2 ra rb)
   | _ ->
     Err ("this expression has type " ^^ type_name rb
          ^^ " but was expected to have type " ^^ type_name ra)
@@ -975,7 +1279,12 @@ let rec free_ty t acc = match repr t with
                | Unbound i -> if mem_int i acc then acc else i :: acc
                | Link u -> free_ty u acc)
   | TArrow (a, b) -> free_ty b (free_ty a acc)
+  | TCon (_, l) -> free_tys l acc
+  | TTuple l -> free_tys l acc
   | _ -> acc
+and free_tys l acc = match l with
+  | [] -> acc
+  | t :: r -> free_tys r (free_ty t acc)
 
 let rec free_env env acc = match env with
   | [] -> acc
@@ -1005,12 +1314,61 @@ let instantiate sc = match sc with
                    | Unbound i -> if mem_int i q then fresh_for i !subst else t
                    | Link u -> go u)
       | TArrow (a, b) -> TArrow (go a, go b)
-      | u -> u in
+      | TCon (n, l) -> TCon (n, go_list l)
+      | TTuple l -> TTuple (go_list l)
+      | u -> u
+    and go_list l = match l with [] -> [] | t :: r -> go t :: go_list r in
     go t
 
 let rec lookup_scheme env x = match env with
   | [] -> Err ("unbound " ^^ x)
   | (y, sc) :: rest -> if string_equal x y then Ok (instantiate sc) else lookup_scheme rest x
+
+(* ---- declared constructors ----
+   Each one records the type it builds, that type's parameters, and the
+   types of its arguments as they were written.  A use instantiates them:
+   every parameter gets a fresh variable, so "Some 1" and "Some 1.0" are
+   both fine and neither fixes the other.  [] and :: are the list type,
+   declared here rather than built into the checker. *)
+let constructors : (string * (string * string list * tyexp list)) list ref =
+  ref [ ("[]", ("list", ["'a"], []));
+        ("::", ("list", ["'a"], [TEVar "'a"; TECon ("list", [TEVar "'a"])])) ]
+
+let rec find_ctor l c = match l with
+  | [] -> Err ("unbound constructor " ^^ c)
+  | (n, d) :: r -> if string_equal n c then Ok d else find_ctor r c
+
+let rec lookup_sub sub v = match sub with
+  | [] -> fresh_tv ()
+  | (n, t) :: r -> if string_equal n v then t else lookup_sub r v
+
+let rec ty_of_texp sub te = match te with
+  | TEVar v -> lookup_sub sub v
+  | TECon (n, []) when string_equal n "int" -> TInt
+  | TECon (n, []) when string_equal n "bool" -> TBool
+  | TECon (n, []) when string_equal n "float" -> TFloat
+  | TECon (n, []) when string_equal n "string" -> TString
+  | TECon (n, l) -> TCon (n, ty_of_texps sub l)
+  | TEArrow (a, b) -> TArrow (ty_of_texp sub a, ty_of_texp sub b)
+  | TETuple l -> TTuple (ty_of_texps sub l)
+and ty_of_texps sub l = match l with
+  | [] -> []
+  | t :: r -> ty_of_texp sub t :: ty_of_texps sub r
+
+let rec fresh_sub ps = match ps with
+  | [] -> []
+  | v :: r -> (v, fresh_tv ()) :: fresh_sub r
+
+let rec sub_tys sub ps = match ps with
+  | [] -> []
+  | v :: r -> lookup_sub sub v :: sub_tys sub r
+
+(* what a use of this constructor takes, and what it builds *)
+let ctor_types c = match find_ctor !constructors c with
+  | Err m -> Err m
+  | Ok (tname, ps, args) ->
+    let sub = fresh_sub ps in
+    Ok (ty_of_texps sub args, TCon (tname, sub_tys sub ps))
 
 let int_op op =
   string_equal op "+" || string_equal op "-" || string_equal op "*"
@@ -1092,6 +1450,70 @@ let rec infer env e = match e with
        match infer henv handler with
        | Err m -> Err m
        | Ok th -> match unify tb th with Err m -> Err m | Ok () -> Ok tb)
+  | Tuple es ->
+    (match infer_all env es [] with
+     | Err m -> Err m
+     | Ok ts -> Ok (TTuple ts))
+  | Con (c, args) ->
+    (match ctor_types c with
+     | Err m -> Err m
+     | Ok (want, result) ->
+       let rec go ws es = match ws, es with
+         | [], [] -> Ok result
+         | w :: wr, e :: er ->
+           (match infer env e with
+            | Err m -> Err m
+            | Ok te ->
+              match unify w te with Err m -> Err m | Ok () -> go wr er)
+         | _ -> Err (c ^^ " is used with the wrong number of arguments") in
+       go want args)
+  | Match (scrut, arms) ->
+    (match infer env scrut with
+     | Err m -> Err m
+     | Ok ts ->
+       let result = fresh_tv () in
+       let rec go l = match l with
+         | [] -> Ok result
+         | (q, body) :: r ->
+           (match infer_pat env q ts with
+            | Err m -> Err m
+            | Ok env2 ->
+              match infer env2 body with
+              | Err m -> Err m
+              | Ok tb ->
+                match unify result tb with Err m -> Err m | Ok () -> go r) in
+       go arms)
+
+and infer_all env l acc = match l with
+  | [] -> Ok (rev_acc acc [])
+  | e :: r ->
+    (match infer env e with Err m -> Err m | Ok t -> infer_all env r (t :: acc))
+
+(* a pattern against the type it is matched on, giving what it binds *)
+and infer_pat env q t = match q with
+  | PWild -> Ok env
+  | PVar x -> Ok ((x, Forall ([], t)) :: env)
+  | PInt _ -> (match unify t TInt with Err m -> Err m | Ok () -> Ok env)
+  | PBool _ -> (match unify t TBool with Err m -> Err m | Ok () -> Ok env)
+  | PTuple l ->
+    let rec fresh_for l = match l with [] -> [] | _ :: r -> fresh_tv () :: fresh_for r in
+    let ts = fresh_for l in
+    (match unify t (TTuple ts) with
+     | Err m -> Err m
+     | Ok () -> infer_pats env l ts)
+  | PCon (c, ps) ->
+    (match ctor_types c with
+     | Err m -> Err m
+     | Ok (want, result) ->
+       match unify t result with
+       | Err m -> Err m
+       | Ok () -> infer_pats env ps want)
+
+and infer_pats env ps ts = match ps, ts with
+  | [], [] -> Ok env
+  | q :: pr, t :: tr ->
+    (match infer_pat env q t with Err m -> Err m | Ok env2 -> infer_pats env2 pr tr)
+  | _ -> Err "a pattern has the wrong number of arguments"
 
 let rec eval env e = match e with
   | Int n -> Ok (VInt n)
@@ -1112,8 +1534,10 @@ let rec eval env e = match e with
            if is_comparison op then Ok (compare_floats op x y)
            else if is_float_op op then float_arith op x y
            else Err ("float needs " ^^ op ^^ ".")
-         | VBool x, VBool y when string_equal op "=" -> Ok (VBool (x = y))
-         | VBool x, VBool y when string_equal op "<>" -> Ok (VBool (x <> y))
+         | VBool x, VBool y when string_equal op "=" -> Ok (VBool (bool_eq x y))
+         | VBool x, VBool y when string_equal op "<>" -> Ok (VBool (not_b (bool_eq x y)))
+         | _, _ when string_equal op "=" -> Ok (VBool (val_eq va vb))
+         | _, _ when string_equal op "<>" -> Ok (VBool (not_b (val_eq va vb)))
          | _ -> Err ("bad operands for " ^^ op))
   | If (c, a, b) ->
     (match eval env c with
@@ -1155,6 +1579,42 @@ let rec eval env e = match e with
         | true, VClosure (_, _, cenv) -> cenv := (name, v) :: !cenv
         | _ -> ());
        eval ((name, v) :: env) body)
+  | Tuple es ->
+    (match eval_all env es [] with Err m -> Err m | Ok vs -> Ok (VTuple vs))
+  | Con (c, args) ->
+    (match eval_all env args [] with Err m -> Err m | Ok vs -> Ok (VCon (c, vs)))
+  | Match (scrut, arms) ->
+    (match eval env scrut with
+     | Err m -> Err m
+     | Ok v ->
+       let rec go l = match l with
+         | [] -> Err "no case matches this value"
+         | (q, body) :: r ->
+           (match match_pat env q v with
+            | None -> go r
+            | Some env2 -> eval env2 body) in
+       go arms)
+
+and eval_all env l acc = match l with
+  | [] -> Ok (rev_acc acc [])
+  | e :: r ->
+    (match eval env e with Err m -> Err m | Ok v -> eval_all env r (v :: acc))
+
+(* a pattern against a value: the bindings it makes, or nothing *)
+and match_pat env q v = match q, v with
+  | PWild, _ -> Some env
+  | PVar x, _ -> Some ((x, v) :: env)
+  | PInt n, VInt m -> if n = m then Some env else None
+  | PBool b, VBool c -> if bool_eq b c then Some env else None
+  | PTuple ps, VTuple vs -> match_pats env ps vs
+  | PCon (c, ps), VCon (d, vs) -> if string_equal c d then match_pats env ps vs else None
+  | _ -> None
+
+and match_pats env ps vs = match ps, vs with
+  | [], [] -> Some env
+  | q :: pr, v :: vr ->
+    (match match_pat env q v with None -> None | Some env2 -> match_pats env2 pr vr)
+  | _ -> None
 
 (* ---- evaluating a line, whichever way it came ---- *)
 (* Printing a double, without caml_format_float -- which this processor does
@@ -1207,13 +1667,40 @@ let print_float (x : float) =
     end
   end
 
-let print_value v = match v with
+let rec print_value v = match v with
   | VInt n -> put_int n
   | VFloat f -> print_float f
   | VBool b -> puts (if b then "true" else "false")
   | VStr s -> putc '"'; puts s; putc '"'
   | VClosure _ -> puts "<fun>"
   | VBuiltin _ -> puts "<fun>"
+  | VTuple l -> putc '('; print_commas l; putc ')'
+  | VCon (c, []) when string_equal c "[]" -> puts "[]"
+  | VCon (c, [_; _]) when string_equal c "::" ->
+    putc '['; print_items v; putc ']'
+  | VCon (c, []) -> puts c
+  | VCon (c, [a]) -> puts c; putc ' '; print_arg a
+  | VCon (c, l) -> puts c; putc ' '; putc '('; print_commas l; putc ')'
+
+and print_commas l = match l with
+  | [] -> ()
+  | [v] -> print_value v
+  | v :: r -> print_value v; puts ", "; print_commas r
+
+(* the spine of a list, without the brackets *)
+and print_items v = match v with
+  | VCon (c, [h; t]) when string_equal c "::" ->
+    print_value h;
+    (match t with
+     | VCon (d, []) when string_equal d "[]" -> ()
+     | _ -> puts "; "; print_items t)
+  | _ -> ()
+
+(* a constructor's argument needs parentheses if it is itself applied *)
+and print_arg v = match v with
+  | VCon (c, _ :: _) when not_b (string_equal c "::") ->
+    putc '('; print_value v; putc ')'
+  | _ -> print_value v
 
 (* The pervasives: a value and a type for each, so that "sin 0.5" needs no
    declaration and "sin 1" is refused before it runs. *)
@@ -1245,12 +1732,6 @@ let session = ref (builtin_values builtins)
    that waits until the closure runs gives "unbound fact" to someone who
    has just seen "val fact = <fun>".  This walks an expression for the
    first free name, with the session's own bindings counted as bound. *)
-let session_names () =
-  let rec go env acc = match env with
-    | [] -> acc
-    | (n, _) :: rest -> go rest (n :: acc) in
-  go !session []
-
 (* "ms" is the one name the evaluator answers for without a binding *)
 (* The session's types, beside its values.  A top-level binding is parsed as
    "let x = e in x", so its scheme is generalised from the right-hand side
@@ -1277,6 +1758,21 @@ let evaluate_line () =
   if !line_len > 0 then begin
     match tokenize () with
     | Err m -> puts "error: "; puts m; newline ()
+    | Ok toks when (match toks with t :: _ -> is_kw t "type" | [] -> false) ->
+      (* a declaration, not an expression: it binds constructors and has no
+         value to print *)
+      (match parse_typedecl (match toks with _ :: r -> r | [] -> []) with
+       | Err m -> puts "error: "; puts m; newline ()
+       | Ok (name, ps, arms, rest) ->
+         match rest with
+         | _ :: _ -> puts "error: unexpected input at the end"; newline ()
+         | [] ->
+           let rec add l = match l with
+             | [] -> ()
+             | (c, args) :: r ->
+               constructors := (c, (name, ps, args)) :: !constructors; add r in
+           add arms;
+           puts "type "; puts name; newline ())
     | Ok toks ->
       let top_let = match toks with t :: _ -> is_kw t "let" | [] -> false in
       let parsed = match toks with
