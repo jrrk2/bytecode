@@ -151,6 +151,31 @@ let () =
                | Error e -> Format.printf "[read error: %a]@." Tcp.pp_error e; Lwt.return_unit in
              Lwt.pick [ rd (); Lwt_unix.sleep 2.0 ] >>= fun () ->
              Tcp.close f2)
+       else if Array.length Sys.argv > 1 && Sys.argv.(1) = "rec" then
+         typ "type point = { x : int; y : int }\r" >>= fun () ->
+         typ "let p = { x = 3; y = 4 }\r" >>= fun () ->
+         typ "p\r" >>= fun () ->
+         typ "p.x\r" >>= fun () ->
+         typ "p.x + p.y\r" >>= fun () ->
+         typ "let q = { p with y = 10 }\r" >>= fun () ->
+         typ "q\r" >>= fun () ->
+         typ "p\r" >>= fun () ->
+         typ "let dist s = match s with { x = a; y = b } -> a * a + b * b\r" >>= fun () ->
+         typ "dist p\r" >>= fun () ->
+         typ "let shift d s = { s with x = s.x + d }\r" >>= fun () ->
+         typ "shift 5 p\r" >>= fun () ->
+         typ "p = { x = 3; y = 4 }\r" >>= fun () ->
+         typ "p = q\r" >>= fun () ->
+         typ "type named = { nm : int; pt : point }\r" >>= fun () ->
+         typ "let n = { nm = 7; pt = p }\r" >>= fun () ->
+         typ "n\r" >>= fun () ->
+         typ "n.pt.y\r" >>= fun () ->
+         typ "[p; q]\r" >>= fun () ->
+         typ "{ x = 1 }\r" >>= fun () ->
+         typ "p.z\r" >>= fun () ->
+         typ "{ x = 1; y = true }\r" >>= fun () ->
+         typ "let f r = r.x\r" >>= fun () ->
+         typ "f q\r"
        else if Array.length Sys.argv > 1 && Sys.argv.(1) = "adt" then
          typ "[1; 2; 3]\r" >>= fun () ->
          typ "1 :: 2 :: []\r" >>= fun () ->

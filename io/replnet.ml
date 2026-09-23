@@ -548,7 +548,10 @@ let symbol_len i =
      || (c = 58 && d = 58)
      || ((c = 43 || c = 45 || c = 42 || c = 47) && d = 46) then 2
   else if c = 43 || c = 45 || c = 42 || c = 47 || c = 61 || c = 60 || c = 62
-       || c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 124 || c = 59 then 1
+       || c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 124 || c = 59
+       (* { } . : for records; a float literal and +. -. *. /. are taken
+          before this, so a lone point can only be a field selection *)
+       || c = 123 || c = 125 || c = 46 || c = 58 then 1
   else 0
 
 type 'a result = Ok of 'a | Err of string
@@ -611,6 +614,9 @@ type expr =
      parser writes for [] and for x :: xs and [a; b; c] *)
   | Con of string * expr list
   | Match of expr * (pat * expr) list
+  | Record of (string * expr) list
+  | With of expr * (string * expr) list   (* { e with f = v } *)
+  | Field of expr * string
 and pat =
   | PWild
   | PVar of string
@@ -618,6 +624,7 @@ and pat =
   | PBool of bool
   | PTuple of pat list
   | PCon of string * pat list
+  | PRec of (string * pat) list
 
 (* A type as it is written in a declaration, before it becomes a ty: the
    declaration is read once and its argument types instantiated afresh at
@@ -687,7 +694,7 @@ and parse_pat_app toks = match toks with
 and starts_pat toks = match toks with
   | TInt _ :: _ -> true
   | TId x :: _ -> not (keyword x) || string_equal x "true" || string_equal x "false"
-  | t :: _ -> is_sym t "(" || is_sym t "["
+  | t :: _ -> is_sym t "(" || is_sym t "[" || is_sym t "{"
   | [] -> false
 
 and parse_pat_atom toks = match toks with
@@ -699,6 +706,7 @@ and parse_pat_atom toks = match toks with
   | TId x :: rest when not (keyword x) -> Ok (PVar x, rest)
   | t :: t2 :: rest when is_sym t "[" && is_sym t2 "]" -> Ok (PCon ("[]", []), rest)
   | t :: rest when is_sym t "[" -> parse_pat_list rest
+  | t :: rest when is_sym t "{" -> parse_pat_rec rest []
   | t :: rest when is_sym t "(" ->
     (match parse_pat rest with
      | Err e -> Err e
@@ -713,6 +721,22 @@ and parse_pat_tuple acc toks = match toks with
   | t :: rest when is_sym t ")" ->
     Ok ((match acc with [q] -> q | _ -> PTuple (rev_acc acc [])), rest)
   | _ -> Err "expected , or ) in a pattern"
+
+and parse_pat_rec toks acc = match toks with
+  | TId f :: (t :: rest) when not (keyword f) && is_sym t "=" ->
+    (match parse_pat rest with
+     | Err e -> Err e
+     | Ok (q, rest2) ->
+       match rest2 with
+       | t2 :: rest3 when is_sym t2 ";" -> parse_pat_rec rest3 ((f, q) :: acc)
+       | t2 :: rest3 when is_sym t2 "}" -> Ok (PRec (rev_acc ((f, q) :: acc) []), rest3)
+       | _ -> Err "expected ; or } in a record pattern")
+  (* { x } is shorthand for { x = x } *)
+  | TId f :: (t :: rest) when not (keyword f) && is_sym t ";" ->
+    parse_pat_rec rest ((f, PVar f) :: acc)
+  | TId f :: (t :: rest) when not (keyword f) && is_sym t "}" ->
+    Ok (PRec (rev_acc ((f, PVar f) :: acc) []), rest)
+  | _ -> Err "expected a field name in a record pattern"
 
 and parse_pat_list toks =
   match parse_pat toks with
@@ -878,12 +902,23 @@ and term_more a toks = match toks with
   | _ -> Ok (a, toks)
 
 and parse_app toks =
-  match parse_atom toks with
+  match parse_sel toks with
   | Err e -> Err e
   | Ok (f, rest) -> app_more f rest
+
+(* an atom and any field selections after it: f p.x is f (p.x) *)
+and parse_sel toks =
+  match parse_atom toks with
+  | Err e -> Err e
+  | Ok (a, rest) -> sel_more a rest
+and sel_more a toks = match toks with
+  | t :: (TId f :: rest) when is_sym t "." && not (keyword f) ->
+    sel_more (Field (a, f)) rest
+  | _ -> Ok (a, toks)
+
 and app_more f toks =
   if starts_atom toks then
-    match parse_atom toks with
+    match parse_sel toks with
     | Err e -> Err e
     | Ok (a, rest) ->
       let applied = match f with
@@ -895,7 +930,7 @@ and starts_atom toks = match toks with
   | TInt _ :: _ -> true
   | TFloat _ :: _ -> true
   | TId x :: _ -> not (keyword x) || string_equal x "true" || string_equal x "false"
-  | t :: _ -> is_sym t "(" || is_sym t "["
+  | t :: _ -> is_sym t "(" || is_sym t "[" || is_sym t "{"
   | [] -> false
 
 and parse_atom toks = match toks with
@@ -907,6 +942,22 @@ and parse_atom toks = match toks with
   | TId x :: rest when not (keyword x) -> Ok (Var x, rest)
   | t :: t2 :: rest when is_sym t "[" && is_sym t2 "]" -> Ok (Con ("[]", []), rest)
   | t :: rest when is_sym t "[" -> parse_list_lit rest
+  (* a field list starts "name =", anything else is the record to update *)
+  | t :: (TId f :: (t2 :: rest)) when is_sym t "{" && not (keyword f) && is_sym t2 "=" ->
+    parse_rec_lit (TId f :: (t2 :: rest)) []
+  | t :: rest when is_sym t "{" ->
+    (match parse_expr rest with
+     | Err e -> Err e
+     | Ok (base, rest2) ->
+       match expect rest2 "with" with
+       | Err _ -> Err "expected = or with in a record"
+       | Ok rest3 ->
+         match parse_rec_lit rest3 [] with
+         | Err e -> Err e
+         | Ok (r, rest4) ->
+           match r with
+           | Record fs -> Ok (With (base, fs), rest4)
+           | _ -> Err "expected fields after with")
   | TSym s :: TFloat f :: rest when string_equal s "-" -> Ok (Float (~-. f), rest)
   | TSym s :: rest when string_equal s "-" ->
     (match parse_atom rest with
@@ -929,6 +980,21 @@ and parse_tuple_rest acc toks = match toks with
   | t :: rest when is_sym t ")" ->
     Ok ((match acc with [e] -> e | _ -> Tuple (rev_acc acc [])), rest)
   | _ -> Err "expected , or ) "
+
+and parse_rec_lit toks acc = match toks with
+  | TId f :: (t :: rest) when not (keyword f) && is_sym t "=" ->
+    (match parse_expr rest with
+     | Err e -> Err e
+     | Ok (v, rest2) ->
+       match rest2 with
+       | t2 :: rest3 when is_sym t2 ";" -> parse_rec_lit rest3 ((f, v) :: acc)
+       | t2 :: rest3 when is_sym t2 "}" -> Ok (Record (rev_acc ((f, v) :: acc) []), rest3)
+       | _ -> Err "expected ; or } in a record")
+  | TId f :: (t :: rest) when not (keyword f) && is_sym t ";" ->
+    parse_rec_lit rest ((f, Var f) :: acc)
+  | TId f :: (t :: rest) when not (keyword f) && is_sym t "}" ->
+    Ok (Record (rev_acc ((f, Var f) :: acc) []), rest)
+  | _ -> Err "expected a field name in a record"
 
 and parse_list_lit toks =
   match parse_expr toks with
@@ -1015,6 +1081,22 @@ let parse_typedecl toks =
     (match expect rest "=" with
      | Err e -> Err e
      | Ok rest ->
+       match rest with
+       | t :: rest1 when is_sym t "{" ->
+         (* a record: fields and their types, rather than constructors *)
+         let rec flds toks acc = match toks with
+           | TId f :: (t2 :: rest2) when not (keyword f) && is_sym t2 ":" ->
+             (match parse_tyexp rest2 with
+              | Err e -> Err e
+              | Ok (te, rest3) ->
+                match rest3 with
+                | t3 :: rest4 when is_sym t3 ";" -> flds rest4 ((f, te) :: acc)
+                | t3 :: rest4 when is_sym t3 "}" ->
+                  Ok (name, ps, [], rev_acc ((f, te) :: acc) [], rest4)
+                | _ -> Err "expected ; or } in a record type")
+           | _ -> Err "expected a field name and its type" in
+         flds rest1 []
+       | _ ->
        let rest = match rest with t :: r when is_sym t "|" -> r | _ -> rest in
        let rec arms toks acc = match toks with
          | TId c :: (t :: rest2) when is_ctor c && is_kw t "of" ->
@@ -1032,7 +1114,7 @@ let parse_typedecl toks =
          | _ -> Err "expected a constructor name"
        and more acc toks = match toks with
          | t :: rest2 when is_sym t "|" -> arms rest2 acc
-         | _ -> Ok (name, ps, rev_acc acc [], toks) in
+         | _ -> Ok (name, ps, rev_acc acc [], [], toks) in
        arms rest [])
   | _ -> Err "expected a type name"
 
@@ -1049,6 +1131,7 @@ type value =
   | VClosure of string * expr * env ref   (* the ref lets a let rec see itself *)
   | VTuple of value list
   | VCon of string * value list
+  | VRec of (string * value) list
 and env = (string * value) list
 
 let rec rev_list l acc = match l with [] -> acc | x :: r -> rev_list r (x :: acc)
@@ -1081,6 +1164,10 @@ let call_builtin name args = match args with
   | _ -> Err ("bad argument for " ^^ name)
 
 
+let rec lookup_rec l f = match l with
+  | [] -> Err ("no field " ^^ f)
+  | (g, v) :: r -> if string_equal f g then Ok v else lookup_rec r f
+
 let bool_eq (a : bool) (b : bool) = if a then b else if b then false else true
 let not_b (a : bool) = if a then false else true
 
@@ -1093,7 +1180,14 @@ let rec val_eq a b = match a, b with
   | VStr x, VStr y -> string_equal x y
   | VTuple l, VTuple m -> val_eq_list l m
   | VCon (n, l), VCon (m, k) -> string_equal n m && val_eq_list l k
+  | VRec l, VRec m -> val_eq_rec l m
   | _ -> false
+and val_eq_rec l m = match l with
+  | [] -> true
+  | (f, v) :: r ->
+    (match lookup_rec m f with
+     | Err _ -> false
+     | Ok w -> val_eq v w && val_eq_rec r m)
 and val_eq_list l m = match l, m with
   | [], [] -> true
   | x :: r, y :: s -> val_eq x y && val_eq_list r s
@@ -1338,6 +1432,29 @@ let constructors : (string * (string * string list * tyexp list)) list ref =
   ref [ ("[]", ("list", ["'a"], []));
         ("::", ("list", ["'a"], [TEVar "'a"; TECon ("list", [TEVar "'a"])])) ]
 
+(* field name -> the record type it belongs to, that type's parameters, and
+   the field's own type.  A field is looked up by name alone, so the last
+   declaration of a name wins, as it does in OCaml. *)
+let fields : (string * (string * string list * tyexp)) list ref = ref []
+(* record type name -> its fields in declaration order, for printing *)
+let rec_order : (string * string list) list ref = ref []
+
+let rec find_rec_order l n = match l with
+  | [] -> Err ("unknown record type " ^^ n)
+  | (m, fs) :: r -> if string_equal m n then Ok fs else find_rec_order r n
+
+let rec mem_field f l = match l with
+  | [] -> false
+  | (g, _) :: r -> string_equal f g || mem_field f r
+
+let rec all_present want fs = match want with
+  | [] -> true
+  | f :: r -> mem_field f fs && all_present r fs
+
+let rec find_field l f = match l with
+  | [] -> Err ("unbound field " ^^ f)
+  | (n, d) :: r -> if string_equal n f then Ok d else find_field r f
+
 let rec find_ctor l c = match l with
   | [] -> Err ("unbound constructor " ^^ c)
   | (n, d) :: r -> if string_equal n c then Ok d else find_ctor r c
@@ -1373,6 +1490,13 @@ let ctor_types c = match find_ctor !constructors c with
   | Ok (tname, ps, args) ->
     let sub = fresh_sub ps in
     Ok (ty_of_texps sub args, TCon (tname, sub_tys sub ps))
+
+(* the record type a field belongs to, and that field's type, both fresh *)
+let field_types f = match find_field !fields f with
+  | Err m -> Err m
+  | Ok (tname, ps, te) ->
+    let sub = fresh_sub ps in
+    Ok (TCon (tname, sub_tys sub ps), ty_of_texp sub te)
 
 let int_op op =
   string_equal op "+" || string_equal op "-" || string_equal op "*"
@@ -1454,6 +1578,38 @@ let rec infer env e = match e with
        match infer henv handler with
        | Err m -> Err m
        | Ok th -> match unify tb th with Err m -> Err m | Ok () -> Ok tb)
+  | Field (e, f) ->
+    (match field_types f with
+     | Err m -> Err m
+     | Ok (rt, ft) ->
+       match infer env e with
+       | Err m -> Err m
+       | Ok te -> match unify rt te with Err m -> Err m | Ok () -> Ok ft)
+  | Record fs ->
+    (match fs with
+     | [] -> Err "a record needs at least one field"
+     | (f0, _) :: _ ->
+       match field_types f0 with
+       | Err m -> Err m
+       | Ok (rt, _) ->
+         (* every field is checked against the same instance, so the
+            parameters agree across them *)
+         match infer_fields env fs rt with
+         | Err m -> Err m
+         | Ok () ->
+           match rt with
+           | TCon (n, _) ->
+             (match find_rec_order !rec_order n with
+              | Err m -> Err m
+              | Ok want ->
+                if all_present want fs then Ok rt
+                else Err ("some fields of " ^^ n ^^ " are missing"))
+           | _ -> Ok rt)
+  | With (base, fs) ->
+    (match infer env base with
+     | Err m -> Err m
+     | Ok rt ->
+       match infer_fields env fs rt with Err m -> Err m | Ok () -> Ok rt)
   | Tuple es ->
     (match infer_all env es [] with
      | Err m -> Err m
@@ -1488,6 +1644,21 @@ let rec infer env e = match e with
                 match unify result tb with Err m -> Err m | Ok () -> go r) in
        go arms)
 
+(* each field against the record type it is being used at *)
+and infer_fields env fs rt = match fs with
+  | [] -> Ok ()
+  | (f, e) :: r ->
+    (match field_types f with
+     | Err m -> Err m
+     | Ok (rt2, ft) ->
+       match unify rt rt2 with
+       | Err _ -> Err (f ^^ " is not a field of this record")
+       | Ok () ->
+         match infer env e with
+         | Err m -> Err m
+         | Ok te ->
+           match unify ft te with Err m -> Err m | Ok () -> infer_fields env r rt)
+
 and infer_all env l acc = match l with
   | [] -> Ok (rev_acc acc [])
   | e :: r ->
@@ -1505,6 +1676,7 @@ and infer_pat env q t = match q with
     (match unify t (TTuple ts) with
      | Err m -> Err m
      | Ok () -> infer_pats env l ts)
+  | PRec fs -> infer_pat_rec env fs t
   | PCon (c, ps) ->
     (match ctor_types c with
      | Err m -> Err m
@@ -1512,6 +1684,20 @@ and infer_pat env q t = match q with
        match unify t result with
        | Err m -> Err m
        | Ok () -> infer_pats env ps want)
+
+(* a record pattern may name only some of the fields *)
+and infer_pat_rec env fs t = match fs with
+  | [] -> Ok env
+  | (f, q) :: r ->
+    (match field_types f with
+     | Err m -> Err m
+     | Ok (rt, ft) ->
+       match unify t rt with
+       | Err _ -> Err (f ^^ " is not a field of this record")
+       | Ok () ->
+         match infer_pat env q ft with
+         | Err m -> Err m
+         | Ok env2 -> infer_pat_rec env2 r t)
 
 and infer_pats env ps ts = match ps, ts with
   | [], [] -> Ok env
@@ -1586,6 +1772,29 @@ let rec eval env e = match e with
         | true, VClosure (_, _, cenv) -> cenv := (name, v) :: !cenv
         | _ -> ());
        eval ((name, v) :: env) body)
+  | Field (e, f) ->
+    (match eval env e with
+     | Err m -> Err m
+     | Ok (VRec l) -> lookup_rec l f
+     | Ok _ -> Err "not a record")
+  | Record fs ->
+    (match eval_fields env fs [] with Err m -> Err m | Ok l -> Ok (VRec l))
+  | With (base, fs) ->
+    (match eval env base with
+     | Err m -> Err m
+     | Ok (VRec l) ->
+       (match eval_fields env fs [] with
+        | Err m -> Err m
+        | Ok upd ->
+          (* the base's order is kept, with the named fields replaced *)
+          let rec merge b = match b with
+            | [] -> []
+            | (f, v) :: r ->
+              (match lookup_rec upd f with
+               | Ok w -> (f, w) :: merge r
+               | Err _ -> (f, v) :: merge r) in
+          Ok (VRec (merge l)))
+     | Ok _ -> Err "not a record")
   | Tuple es ->
     (match eval_all env es [] with Err m -> Err m | Ok vs -> Ok (VTuple vs))
   | Con (c, args) ->
@@ -1602,6 +1811,13 @@ let rec eval env e = match e with
             | Some env2 -> eval env2 body) in
        go arms)
 
+and eval_fields env fs acc = match fs with
+  | [] -> Ok (rev_acc acc [])
+  | (f, e) :: r ->
+    (match eval env e with
+     | Err m -> Err m
+     | Ok v -> eval_fields env r ((f, v) :: acc))
+
 and eval_all env l acc = match l with
   | [] -> Ok (rev_acc acc [])
   | e :: r ->
@@ -1615,7 +1831,18 @@ and match_pat env q v = match q, v with
   | PBool b, VBool c -> if bool_eq b c then Some env else None
   | PTuple ps, VTuple vs -> match_pats env ps vs
   | PCon (c, ps), VCon (d, vs) -> if string_equal c d then match_pats env ps vs else None
+  | PRec fs, VRec l -> match_rec env fs l
   | _ -> None
+
+and match_rec env fs l = match fs with
+  | [] -> Some env
+  | (f, q) :: r ->
+    (match lookup_rec l f with
+     | Err _ -> None
+     | Ok v ->
+       match match_pat env q v with
+       | None -> None
+       | Some env2 -> match_rec env2 r l)
 
 and match_pats env ps vs = match ps, vs with
   | [], [] -> Some env
@@ -1682,12 +1909,18 @@ let rec print_value v = match v with
   | VClosure _ -> puts "<fun>"
   | VBuiltin _ -> puts "<fun>"
   | VTuple l -> putc '('; print_commas l; putc ')'
+  | VRec l -> puts "{ "; print_fields l; puts " }"
   | VCon (c, []) when string_equal c "[]" -> puts "[]"
   | VCon (c, [_; _]) when string_equal c "::" ->
     putc '['; print_items v; putc ']'
   | VCon (c, []) -> puts c
   | VCon (c, [a]) -> puts c; putc ' '; print_arg a
   | VCon (c, l) -> puts c; putc ' '; putc '('; print_commas l; putc ')'
+
+and print_fields l = match l with
+  | [] -> ()
+  | [(f, v)] -> puts f; puts " = "; print_value v
+  | (f, v) :: r -> puts f; puts " = "; print_value v; puts "; "; print_fields r
 
 and print_commas l = match l with
   | [] -> ()
@@ -1770,7 +2003,7 @@ let evaluate_line () =
          value to print *)
       (match parse_typedecl (match toks with _ :: r -> r | [] -> []) with
        | Err m -> puts "error: "; puts m; newline ()
-       | Ok (name, ps, arms, rest) ->
+       | Ok (name, ps, arms, flds, rest) ->
          match rest with
          | t :: _ ->
            puts "error: unexpected input at the end";
@@ -1782,6 +2015,14 @@ let evaluate_line () =
              | (c, args) :: r ->
                constructors := (c, (name, ps, args)) :: !constructors; add r in
            add arms;
+           let rec addf l names = match l with
+             | [] -> rev_acc names []
+             | (f, te) :: r ->
+               fields := (f, (name, ps, te)) :: !fields;
+               addf r (f :: names) in
+           (match flds with
+            | [] -> ()
+            | _ -> rec_order := (name, addf flds []) :: !rec_order);
            puts "type "; puts name; newline ())
     | Ok toks ->
       let top_let = match toks with t :: _ -> is_kw t "let" | [] -> false in
