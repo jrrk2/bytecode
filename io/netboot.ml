@@ -66,7 +66,7 @@ let dip_sw = 0x1009
 let buttons = 0x100b
 let boot_reg = 0x1007
 let stage = 0x10000
-let stage_size = 0x10000
+let stage_size = 0x20000   (* 128 KiB of staging RAM *)
 
 let eth_rx_valid = 1
 let eth_tx_busy = 2
