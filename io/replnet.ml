@@ -676,6 +676,46 @@ let print_value v = match v with
 
 let session = ref []
 
+
+(* A name used but never bound is an error in the definition, not in the
+   call that finds out: OCaml says so when the let is typed, and a mini-ML
+   that waits until the closure runs gives "unbound fact" to someone who
+   has just seen "val fact = <fun>".  This walks an expression for the
+   first free name, with the session's own bindings counted as bound. *)
+let rec bound_in names x = match names with
+  | [] -> false
+  | y :: rest -> if string_equal x y then true else bound_in rest x
+
+let rec free_name names e = match e with
+  | Int _ -> Ok ()
+  | Bool _ -> Ok ()
+  | Var x -> if bound_in names x then Ok () else Err x
+  | Fun (p, body) -> free_name (p :: names) body
+  | App (f, a) ->
+    (match free_name names f with Err m -> Err m | Ok () -> free_name names a)
+  | Binop (_, a, b) ->
+    (match free_name names a with Err m -> Err m | Ok () -> free_name names b)
+  | If (c, a, b) ->
+    (match free_name names c with
+     | Err m -> Err m
+     | Ok () -> match free_name names a with Err m -> Err m | Ok () -> free_name names b)
+  | Try (body, x, handler) ->
+    (match free_name names body with Err m -> Err m | Ok () -> free_name (x :: names) handler)
+  | Let (recursive, name, bound, body) ->
+    let inner = if recursive then name :: names else names in
+    (match free_name inner bound with
+     | Err m -> Err m
+     | Ok () -> free_name (name :: names) body)
+
+let session_names () =
+  let rec go env acc = match env with
+    | [] -> acc
+    | (n, _) :: rest -> go rest (n :: acc) in
+  go !session []
+
+(* "ms" is the one name the evaluator answers for without a binding *)
+let scope_check e = free_name ("ms" :: session_names ()) e
+
 let evaluate_line () =
   if !line_len > 0 then begin
     match tokenize () with
@@ -689,6 +729,17 @@ let evaluate_line () =
       | Err m -> puts "error: "; puts m; newline ()
       | Ok (_, _ :: _) -> puts "error: unexpected input at the end"; newline ()
       | Ok (e, []) ->
+        match scope_check e with
+        | Err x ->
+          puts "error: unbound "; puts x;
+          (* the usual cause: a function that calls itself, written without
+             rec, which binds nothing for its own body *)
+          (match e with
+           | Let (false, name, _, _) when string_equal name x ->
+             puts " (did you mean \"let rec\"?)"
+           | _ -> ());
+          newline ()
+        | Ok () ->
         let t0 = now () in
         match eval !session e with
         | Err m -> puts "error: "; puts m; newline ()
