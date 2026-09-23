@@ -411,8 +411,12 @@ module ethmin_vm_core #(
 	// One trap_ready per request; a request is not acted on again until
 	// trap_valid has dropped (the VM drops it on seeing trap_ready).
 	localparam [7:0] TRAP_IO_READ = 8'h01, TRAP_IO_WRITE = 8'h02;
+	// The floating-point peripheral: an operand at a time, then the
+	// operation, then the upper half of the answer.
+	localparam [7:0] TRAP_FP_A = 8'h10, TRAP_FP_B = 8'h11,
+	                 TRAP_FP_EXEC = 8'h12, TRAP_FP_HI = 8'h13;
 	localparam [2:0] IO_IDLE = 3'd0, IO_PKT_READ = 3'd1, IO_UART = 3'd2, IO_DONE = 3'd3,
-	                 IO_STAGE_READ = 3'd4;
+	                 IO_STAGE_READ = 3'd4, IO_FP_WAIT = 3'd5;
 	reg [2:0] io_state;
 	reg [1:0] io_lane;
 	reg [7:0] leds;
@@ -428,6 +432,22 @@ module ethmin_vm_core #(
 		btn_sync[0] <= BTN;
 		btn_sync[1] <= btn_sync[0];
 	end
+
+	// ─── the floating-point peripheral ───────────────────────────────────
+	reg  [63:0] fp_a, fp_b, fp_res;
+	reg         fp_start;
+	reg  [3:0]  fp_op;
+	wire        fp_done, fp_flag;
+	wire [63:0] fp_result;
+	fpu_hardfloat fpu (
+		.clk(clk_sys), .resetn(resetn && !vm_reset),
+		.start(fp_start), .op(fp_op), .a(fp_a), .b(fp_b),
+		.done(fp_done), .result(fp_result), .flag(fp_flag));
+
+	wire fp_is_cmp = (fp_op == 4'd5) || (fp_op == 4'd6) || (fp_op == 4'd7);
+	wire fp_trap = (trap_prim == TRAP_FP_A) || (trap_prim == TRAP_FP_B) ||
+	               (trap_prim == TRAP_FP_EXEC) || (trap_prim == TRAP_FP_HI);
+	wire fp_new  = trap_valid && fp_trap && io_state == IO_IDLE && !vm_reset;
 
 	wire io_read  = trap_prim == TRAP_IO_READ;
 	wire io_write = trap_prim == TRAP_IO_WRITE;
@@ -462,6 +482,7 @@ module ethmin_vm_core #(
 
 	always @(posedge clk_sys) begin
 		trap_ready <= 1'b0;
+		fp_start   <= 1'b0;
 		rx_ack     <= 1'b0;
 		tx_start   <= 1'b0;
 		boot_req   <= 1'b0;
@@ -473,7 +494,18 @@ module ethmin_vm_core #(
 				tx_len <= 11'd0;
 			end
 		end else case (io_state)
-			IO_IDLE: if (io_new) begin
+			IO_IDLE: if (fp_new) begin
+				case (trap_prim)
+					TRAP_FP_A: begin fp_a <= {trap_arg1, trap_arg0}; trap_ready <= 1'b1; io_state <= IO_DONE; end
+					TRAP_FP_B: begin fp_b <= {trap_arg1, trap_arg0}; trap_ready <= 1'b1; io_state <= IO_DONE; end
+					TRAP_FP_HI: begin trap_result <= fp_res[63:32];  trap_ready <= 1'b1; io_state <= IO_DONE; end
+					default: begin                 // TRAP_FP_EXEC
+						fp_op    <= trap_arg0[3:0];
+						fp_start <= 1'b1;
+						io_state <= IO_FP_WAIT;
+					end
+				endcase
+			end else if (io_new) begin
 				io_lane <= io_addr[1:0];
 				if (io_is_packet || io_is_stage) begin
 					if (io_read) io_state <= io_is_packet ? IO_PKT_READ : IO_STAGE_READ;  // BRAM data next cycle
@@ -515,6 +547,14 @@ module ethmin_vm_core #(
 			IO_UART: if (!uf_full) begin                         // the FIFO took the byte
 				trap_ready <= 1'b1;
 				io_state   <= IO_DONE;
+			end
+			IO_FP_WAIT: if (fp_done) begin
+				fp_res      <= fp_result;
+				// a comparison answers with its bit; everything else with
+				// the lower half, the upper half fetched after it
+				trap_result <= fp_is_cmp ? {31'd0, fp_flag} : fp_result[31:0];
+				trap_ready  <= 1'b1;
+				io_state    <= IO_DONE;
 			end
 			IO_DONE: if (!trap_valid) io_state <= IO_IDLE;
 			default: io_state <= IO_IDLE;

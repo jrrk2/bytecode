@@ -90,7 +90,28 @@ let rec place (v : Obj.t) : int =
           !words.(first + i) <- f
         done;
         idx lsl 2
-      end else failwith (Printf.sprintf "unsupported constant with tag %d (floats etc.)" tag)
+      end else if tag = Obj.double_tag then begin
+        (* A double is one word on this host and two on the processor, so it
+           is written out as its bits, low half first: the box the hardware
+           reads is field 0 = low, field 1 = high. *)
+        let bits = Int64.bits_of_float (Obj.magic v : float) in
+        let idx = emit (header 2 tag) in
+        placed := (v, idx) :: !placed;
+        ignore (emit (Int64.to_int (Int64.logand bits 0xFFFFFFFFL)));
+        ignore (emit (Int64.to_int (Int64.logand (Int64.shift_right_logical bits 32) 0xFFFFFFFFL)));
+        idx lsl 2
+      end else if tag = Obj.double_array_tag then begin
+        let a : float array = Obj.magic v in
+        let n = Array.length a in
+        let idx = emit (header (2 * n) tag) in
+        placed := (v, idx) :: !placed;
+        Array.iter (fun x ->
+            let bits = Int64.bits_of_float x in
+            ignore (emit (Int64.to_int (Int64.logand bits 0xFFFFFFFFL)));
+            ignore (emit (Int64.to_int (Int64.logand (Int64.shift_right_logical bits 32) 0xFFFFFFFFL))))
+          a;
+        idx lsl 2
+      end else failwith (Printf.sprintf "unsupported constant with tag %d" tag)
 
 let write_hex path arr n =
   let oc = open_out path in

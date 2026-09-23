@@ -15,6 +15,10 @@ file mkdir out
 foreach f {program.hex heap.hex globals.hex} { file copy -force $here/$f . }
 
 read_verilog -sv $repo/ocaml4142_vm_rtl.sv
+# The floating-point peripheral: Berkeley HardFloat's cores, the IEEE
+# boundary, and the wrapper the trap port talks to (fpga/fpu-rtl).
+set fpu $repo/fpga/fpu-rtl
+read_verilog [list $fpu/fpu_hardfloat.v $fpu/recode64.v $fpu/hardfloat.v]
 read_verilog [list $here/program_bram.v $here/ethmin_vm_core.v $here/vc707_ethmin_vm.v $eth/simpleuart.v $eth/liteeth_sgmii_phy.v]
 read_verilog -sv [list $eth/eth_mac_1g.sv $eth/axis_gmii_rx.sv $eth/axis_gmii_tx.sv $eth/rgmii_lfsr.sv \
     $eth/eth_lutram_fifo.sv $eth/eth_stream_dma.sv $eth/eth_gmii_retime256.sv $eth/eth_pkt_buf256.sv \

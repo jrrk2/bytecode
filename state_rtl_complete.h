@@ -151,6 +151,15 @@
     S_RAISE_READ,
     S_RAISE_FRAME,
     S_ZERO_DIVIDE,
+    // floating point: the operands out of their boxes, through the FPU
+    // peripheral on the trap port, and the answer back into a fresh box
+    S_FP_READ_A,
+    S_FP_READ_B,
+    S_FP_SEND_A,
+    S_FP_SEND_B,
+    S_FP_EXEC,
+    S_FP_HI,
+    S_FP_BOX,
     // obsolete states
     S_OFFSETCLOSURE_READ,
     S_OFFSETCLOSURE_ADD,

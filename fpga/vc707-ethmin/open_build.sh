@@ -55,7 +55,9 @@ build_id="32'h$(printf '%x' $(( (1 << 29) | (dirty << 28) | 0x$commit )))"
 YOSYS_DEFS="${YOSYS_DEFS:-} -DBUILD_ID=$build_id"
 echo "== build id $build_id (commit $commit, dirty $dirty, open flow)"
 
+FPU=$REPO/fpga/fpu-rtl
 SRCS="vm_sv2v.v program_bram.v ethmin_vm_core.v vc707_ethmin_vm.v \
+  $FPU/fpu_hardfloat.v $FPU/recode64.v $FPU/hardfloat.v \
   $ETH/simpleuart.v $ETH/liteeth_sgmii_phy.v $ETH/eth_mac_1g.sv \
   $ETH/axis_gmii_rx.sv $ETH/axis_gmii_tx.sv $ETH/rgmii_lfsr.sv \
   $ETH/eth_lutram_fifo.sv $ETH/eth_stream_dma.sv $ETH/eth_gmii_retime256.sv \

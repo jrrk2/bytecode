@@ -1,4 +1,6 @@
 #include "Vocaml4142_vm_rtl.h"
+#include <cmath>
+#include <cstring>
 #include "verilated.h"
 #include "verilated_vcd_c.h"
 typedef enum
@@ -207,10 +209,55 @@ int main(int argc, char** argv) {
         // the ethmin device model: one ready per request, not again until
         // trap_valid has dropped.
         static bool trap_answered = false;
+        // The floating-point peripheral of fpga/fpu-rtl, in the host's own
+        // doubles: the hardware is proved against these in
+        // fpga/fpu-rtl/test, so the model and the silicon agree by
+        // construction rather than by hope.
+        static uint64_t fp_a = 0, fp_b = 0, fp_res = 0;
+        static bool fp_flag = false;
         top->trap_ready = 0;
-        if (top->trap_valid && !trap_answered && (top->trap_prim == 1 || top->trap_prim == 2)) {
+        if (top->trap_valid && !trap_answered &&
+            (top->trap_prim == 1 || top->trap_prim == 2)) {
             if (top->trap_prim == 1) top->trap_result = ethmodel_read((int32_t)top->trap_arg0);
             else ethmodel_write((int32_t)top->trap_arg0, (int32_t)top->trap_arg1);
+            top->trap_ready = 1;
+            trap_answered = true;
+        } else if (top->trap_valid && !trap_answered &&
+                   top->trap_prim >= 0x10 && top->trap_prim <= 0x13) {
+            uint64_t pair = ((uint64_t)(uint32_t)top->trap_arg1 << 32) | (uint32_t)top->trap_arg0;
+            auto as_double = [](uint64_t u) { double d; memcpy(&d, &u, 8); return d; };
+            auto as_bits = [](double d) { uint64_t u; memcpy(&u, &d, 8); return u; };
+            switch (top->trap_prim) {
+                case 0x10: fp_a = pair; break;
+                case 0x11: fp_b = pair; break;
+                case 0x13: top->trap_result = (uint32_t)(fp_res >> 32); break;
+                default: {                       // 0x12: do it
+                    double a = as_double(fp_a), b = as_double(fp_b);
+                    switch (top->trap_arg0 & 0xF) {
+                        case 0:  fp_res = as_bits(a + b); break;
+                        case 1:  fp_res = as_bits(a - b); break;
+                        case 2:  fp_res = as_bits(a * b); break;
+                        case 3:  fp_res = as_bits(a / b); break;
+                        case 4:  fp_res = as_bits(sqrt(a)); break;
+                        case 5:  fp_flag = (a < b); break;
+                        case 6:  fp_flag = (a <= b); break;
+                        case 7:  fp_flag = (a == b); break;
+                        case 8:  fp_res = fp_a ^ (1ULL << 63); break;
+                        case 9:  fp_res = fp_a & ~(1ULL << 63); break;
+                        case 10: fp_res = as_bits((double)(int32_t)(uint32_t)fp_a); break;
+                        default: {               // 11: toward zero, as OCaml's own cast
+                            double d = as_double(fp_a);
+                            fp_res = (d >= -2147483648.0 && d <= 2147483647.0)
+                                       ? (uint32_t)(int32_t)d : 0;
+                            break;
+                        }
+                    }
+                    int op = top->trap_arg0 & 0xF;
+                    top->trap_result = (op >= 5 && op <= 7) ? (uint32_t)fp_flag
+                                                            : (uint32_t)(fp_res & 0xffffffffu);
+                    break;
+                }
+            }
             top->trap_ready = 1;
             trap_answered = true;
         } else if (!top->trap_valid) trap_answered = false;
