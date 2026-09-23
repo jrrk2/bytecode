@@ -180,7 +180,9 @@ let () =
          typ "1 :: [true]\r" >>= fun () ->
          typ "map\r" >>= fun () ->
          typ "len [1; 2] + len [true]\r" >>= fun () ->
-         typ "match Some 1 with None -> 0\r"
+         typ "match Some 1 with None -> 0\r" >>= fun () ->
+         typ "let rec stack n = if n > 0 then n :: stack (n-1) else []\r" >>= fun () ->
+         typ "stack 300\r"
        else if Array.length Sys.argv > 1 && Sys.argv.(1) = "big" then
          (* one long line: a paste into the session, so the frames are full *)
          typ ("echo " ^ String.make 400 'x' ^ "\r") >>= fun () ->

@@ -1855,7 +1855,7 @@ let seq_eq (a : int array) (b : int array) =
 (* ---- TCP ---- *)
 let tcp_port = 23
 let mss = 536                      (* what we send; the peer's MSS is not needed *)
-let out_max = 1024                 (* unsent + unacknowledged output *)
+let out_max = 8192                 (* unsent + unacknowledged output *)
 let win = 1024                     (* what we advertise: one RX window's worth *)
 
 type tstate = Closed | SynRcvd | Estab | LastAck
@@ -1883,11 +1883,23 @@ let close_after = ref false        (* the application asked to hang up *)
 
 let out_room () = out_max - !out_len
 
-let out_char c =
+(* The last bytes are kept back so that a value which did not fit can say
+   so: printing stops at out_limit, and the notice goes in above it. *)
+let out_limit = out_max - 24
+let out_over = ref false
+
+let out_raw c =
   if !out_len < out_max then begin
     bytes_set out !out_len c;
     out_len := !out_len + 1
   end
+
+(* The buffer holds what is unsent and unacknowledged together, so a value
+   larger than it cannot be handed over in one go.  What will not fit is
+   still dropped -- emptying it here means running the receive path from
+   inside the one already reading a packet, which is its own trouble -- but
+   the reader is told, rather than the value simply stopping mid-character. *)
+let out_char c = if !out_len < out_limit then out_raw c else out_over := true
 
 let out_string s = for i = 0 to string_length s - 1 do out_char (string_get s i) done
 
@@ -1978,8 +1990,14 @@ let banner () =
    this connection's buffer (to_tcp), then a prompt. *)
 let run_line () =
   to_tcp := true;
+  out_over := false;
   evaluate_line ();
   line_len := 0;
+  if !out_over then begin
+    let m = "\r\n  ... (truncated)" in
+    for i = 0 to string_length m - 1 do out_raw (string_get m i) done;
+    out_over := false
+  end;
   prompt ();
   to_tcp := false
 
@@ -2332,6 +2350,8 @@ let poll () =
     io_write leds ((if bound () then 2 else 0) lor ((!packets land 0x3F) lsl 2))
   end
 
+(* Emptying the output buffer: send what is queued and take the
+   acknowledgements, until there is room or the connection has gone. *)
 let build_id = 0x100a
 
 (* "24d6527 open": the commit this bitstream was built from (with a + if the
