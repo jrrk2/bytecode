@@ -1564,7 +1564,10 @@ let rec eval env e = match e with
           else Ok (VBuiltin (name, arity, got2)))
      | Ok _ -> Err "not a function")
   | Try (body, name, handler) ->
-    (match eval env body with
+    (match (try eval env body with
+            | Stack_overflow -> Err "stack overflow"
+            | Out_of_memory -> Err "out of memory"
+            | Invalid_argument _ -> Err "index out of bounds") with
      | Ok v -> Ok v
      | Err m ->
        (* the handler sees the message as a string value if it asked for a
@@ -1795,7 +1798,15 @@ let evaluate_line () =
           newline ()
         | Ok (bound_name, sc, ty) ->
         let t0 = now () in
-        match eval !session e with
+        (* Stack_overflow and Invalid_argument come from the hardware --
+           a recursion deeper than the stack, an index outside an array or
+           a string -- and reach here as exceptions rather than as Err.
+           Uncaught they would halt the processor and take the session
+           with them. *)
+        match (try eval !session e with
+               | Stack_overflow -> Err "stack overflow"
+               | Out_of_memory -> Err "out of memory"
+               | Invalid_argument _ -> Err "index out of bounds") with
         | Err m -> puts "error: "; puts m; newline ()
         | Ok v ->
           let elapsed = now () - t0 in

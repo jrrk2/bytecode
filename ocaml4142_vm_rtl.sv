@@ -424,6 +424,7 @@ module ocaml4142_vm_rtl #(
   // Stack_overflow the ninth.
   localparam int ZERO_DIVIDE_EXN = 5;
   localparam int STACK_OVERFLOW_EXN = 8;
+  localparam int OUT_OF_MEMORY_EXN = 0;
   // The stack grows down from the top of stack_mem and nothing stopped it
   // reaching zero, where it wrapped and quietly took the machine with it.
   // The check is made once per instruction, so the margin has to cover
@@ -2689,9 +2690,7 @@ module ocaml4142_vm_rtl #(
             $display("GC: out of memory (%0d words live, %0d needed, semi-space %0d)",
                      gc_free - to_lo, gc_need, gc_semi);
             `endif
-            trap_valid <= 1'b1;
-            trap_prim <= 8'hF1;
-            state <= S_TRAP_WAIT;
+            state <= S_OUT_OF_MEMORY;
           end else state <= S_EXEC;  // run the allocating instruction again
         end
 
@@ -3305,6 +3304,23 @@ module ocaml4142_vm_rtl #(
           temp_heap_addr <= Heap_index_of_ptr(temp_base_ptr) + 1 + temp_index[HEAP_AW+1:2];
           str_byte       <= temp_index[1:0];
           state          <= bound_next;
+        end
+
+        // The collection freed too little to carry on.  This used to raise
+        // trap 0xF1 and wait for the machine around it to answer, but
+        // nothing ever did -- ethmin_vm_core answers the I/O and
+        // floating-point traps and no others -- so the VM stopped there for
+        // good, which is what a program that outgrew the heap looked like
+        // from outside.  Raise Out_of_memory instead: it takes no
+        // allocation, it unwinds to the innermost handler, and dropping
+        // everything between is what lets the next collection succeed.
+        S_OUT_OF_MEMORY:
+        if (!rd_phase) begin
+          globals_read_a(OUT_OF_MEMORY_EXN[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          accu  <= gm_rd_a;
+          state <= S_RAISE_ENTER;
         end
 
         S_RAISE_ENTER: begin
