@@ -9,6 +9,8 @@ module vc707_ethmin_vm (
 	input  wire       IO_CLK_N,
 	input  wire       IO_RST,          // CPU_RESET, active high
 	output wire [7:0] LED,
+	input  wire [7:0] GPIO_DIP_SW,   // SW11: the image server's host number
+	input  wire [4:0] GPIO_SW,       // the push buttons: hold one to log frames
 	input  wire       UART_RX,
 	output wire       UART_TX,
 
@@ -39,7 +41,20 @@ module vc707_ethmin_vm (
 	localparam integer MAC_DIV = `MAC_DIV;
 
 	wire clk_sys, clk_mac, rst_sys_n, locked;
-	clkgen_vc707 #(.MAC_DIV(MAC_DIV)) clkgen (
+	// clk_sys = 1 GHz VCO / SYS_DIV: 10 -> 100 MHz, 13.375 -> 74.77, 20 -> 50.
+	// CLK_HZ must match it: the UART divider and the millisecond timer are
+	// derived from it.  Both are overridable so a flow that cannot close
+	// 100 MHz can build the same design slower (the open flow, at present).
+`ifndef SYS_DIV
+`define SYS_DIV 10.000
+`endif
+`ifndef BUILD_ID
+`define BUILD_ID 32'd0
+`endif
+`ifndef CLK_HZ
+`define CLK_HZ 100_000_000
+`endif
+	clkgen_vc707 #(.MAC_DIV(MAC_DIV), .SYS_DIV(`SYS_DIV)) clkgen (
 		.IO_CLK_P(IO_CLK_P), .IO_CLK_N(IO_CLK_N), .IO_RST_N(~IO_RST),
 		.clk_sys(clk_sys), .clk_mac(clk_mac),
 		.rst_sys_n(rst_sys_n), .locked(locked));
@@ -89,7 +104,7 @@ module vc707_ethmin_vm (
 	// ─── VM + DMA + registers (ethmin_vm_core.v) ─────────────────────────
 	ethmin_vm_core #(
 		.RX_WORD_BASE(RX_WORD_BASE), .TX_WORD_BASE(TX_WORD_BASE),
-		.WINDOW_WORDS(WINDOW_WORDS)
+		.WINDOW_WORDS(WINDOW_WORDS), .CLK_HZ(`CLK_HZ), .BUILD_ID(`BUILD_ID)
 	) core (
 		.clk_sys(clk_sys), .resetn(resetn),
 		// clk_mac DIRECTLY, not the eth_clk that comes back out of sgmii_soc.
@@ -112,6 +127,6 @@ module vc707_ethmin_vm (
 		.tx_axis_tlast(tx_tlast), .tx_axis_tready(tx_tready),
 		.tx_axis_tuser(tx_tuser),
 		.pcspma_status(pcspma_status),
-		.LED(LED), .UART_RX(UART_RX), .UART_TX(UART_TX));
+		.LED(LED), .DIP(GPIO_DIP_SW), .BTN(GPIO_SW), .UART_RX(UART_RX), .UART_TX(UART_TX));
 endmodule
 `default_nettype wire

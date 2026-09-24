@@ -7,7 +7,7 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 PROJ=$REPO/fpga/vc707-ethmin
-ETH=${XC7BT:-$HOME/xc7-bitstream-tools}/examples/vc707-ethmin/rtl
+ETH=$REPO/fpga/eth-rtl
 OBJ=${OBJ:-$HOME/bytecode-work/vc707-netboot-sim-obj}
 PAYLOAD=$(realpath -m "${1:-$REPO/hellofor.ml}")
 WORK=${WORK:-$HOME/bytecode-work/netboot}

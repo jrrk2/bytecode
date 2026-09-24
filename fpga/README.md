@@ -30,7 +30,7 @@ code (`program.hex`) and its constants (`heap.hex`, `globals.hex`, from
 `tools/bc2image`).  Intermediate files go to `$GEN` (default
 `~/bytecode-work/vc707-gen`) because apio compiles every `.v`/`.sv` under the
 project.  The UART is picosoc's `simpleuart.v` (ISC licence, header kept),
-from xc7-bitstream-tools' `examples/vc707-ethmin`.
+kept in `eth-rtl/` with the rest of the borrowed RTL.
 
 - `vc707-sim/run.sh`: Verilator simulation of the whole harness with
   pass-through stand-ins for the clocking primitives, decoding the UART.
@@ -52,9 +52,11 @@ RAMB36 pairs, which is why the harness sets `STACK_AW`/`HEAP_AW` to 15.
 
 # Ethernet: `vc707-ethmin/`
 
-The VC707 ethmin design from xc7-bitstream-tools (clocking, LiteEth's SGMII
-PCS/PMA on the GTX, the 1G MAC and the DMA, all used in place, no Xilinx IP)
-with the VM in place of picorv32.  `ethmin_vm_core.v` holds the VM, a packet
+The VC707 ethmin design (clocking, LiteEth's SGMII PCS/PMA on the GTX, the
+1G MAC and the DMA, no Xilinx IP) with the VM in place of picorv32.  Those
+parts are in `eth-rtl/`, copied from xc7-bitstream-tools so this repository
+builds on its own; see `eth-rtl/README.md` for each file's origin.  Only the
+open flow's tools stay external.  `ethmin_vm_core.v` holds the VM, a packet
 RAM shared with the DMA, a staging RAM, the program code RAM and the boot
 sequencer, and answers the VM's `vm_io_read`/`vm_io_write` with this I/O
 space (the one `ethmodel.c` simulates):
@@ -105,6 +107,13 @@ The core's memories are much smaller than the regression's defaults (heap
 address space, so the garbage collector runs in a corner the default model
 never reaches.  `HEAP_AW=14 tools/regress.sh heap14` runs the whole regression
 there.
+
+`open_build.sh` builds the same design with the open flow (sv2v, yosys,
+openXC7's nextpnr, prjxray) using `vc707_ethmin_vm_open.xdc`, whose
+hand-placed clocking that flow needs.  It produces a bitstream; on the board
+the frames come out corrupt, from three 0.05 ns hold violations on the packet
+RAM that `-o hold-fix` does not yet repair.  Vivado's build is the one to
+flash.
 
 Simulation: `vc707-ethmin-sim/run.sh` runs the core with ethmin on canned
 frames; `vc707-ethmin-sim/run_netboot.sh [prog.ml]` runs the loader against

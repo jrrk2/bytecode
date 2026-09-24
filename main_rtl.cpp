@@ -1,4 +1,6 @@
 #include "Vocaml4142_vm_rtl.h"
+#include <cmath>
+#include <cstring>
 #include "verilated.h"
 #include "verilated_vcd_c.h"
 typedef enum
@@ -12,6 +14,9 @@ typedef enum
 // Bytecode ROM (owned by C++)
 // ------------------------------------------------------------
 uint32_t code_rom[1 << 20];
+// A write into the code window invalidates the one-deep prefetch, as
+// ethmin_vm_core does with code_q_valid.
+static bool code_dirty = false;
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,6 +200,10 @@ int main(int argc, char** argv) {
     uint32_t addr, op1, cnt, oldpc, vitems, cycle, accu, spaddr, items, oldcycle = 0;
     int matching = 1;
     int windup = 10;
+    // With +notrace there is nothing to diverge from: a program that writes
+    // its own code has no reference run to be compared with, because the
+    // reference cannot execute what it generates.
+    const bool notrace = Verilated::commandArgsPlusMatch("notrace")[0] != 0;
     printf("Program length %d\n", prog_length);
 
     while (windup && !Verilated::gotFinish()) {
@@ -207,15 +216,85 @@ int main(int argc, char** argv) {
         // the ethmin device model: one ready per request, not again until
         // trap_valid has dropped.
         static bool trap_answered = false;
+        // The floating-point peripheral of fpga/fpu-rtl, in the host's own
+        // doubles: the hardware is proved against these in
+        // fpga/fpu-rtl/test, so the model and the silicon agree by
+        // construction rather than by hope.
+        static uint64_t fp_a = 0, fp_b = 0, fp_res = 0;
+        static bool fp_flag = false;
         top->trap_ready = 0;
-        if (top->trap_valid && !trap_answered && (top->trap_prim == 1 || top->trap_prim == 2)) {
-            if (top->trap_prim == 1) top->trap_result = ethmodel_read((int32_t)top->trap_arg0);
-            else ethmodel_write((int32_t)top->trap_arg0, (int32_t)top->trap_arg1);
+        if (top->trap_valid && !trap_answered &&
+            (top->trap_prim == 1 || top->trap_prim == 2)) {
+            uint32_t a = (uint32_t)top->trap_arg0;
+            if (a >= 0x60000 && a < 0x80000) {
+                // Code memory while the program runs, a byte per address:
+                // fpga/vc707-ethmin/ethmin_vm_core.v decodes 0x60000..0x7FFFF
+                // this way, and modelling it here is what lets a compiler
+                // that writes its own code be simulated at all.
+                uint32_t w = (a - 0x60000) >> 2, lane = a & 3;
+                if (top->trap_prim == 2) {
+                    code_rom[w] = (code_rom[w] & ~(0xFFu << (8 * lane)))
+                                | (((uint32_t)top->trap_arg1 & 0xFF) << (8 * lane));
+                    code_dirty = true;
+                } else {
+                    top->trap_result = (code_rom[w] >> (8 * lane)) & 0xFF;
+                }
+            } else if (a == 0x100c) {
+                // prog_words: the model fetches from the whole array, so the
+                // bound the hardware keeps has nothing to do here
+            } else if (top->trap_prim == 1) top->trap_result = ethmodel_read((int32_t)a);
+            else ethmodel_write((int32_t)a, (int32_t)top->trap_arg1);
+            top->trap_ready = 1;
+            trap_answered = true;
+        } else if (top->trap_valid && !trap_answered &&
+                   top->trap_prim >= 0x10 && top->trap_prim <= 0x13) {
+            uint64_t pair = ((uint64_t)(uint32_t)top->trap_arg1 << 32) | (uint32_t)top->trap_arg0;
+            auto as_double = [](uint64_t u) { double d; memcpy(&d, &u, 8); return d; };
+            auto as_bits = [](double d) { uint64_t u; memcpy(&u, &d, 8); return u; };
+            switch (top->trap_prim) {
+                case 0x10: fp_a = pair; break;
+                case 0x11: fp_b = pair; break;
+                case 0x13: top->trap_result = (uint32_t)(fp_res >> 32); break;
+                default: {                       // 0x12: do it
+                    double a = as_double(fp_a), b = as_double(fp_b);
+                    switch (top->trap_arg0 & 0xF) {
+                        case 0:  fp_res = as_bits(a + b); break;
+                        case 1:  fp_res = as_bits(a - b); break;
+                        case 2:  fp_res = as_bits(a * b); break;
+                        case 3:  fp_res = as_bits(a / b); break;
+                        case 4:  fp_res = as_bits(sqrt(a)); break;
+                        case 5:  fp_flag = (a < b); break;
+                        case 6:  fp_flag = (a <= b); break;
+                        case 7:  fp_flag = (a == b); break;
+                        case 8:  fp_res = fp_a ^ (1ULL << 63); break;
+                        case 9:  fp_res = fp_a & ~(1ULL << 63); break;
+                        case 10: fp_res = as_bits((double)(int32_t)(uint32_t)fp_a); break;
+                        default: {               // 11: toward zero, as OCaml's own cast
+                            double d = as_double(fp_a);
+                            fp_res = (d >= -2147483648.0 && d <= 2147483647.0)
+                                       ? (uint32_t)(int32_t)d : 0;
+                            break;
+                        }
+                    }
+                    int op = top->trap_arg0 & 0xF;
+                    top->trap_result = (op >= 5 && op <= 7) ? (uint32_t)fp_flag
+                                                            : (uint32_t)(fp_res & 0xffffffffu);
+                    break;
+                }
+            }
             top->trap_ready = 1;
             trap_answered = true;
         } else if (!top->trap_valid) trap_answered = false;
-        // Provide instruction byte
-        top->code_rdata = top->pc < sizeof(code_rom)/sizeof(*code_rom) ? code_rom[top->pc] : 0xDEADBEEF;
+        // The fetch unit, as in fpga/vc707-ethmin/ethmin_vm_core.v: the code
+        // memory is read synchronously (block RAM), the word read is kept
+        // with the pc it came from, and the next one is prefetched while the
+        // VM uses this one, so straight-line code costs no extra cycle.
+        static uint32_t code_q = 0xDEADBEEF, code_q_pc = 0xFFFFFFFF;
+        if (code_dirty) { code_q_pc = 0xFFFFFFFF; code_dirty = false; }
+        bool code_valid = code_q_pc == top->pc;
+        top->code_rdata = code_q;
+        top->code_valid = code_valid;
+        uint32_t fetch_pc = code_valid ? top->pc + 1 : top->pc;
         // Clock tick
         top->clk = 0;
         top->eval();
@@ -225,8 +304,10 @@ int main(int argc, char** argv) {
 	switch(top->state_out)
 	  {
 	  case S_FETCH:
+	    if (!code_valid) break;   // waiting for the fetch unit
 	    oldpc = top->pc;
 	    op = opname(top->code_rdata);
+	    if (notrace) { printf("Fetch PC=%d %s\n", top->pc, op); break; }
 	    printf("Fetch PC=%d ROM = 0x%x, instruction = %s, SP=@%d\n", top->pc, top->code_rdata, op, vitems);
 	    cnt = 0;
 	    do {
@@ -300,6 +381,8 @@ int main(int argc, char** argv) {
 	
         top->clk = 1;
         top->eval();
+        code_q = fetch_pc < sizeof(code_rom)/sizeof(*code_rom) ? code_rom[fetch_pc] : 0xDEADBEEF;
+        code_q_pc = fetch_pc;
 
         if (top->halted) {
             std::cout << "HALT\n";
@@ -315,7 +398,7 @@ int main(int argc, char** argv) {
             break;
         }
 
-	windup -= !matching;
+	windup -= (!matching && !notrace);
     }
 
     if (tfp) { tfp->close(); delete tfp; }

@@ -31,11 +31,18 @@ case "$PROG" in
   BC=$PROG ;;
 esac
 
+# An unimplemented primitive is silent until the board runs it, so check the
+# image against the RTL's C_CALL arms before anything is built from it.
+python3 "$REPO/tools/check_prims.py" "$BC" "$REPO/ocaml4142_vm_rtl.sv" | tail -1
+
 python3 "$REPO/tools/bc2hex.py" "$BC" "$OUT/program.hex" > /dev/null
 [ "$GEN/bc2image" -nt "$REPO/tools/bc2image.ml" ] ||
   (cd "$GEN" && "$OCAMLC" -o bc2image "$REPO/tools/bc2image.ml")
 "$GEN/bc2image" "$BC" "$OUT" > /dev/null
 words=$(wc -l < "$OUT/program.hex")
+# ...and the same code as explicit x1 block RAMs, which is what the design
+# instantiates: inference picks x9, and the open flow gets x9 wrong.
+python3 "$REPO/tools/gen_rom_bram.py" "$OUT/program.hex" "$OUT/program_bram.v" code_rom_bram > /dev/null
 heap_words=$(awk '/heap_words/{print $2}' "$OUT/image.txt")
 globals_words=$(awk '/^globals/{print $2}' "$OUT/image.txt")
 rm "$OUT/image.txt"

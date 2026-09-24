@@ -19,8 +19,13 @@ module ocaml4142_vm_rtl #(
     input logic reset,
 
 
+    // Instruction fetch: the code memory may take a cycle (block RAM), so
+    // code_rdata counts only while code_valid is high, and the states that
+    // read it wait in place until it is.  A fetch unit that answers
+    // combinationally ties code_valid high.
     output logic [PCW-1:0] pc,
     input  logic [   31:0] code_rdata,
+    input  logic           code_valid,
 
 
     output logic                trap_valid,
@@ -335,6 +340,9 @@ module ocaml4142_vm_rtl #(
   logic gc_copy_valid, gc_mark_second;
   logic [STACK_AW:0] gc_i;
   logic [31:0] gc_need, alloc_need;
+  // MULINT's pipeline: operands, then product (see the MULINT arm)
+  logic signed [VALUEW-1:0] mul_a, mul_b;
+  logic signed [2*VALUEW-1:0] mul_p;
   logic [2:0] gc_phase;
   localparam logic [2:0] GC_ACCU = 0, GC_ENV = 1, GC_STACK = 2, GC_GLOBALS = 3, GC_SCAN = 4;
   logic gc_return_to_scan;  // where S_GC_FWD's result goes
@@ -384,6 +392,19 @@ module ocaml4142_vm_rtl #(
   endfunction
 
 
+  // "index out of bounds", the message OCaml's caml_array_bound_error
+  // raises, packed little-endian with the padding byte OCaml's strings end
+  // with: 19 characters in five words, so the last byte is zero.
+  function automatic logic [31:0] bound_msg_word(input logic [2:0] i);
+    unique case (i)
+      3'd0: bound_msg_word = 32'h65646E69;    // "inde"
+      3'd1: bound_msg_word = 32'h756F2078;    // "x ou"
+      3'd2: bound_msg_word = 32'h666F2074;    // "t of"
+      3'd3: bound_msg_word = 32'h756F6220;    // " bou"
+      default: bound_msg_word = 32'h0073646E; // "nds" and the padding
+    endcase
+  endfunction
+
   function automatic logic [VALUEW-1:0] Make_header(input int wosize, input int tag);
     logic [ 7:0] tag8 = tag;
     logic [15:0] wosize16 = wosize;
@@ -398,11 +419,34 @@ module ocaml4142_vm_rtl #(
 
   localparam int TAG_CLOSURE = 247;
 
+  // The predefined exceptions live in the global data at the indices
+  // runtime/caml/fail.h fixes; Division_by_zero is the sixth and
+  // Stack_overflow the ninth.
+  localparam int ZERO_DIVIDE_EXN = 5;
+  localparam int STACK_OVERFLOW_EXN = 8;
+  localparam int OUT_OF_MEMORY_EXN = 0;
+  // The stack grows down from the top of stack_mem and nothing stopped it
+  // reaching zero, where it wrapped and quietly took the machine with it.
+  // The check is made once per instruction, so the margin has to cover
+  // everything a single one can push before the next fetch looks again.
+  localparam int STACK_MARGIN = 256;
+  // Invalid_argument carries a string, so unlike Division_by_zero it cannot
+  // simply be read out of the globals.  The value is built once coming out
+  // of reset and parked in a slot above the ones the image loads, where the
+  // collector's root scan finds it and forwards it like any other root.
+  localparam int INVALID_EXN = 3;
+  localparam int BOUND_EXN_SLOT = (1 << GLOBALS_AW) - 1;
+  localparam int BOUND_MSG_WORDS = 5;   // "index out of bounds", padded
+
 
 
 
   logic [VALUEW-1:0] env;
   logic [       7:0] extra_args;
+
+  // caml_fresh_oo_id's counter: every exception constructor and every class
+  // takes one at startup, and all that matters is that they differ.
+  logic [VALUEW-1:0] oo_id;
 
 
 
@@ -458,17 +502,50 @@ module ocaml4142_vm_rtl #(
   logic [VALUEW-1:0] temp_index;
   logic [VALUEW-1:0] temp_array_ptr;
   logic [VALUEW-1:0] temp_base_ptr;
+  state_t bound_next;   // the access to make once its index has been checked
   logic [VALUEW-1:0] temp_return_pc, temp_return_env;
   logic [7:0] temp_extra_args;
 
 
   logic [7:0] op_cycle_count;
 
+  // Every float primitive starts the same way: say which operation, whether
+  // it takes one operand or two, where the first one comes from, and what
+  // shape the answer is.  The states below do the rest.
+  task automatic fp_begin(input logic [3:0] op, input logic unary,
+                          input logic from_int, input logic boxes,
+                          input logic negate);
+    begin
+      fp_op       <= op;
+      fp_unary    <= unary;
+      fp_from_int <= from_int;
+      fp_boxes    <= boxes;
+      fp_negate   <= negate;
+      state       <= from_int ? S_FP_SEND_A : S_FP_READ_A;
+    end
+  endtask
+
   // The trap port as an I/O bus for vm_io_read/vm_io_write: trap_valid is
   // held, with trap_prim and plain-integer arguments, until trap_ready; a
   // read takes trap_result.  The device acts once per request.
   localparam logic [7:0] TRAP_IO_READ = 8'h01;
   localparam logic [7:0] TRAP_IO_WRITE = 8'h02;
+  // The floating-point peripheral answers on the same port.  A double is
+  // 64 bits and an argument is 32, so an operand goes over in two halves
+  // and the answer comes back the same way.
+  localparam logic [7:0] TRAP_FP_A = 8'h10, TRAP_FP_B = 8'h11,
+                         TRAP_FP_EXEC = 8'h12, TRAP_FP_HI = 8'h13;
+  localparam logic [3:0] FP_ADD = 4'd0, FP_SUB = 4'd1, FP_MUL = 4'd2, FP_DIV = 4'd3,
+                         FP_SQRT = 4'd4, FP_LT = 4'd5, FP_LE = 4'd6, FP_EQ = 4'd7,
+                         FP_NEG = 4'd8, FP_ABS = 4'd9, FP_OF_INT = 4'd10, FP_TO_INT = 4'd11;
+  localparam int DOUBLE_TAG = 253;
+
+  logic [3:0] fp_op;        // what to ask the peripheral for
+  logic       fp_unary;     // one operand, so no second box to open
+  logic       fp_from_int;  // the operand is an int in accu, not a box
+  logic       fp_boxes;     // the answer is a double and needs a box
+  logic       fp_negate;    // the answer is the opposite of what was asked
+  logic [VALUEW-1:0] fp_lo, fp_hi;
 
   logic [15:0] str_words;  // caml_ml_string_length: the string's wosize
   logic [ 1:0] str_byte;   // caml_string_get: byte within the word
@@ -619,9 +696,13 @@ module ocaml4142_vm_rtl #(
 
 
 
+  // An uncaught exception stops the machine as STOP does; the request comes
+  // from the raise, which has no handler left to run.
+  logic uncaught_exn;
+
   always_ff @(posedge clk) begin
     if (reset) halted <= 1'b0;
-    else if (opcode == STOP && state == S_EXEC) halted <= 1'b1;
+    else if ((opcode == STOP && state == S_EXEC) || uncaught_exn) halted <= 1'b1;
   end
 
 
@@ -647,21 +728,27 @@ module ocaml4142_vm_rtl #(
   endtask
   task caml_ml_open_descriptor_in;
     begin
+      `ifndef SYNTHESIS
       $display("caml_ml_open_descriptor_in");
+      `endif
       accu <= 32'hC0010000;
     end
   endtask
 
   task caml_ml_open_descriptor_out;
     begin
+      `ifndef SYNTHESIS
       $display("caml_ml_open_descriptor_out");
+      `endif
       accu <= 32'hF00D0000;
     end
   endtask
 
   task caml_ml_output_char;
     begin
+      `ifndef SYNTHESIS
       $display("caml_ml_output_char %c (%d)", Int_val(st_rd_a), Int_val(st_rd_a));
+      `endif
       putc_valid <= 1'b1;
       putc_char  <= st_rd_a[8:1];  // Int_val, low byte
       accu <= Val_int(0);
@@ -670,18 +757,25 @@ module ocaml4142_vm_rtl #(
 
   task caml_ml_flush;
     begin
+      `ifndef SYNTHESIS
       $display("caml_ml_flush");
+      `endif
       accu <= Val_int(0);
     end
   endtask
 
   task caml_string_get;
     begin
+      `ifndef SYNTHESIS
       $display("caml_string_get %x %x", accu, Int_val(st_rd_a));
-      // bytes pack little-endian after the header; index = Int_val(tos)
-      temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW+2:3];
-      str_byte <= st_rd_a[2:1];
-      state <= S_STRGET_READ;
+      `endif
+      // bytes pack little-endian after the header; index = Int_val(tos).
+      // The safe accessor checks first, and S_STRBOUND_LAST works out the
+      // word and the byte once the length is known.
+      temp_base_ptr <= accu;
+      temp_index    <= Int_val(st_rd_a);
+      bound_next    <= S_STRGET_READ;
+      state         <= S_STRBOUND_HDR;
     end
   endtask
 
@@ -756,7 +850,12 @@ module ocaml4142_vm_rtl #(
       CLOSURE: alloc_need = 3 + nvars;
       CLOSUREREC: alloc_need = 3 * imm + nvars;  // header + 3f - 1 + nvars
       GRAB: alloc_need = (extra_args < imm) ? 5 + extra_args : 0;
-      C_CALL1: alloc_need = (imm == 16'h052) ? (Int_val(accu) >> 2) + 2 : 0;  // caml_create_bytes
+      // caml_create_bytes, and the float primitives that box their answer
+      C_CALL1: alloc_need = (imm == 16'h052) ? (Int_val(accu) >> 2) + 2
+                          : (imm == 16'h12f || imm == 16'h000 ||
+                             imm == 16'h157 || imm == 16'h077) ? 3 : 0;
+      C_CALL2: alloc_need = (imm == 16'h003 || imm == 16'h166 ||
+                             imm == 16'h118 || imm == 16'h054) ? 3 : 0;
       default: alloc_need = 0;
     endcase
   end
@@ -798,6 +897,13 @@ module ocaml4142_vm_rtl #(
 
     if (reset) begin
       putc_char    <= '0;
+      fp_op        <= '0;
+      fp_unary     <= 1'b0;
+      fp_from_int  <= 1'b0;
+      fp_boxes     <= 1'b0;
+      fp_negate    <= 1'b0;
+      fp_lo        <= '0;
+      fp_hi        <= '0;
       trap_valid   <= 1'b0;
       trap_prim    <= '0;
       trap_arg0    <= '0;
@@ -805,7 +911,8 @@ module ocaml4142_vm_rtl #(
       rd_phase     <= 1'b0;
       tos_q        <= '0;
       st_a_was_tos <= 1'b0;
-      state        <= S_FETCH;
+      state        <= S_BOUNDEXN_MSG_HDR;
+      bound_next   <= S_DONE;
       pc                    <= '0;
       opcode                <= STOP;
       imm                   <= '0;
@@ -838,6 +945,8 @@ module ocaml4142_vm_rtl #(
 
       sp                    <= (1 << STACK_AW) - 1;
       trapsp                <= (1 << STACK_AW) - 1;
+      oo_id                 <= 0;
+      uncaught_exn          <= 1'b0;
 
 
       // the dynamic heap starts above the image, and never at index 0
@@ -855,7 +964,10 @@ module ocaml4142_vm_rtl #(
 
 
 
-        S_FETCH: begin
+        S_FETCH:
+        if (!code_valid) ;  // wait for the fetch unit
+        else if (sp < STACK_MARGIN[STACK_AW-1:0]) state <= S_STACK_OVERFLOW;
+        else begin
           opcode <= opcode_t'(code_rdata[7:0]);
           imm <= '0;
           nvars <= '0;
@@ -863,7 +975,9 @@ module ocaml4142_vm_rtl #(
           alloc_wosize <= '0;
           alloc_tag <= '0;
 
+          `ifndef SYNTHESIS
           $display("  at fetch, acc=0x%08x, pc=%d, bytecode=%d", accu, pc, code_rdata);
+          `endif
           `ifndef SYNTHESIS  // debug peeks; not part of the two-port datapath
           $display("  stack[sp+0]=0x%08x", stack_mem[sp+0]);
           $display("  stack[sp+1]=0x%08x", stack_mem[sp+1]);
@@ -917,7 +1031,9 @@ module ocaml4142_vm_rtl #(
 
 
 
-        S_FETCH_IMM: begin
+        S_FETCH_IMM:
+        if (!code_valid) ;  // wait for the fetch unit
+        else begin
           if (opcode == CLOSUREREC) begin
 
             nvars <= code_rdata;
@@ -1350,8 +1466,15 @@ module ocaml4142_vm_rtl #(
               stack_read_a(sp);  // tos
               hold_for_read();
             end else begin
-              accu <= Val_int(Int_val(accu) * Int_val(st_rd_a));
-              sp   <= sp + 1;
+              // The product in one cycle is the design's longest path: three
+              // DSP48s and the carry chains that add their partial products,
+              // 27 levels of logic.  Registering the operands and then the
+              // product puts those registers inside the DSPs and costs two
+              // cycles on an instruction the programs here rarely execute.
+              mul_a <= Int_val(accu);
+              mul_b <= Int_val(st_rd_a);
+              sp    <= sp + 1;
+              state <= S_MUL_MUL;
             end
 
             DIVINT:
@@ -1359,9 +1482,12 @@ module ocaml4142_vm_rtl #(
               stack_read_a(sp);  // tos
               hold_for_read();
             end else begin
-              div_start(Int_val(accu), Int_val(st_rd_a), 1'b0);
-              sp    <= sp + 1;
-              state <= S_DIV_ITER;
+              sp <= sp + 1;
+              if (Int_val(st_rd_a) == 0) state <= S_ZERO_DIVIDE;
+              else begin
+                div_start(Int_val(accu), Int_val(st_rd_a), 1'b0);
+                state <= S_DIV_ITER;
+              end
             end
 
             MODINT:
@@ -1369,9 +1495,12 @@ module ocaml4142_vm_rtl #(
               stack_read_a(sp);  // tos
               hold_for_read();
             end else begin
-              div_start(Int_val(accu), Int_val(st_rd_a), 1'b1);
-              sp    <= sp + 1;
-              state <= S_DIV_ITER;
+              sp <= sp + 1;
+              if (Int_val(st_rd_a) == 0) state <= S_ZERO_DIVIDE;
+              else begin
+                div_start(Int_val(accu), Int_val(st_rd_a), 1'b1);
+                state <= S_DIV_ITER;
+              end
             end
 
             ANDINT:
@@ -1723,6 +1852,17 @@ module ocaml4142_vm_rtl #(
 
 
 
+
+            PUSHTRAP: begin
+              op_cycle_count <= 0;
+              state <= S_PUSHTRAP_WRITE_FRAME;
+            end
+
+            POPTRAP: state <= S_POPTRAP;
+
+            // RERAISE and RAISE_NOTRACE differ only in the backtrace, which
+            // this machine does not keep.
+            RAISE, RERAISE, RAISE_NOTRACE: state <= S_RAISE_ENTER;
 
             GETGLOBAL: begin
               temp_globals_addr <= imm[GLOBALS_AW-1:0];
@@ -2148,7 +2288,29 @@ module ocaml4142_vm_rtl #(
                   trap_arg0  <= Int_val(accu);
                   state      <= S_IO_WAIT;
                 end
-                default: $display("Unsupported C_CALL1: 0x%x", imm);
+                // caml_ensure_stack_capacity: ocamlc emits this ahead of any
+                // code block whose stack use passes its threshold -- a module
+                // with enough top-level definitions does it.  The stack here is
+                // a fixed block RAM, so there is nothing to grow: answer unit.
+                16'h05a: accu <= VAL_UNIT;
+                // The float primitives that take one operand.  gt and ge are
+                // lt and le with the operands the other way round, and neq
+                // is eq negated, so the peripheral needs neither.
+                16'h12f: fp_begin(FP_NEG,    1'b1, 1'b0, 1'b1, 1'b0);  // caml_neg_float
+                16'h000: fp_begin(FP_ABS,    1'b1, 1'b0, 1'b1, 1'b0);  // caml_abs_float
+                16'h157: fp_begin(FP_SQRT,   1'b1, 1'b0, 1'b1, 1'b0);  // caml_sqrt_float
+                16'h077: fp_begin(FP_OF_INT, 1'b1, 1'b1, 1'b1, 1'b0);  // caml_float_of_int
+                16'h0e1: fp_begin(FP_TO_INT, 1'b1, 1'b0, 1'b0, 1'b0);  // caml_int_of_float
+                16'h084: begin  // caml_fresh_oo_id: the next identity
+                  accu  <= Val_int(oo_id);
+                  oo_id <= oo_id + 1;
+                end
+                default: begin
+                  `ifndef SYNTHESIS
+                  $display("Unsupported C_CALL1: 0x%x", imm);
+                  `endif
+                  accu <= VAL_UNIT;
+                end
               endcase
             end
 
@@ -2159,10 +2321,13 @@ module ocaml4142_vm_rtl #(
             end else begin
               unique case (imm)
                 16'h108: caml_ml_output_char();
-                16'h00d: begin  // caml_array_get_addr: Field(accu, Int_val(tos))
-                  temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW:1];
+                16'h00d, 16'h00c: begin  // caml_array_get_addr, caml_array_get: Field(accu, Int_val(tos))
+                  // the safe accessor, so the index is checked: read the
+                  // header, not the field, and decide there
+                  temp_index     <= Int_val(st_rd_a);
+                  temp_heap_addr <= Heap_index_of_ptr(accu);
                   state <= S_HEAP_READ;
-                  next_state_after_mem <= S_GETFIELD_DONE;
+                  next_state_after_mem <= S_ARRBOUND_GET;
                 end
                 16'h15b, 16'h03a: caml_string_get();  // caml_string_get, caml_bytes_get
                 16'h15a, 16'h163: begin  // caml_string_equal, caml_string_notequal
@@ -2171,6 +2336,14 @@ module ocaml4142_vm_rtl #(
                   streq_negate <= imm == 16'h163;
                   state <= S_STREQ_HDR;
                 end
+                16'h003: fp_begin(FP_ADD, 1'b0, 1'b0, 1'b1, 1'b0);  // caml_add_float
+                16'h166: fp_begin(FP_SUB, 1'b0, 1'b0, 1'b1, 1'b0);  // caml_sub_float
+                16'h118: fp_begin(FP_MUL, 1'b0, 1'b0, 1'b1, 1'b0);  // caml_mul_float
+                16'h054: fp_begin(FP_DIV, 1'b0, 1'b0, 1'b1, 1'b0);  // caml_div_float
+                16'h068: fp_begin(FP_EQ,  1'b0, 1'b0, 1'b0, 1'b0);  // caml_eq_float
+                16'h130: fp_begin(FP_EQ,  1'b0, 1'b0, 1'b0, 1'b1);  // caml_neq_float
+                16'h0ee: fp_begin(FP_LT,  1'b0, 1'b0, 1'b0, 1'b0);  // caml_lt_float
+                16'h0e6: fp_begin(FP_LE,  1'b0, 1'b0, 1'b0, 1'b0);  // caml_le_float
                 16'h194: begin  // vm_io_write addr data
                   trap_valid <= 1'b1;
                   trap_prim  <= TRAP_IO_WRITE;
@@ -2178,7 +2351,12 @@ module ocaml4142_vm_rtl #(
                   trap_arg1  <= Int_val(st_rd_a);
                   state      <= S_IO_WAIT;
                 end
-                default: $display("Unsupported C_CALL2: 0x%x", imm);
+                default: begin
+                  `ifndef SYNTHESIS
+                  $display("Unsupported C_CALL2: 0x%x", imm);
+                  `endif
+                  accu <= VAL_UNIT;
+                end
               endcase
               sp += 1;
             end
@@ -2190,14 +2368,15 @@ module ocaml4142_vm_rtl #(
                 stack_read_b(sp + 1);  // the char
                 hold_for_read();
               end else begin
-                temp_heap_addr <= Heap_index_of_ptr(accu) + 1 + st_rd_a[HEAP_AW+2:3];
-                str_byte <= st_rd_a[2:1];
-                byte_value <= st_rd_b[8:1];
-                sp <= sp + 2;
+                temp_base_ptr <= accu;
+                temp_index    <= Int_val(st_rd_a);
+                byte_value    <= st_rd_b[8:1];
+                sp   <= sp + 2;
                 accu <= VAL_UNIT;
-                state <= S_BYTESET_RMW;
+                bound_next <= S_BYTESET_RMW;
+                state      <= S_STRBOUND_HDR;
               end
-            end else if (imm == 16'h00f) begin  // caml_array_set_addr: SETVECTITEM's layout
+            end else if (imm == 16'h00f || imm == 16'h00e) begin  // caml_array_set_addr, caml_array_set
               if (!rd_phase) begin
                 stack_read_a(sp);  // index
                 stack_read_b(sp + 1);  // value
@@ -2206,10 +2385,14 @@ module ocaml4142_vm_rtl #(
                 temp_index <= Int_val(st_rd_a);
                 temp_value <= st_rd_b;
                 temp_base_ptr <= accu;
-                state <= S_SETVECTITEM_WRITE;  // pops both, accu = unit
+                temp_heap_addr <= Heap_index_of_ptr(accu);
+                state <= S_HEAP_READ;             // the header, to check the index
+                next_state_after_mem <= S_ARRBOUND_SET;
               end
             end else begin
+              `ifndef SYNTHESIS
               $display("Unsupported C_CALL3: 0x%x", imm);
+              `endif
               accu <= VAL_UNIT;
               sp += 2;
             end
@@ -2325,8 +2508,10 @@ module ocaml4142_vm_rtl #(
             end
 
             default: begin
+              `ifndef SYNTHESIS
               $display(
                   "almost complete, unhandled ops go to trap instead of silently wrong behavior.");
+              `endif
               trap_valid <= 1'b1;
               trap_prim  <= 8'hFF;
               trap_arg0  <= Val_int(opcode);
@@ -2501,11 +2686,11 @@ module ocaml4142_vm_rtl #(
           hp_limit <= to_lo + gc_semi;
           gc_count <= gc_count + 1;
           if (gc_free + gc_need > to_lo + gc_semi) begin
+            `ifndef SYNTHESIS
             $display("GC: out of memory (%0d words live, %0d needed, semi-space %0d)",
                      gc_free - to_lo, gc_need, gc_semi);
-            trap_valid <= 1'b1;
-            trap_prim <= 8'hF1;
-            state <= S_TRAP_WAIT;
+            `endif
+            state <= S_OUT_OF_MEMORY;
           end else state <= S_EXEC;  // run the allocating instruction again
         end
 
@@ -2582,7 +2767,9 @@ module ocaml4142_vm_rtl #(
           state <= S_SWITCH_JUMP;
         end
 
-        S_SWITCH_JUMP: begin  // code_rdata is the table entry at pc
+        S_SWITCH_JUMP:  // code_rdata is the table entry at pc
+        if (!code_valid) ;  // wait for the fetch unit
+        else begin
           pc <= pc - temp_index + $signed(code_rdata);
           state <= S_DONE;
         end
@@ -2625,8 +2812,8 @@ module ocaml4142_vm_rtl #(
           else if (field_from_stack && !rd_phase) begin
             stack_read_a(sp + stack_item);
             hold_for_read();
-          end else if (rec_code_field && !rd_phase) begin
-            pc <= alloc_table + alloc_fn_i;  // code_rdata is the offset next cycle
+          end else if (rec_code_field && (!rd_phase || !code_valid)) begin
+            pc <= alloc_table + alloc_fn_i;  // the offset, once the fetch unit has it
             hold_for_read();
           end else begin
             heap_write(alloc_base + 1 + alloc_i,
@@ -2660,6 +2847,16 @@ module ocaml4142_vm_rtl #(
           stack_write(sp - 1, Ptr_of_heap_index(alloc_base + 3 * alloc_push_i));
           sp <= sp - 1;
           alloc_push_i <= alloc_push_i + 1;
+        end
+
+        S_MUL_MUL: begin
+          mul_p <= mul_a * mul_b;
+          state <= S_MUL_DONE;
+        end
+
+        S_MUL_DONE: begin
+          accu  <= Val_int(mul_p[VALUEW-2:0]);
+          state <= S_DONE;
         end
 
         S_DIV_ITER: begin
@@ -2766,6 +2963,109 @@ module ocaml4142_vm_rtl #(
           state <= S_DONE;
         end
 
+        // ---- floating point ------------------------------------------
+        // A double lives in a two-word box, so both words come back in one
+        // read on the two ports.  The peripheral takes an operand in two
+        // halves over the trap port, and gives the answer back the same way.
+        S_FP_READ_A:
+        if (!rd_phase) begin
+          heap_read_a(Heap_index_of_ptr(accu) + 1);
+          heap_read_b(Heap_index_of_ptr(accu) + 2);
+          hold_for_read();
+        end else begin
+          fp_lo <= hm_rd_a;
+          fp_hi <= hm_rd_b;
+          state <= S_FP_SEND_A;
+        end
+
+        S_FP_READ_B:
+        if (!rd_phase) begin
+          heap_read_a(Heap_index_of_ptr(st_rd_a) + 1);
+          heap_read_b(Heap_index_of_ptr(st_rd_a) + 2);
+          hold_for_read();
+        end else begin
+          fp_lo <= hm_rd_a;
+          fp_hi <= hm_rd_b;
+          state <= S_FP_SEND_B;
+        end
+
+        S_FP_SEND_A:
+        if (!trap_valid) begin
+          trap_valid <= 1'b1;
+          trap_prim  <= TRAP_FP_A;
+          // caml_float_of_int hands over an int, not a box; the sign fills
+          // the upper half so the peripheral sees the whole number.
+          trap_arg0  <= fp_from_int ? Int_val(accu) : fp_lo;
+          // Int_val is an arithmetic shift, so its sign is accu's own; a
+          // bit-select of a function call is also more than yosys will read.
+          trap_arg1  <= fp_from_int ? {VALUEW{accu[VALUEW-1]}} : fp_hi;
+        end else if (trap_ready) begin
+          trap_valid <= 1'b0;
+          state      <= fp_unary ? S_FP_EXEC : S_FP_READ_B;
+        end
+
+        S_FP_SEND_B:
+        if (!trap_valid) begin
+          trap_valid <= 1'b1;
+          trap_prim  <= TRAP_FP_B;
+          trap_arg0  <= fp_lo;
+          trap_arg1  <= fp_hi;
+        end else if (trap_ready) begin
+          trap_valid <= 1'b0;
+          state      <= S_FP_EXEC;
+        end
+
+        S_FP_EXEC:
+        if (!trap_valid) begin
+          trap_valid <= 1'b1;
+          trap_prim  <= TRAP_FP_EXEC;
+          trap_arg0  <= {{(VALUEW-4){1'b0}}, fp_op};
+          trap_arg1  <= '0;
+        end else if (trap_ready) begin
+          trap_valid <= 1'b0;
+          if (fp_boxes) begin
+            fp_lo <= trap_result;
+            state <= S_FP_HI;
+          end else if (fp_op == FP_TO_INT) begin
+            accu  <= Val_int(trap_result);
+            state <= S_DONE;
+          end else begin
+            // a comparison: the peripheral answers with the bit, and
+            // caml_neq_float is caml_eq_float the other way about
+            accu  <= (trap_result[0] ^ fp_negate) ? VAL_TRUE : VAL_FALSE;
+            state <= S_DONE;
+          end
+        end
+
+        S_FP_HI:
+        if (!trap_valid) begin
+          trap_valid <= 1'b1;
+          trap_prim  <= TRAP_FP_HI;
+          trap_arg0  <= '0;
+          trap_arg1  <= '0;
+        end else if (trap_ready) begin
+          trap_valid <= 1'b0;
+          fp_hi      <= trap_result;
+          alloc_i    <= 0;
+          state      <= S_FP_BOX;
+        end
+
+        // The box: a header saying two words of no-scan data, then the
+        // double itself.  Double_tag is above NO_SCAN_TAG, so the collector
+        // steps over the contents rather than reading them as pointers.
+        S_FP_BOX:
+        case (alloc_i)
+          16'd0: begin heap_write(hp,     Make_header(2, DOUBLE_TAG)); alloc_i <= 1; end
+          16'd1: begin heap_write(hp + 1, fp_lo);                      alloc_i <= 2; end
+          16'd2: begin heap_write(hp + 2, fp_hi);                      alloc_i <= 3; end
+          default: begin
+            accu    <= Ptr_of_heap_index(hp);
+            hp      <= hp + 3;
+            alloc_i <= 0;
+            state   <= S_DONE;
+          end
+        endcase
+
         S_IO_WAIT:
         if (trap_ready) begin
           trap_valid <= 1'b0;
@@ -2814,6 +3114,223 @@ module ocaml4142_vm_rtl #(
         end else begin
           temp_heap_val <= hm_rd_a;
           state <= next_state_after_mem;
+        end
+
+        // PUSHTRAP: a four-word trap frame -- the handler's address, the
+        // trap stack below it, the environment and the argument count --
+        // and trapsp then points at it.  (interp.c's PUSHTRAP.)
+        S_PUSHTRAP_WRITE_FRAME: begin
+          case (op_cycle_count)
+            0: begin
+              stack_write(sp - 4, Make_codeptr($signed(pc - 1) + $signed(imm)));
+              op_cycle_count <= 1;
+            end
+            1: begin
+              stack_write(sp - 3, {{(VALUEW-STACK_AW-1){1'b0}}, trapsp, 1'b1});  // Val_long(trapsp)
+              op_cycle_count <= 2;
+            end
+            2: begin
+              stack_write(sp - 2, env);
+              op_cycle_count <= 3;
+            end
+            3: begin
+              stack_write(sp - 1, Val_int(extra_args));
+              sp     <= sp - 4;
+              trapsp <= sp - 4;
+              state  <= S_DONE;
+            end
+          endcase
+        end
+
+        // POPTRAP: the frame goes, and with it the handler.
+        S_POPTRAP:
+        if (!rd_phase) begin
+          stack_read_a(sp + 1);  // the trap stack this frame saved
+          hold_for_read();
+        end else begin
+          trapsp <= st_rd_a[STACK_AW:1];
+          sp     <= sp + 4;
+          state  <= S_DONE;
+        end
+
+        // RAISE: the stack goes back to the innermost trap frame and the
+        // handler runs with the exception in accu.  With no frame left the
+        // exception is uncaught, and this machine has nowhere to print it:
+        // it stops, which is what an uncaught exception does to a program.
+        S_RAISE_READ:
+        if (!rd_phase) begin
+          stack_read_a(trapsp);      // the handler
+          stack_read_b(trapsp + 1);  // the trap stack below this frame
+          hold_for_read();
+        end else begin
+          pc             <= Codeptr_val(st_rd_a);
+          trapsp         <= st_rd_b[STACK_AW:1];
+          temp_stack_addr <= trapsp;
+          state          <= S_RAISE_FRAME;
+        end
+
+        S_RAISE_FRAME:
+        if (!rd_phase) begin
+          stack_read_a(temp_stack_addr + 2);  // env
+          stack_read_b(temp_stack_addr + 3);  // extra_args
+          hold_for_read();
+        end else begin
+          env        <= st_rd_a;
+          extra_args <= Int_val(st_rd_b);
+          sp         <= temp_stack_addr + 4;
+          state      <= S_DONE;
+        end
+
+        // Division by zero raises Division_by_zero, which the global data
+        // holds at the index the runtime's fail.h gives it (5).  The value
+        // goes in accu and the raise proceeds as any other.
+        S_ZERO_DIVIDE:
+        if (!rd_phase) begin
+          globals_read_a(ZERO_DIVIDE_EXN[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          accu  <= gm_rd_a;
+          state <= S_RAISE_ENTER;
+        end
+
+        // Too deep to go on: raise Stack_overflow, which unwinds to the
+        // innermost handler and in doing so gives the stack back.  A handler
+        // installed deep enough to be under the margin itself re-raises here
+        // on its first instruction, unwinding further -- trapsp rises each
+        // time, so this walks out rather than spinning.
+        S_STACK_OVERFLOW:
+        if (!rd_phase) begin
+          globals_read_a(STACK_OVERFLOW_EXN[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          accu  <= gm_rd_a;
+          state <= S_RAISE_ENTER;
+        end
+
+        // Built once, coming out of reset and before the first instruction:
+        // the message string, the two-word exception block that carries it,
+        // and the globals slot that keeps it reachable.
+        S_BOUNDEXN_MSG_HDR: begin
+          heap_write(hp, Make_header(BOUND_MSG_WORDS, STRING_TAG));
+          temp_heap_addr <= hp;        // the string's header, so its pointer
+          alloc_i <= 0;
+          state <= S_BOUNDEXN_MSG;
+        end
+
+        S_BOUNDEXN_MSG:
+        if (alloc_i == BOUND_MSG_WORDS) begin
+          hp <= hp + 1 + BOUND_MSG_WORDS[HEAP_AW-1:0];
+          state <= S_BOUNDEXN_EXN_HDR;
+        end else begin
+          heap_write(temp_heap_addr + 1 + HEAP_AW'(alloc_i), bound_msg_word(alloc_i[2:0]));
+          alloc_i <= alloc_i + 1;
+        end
+
+        S_BOUNDEXN_EXN_HDR: begin
+          heap_write(hp, Make_header(2, 0));
+          temp_field1 <= Ptr_of_heap_index(hp);
+          state <= S_BOUNDEXN_ID;
+        end
+
+        // field 0 is the exception's identity, which the image's globals
+        // hold at the index fail.h fixes for Invalid_argument
+        S_BOUNDEXN_ID:
+        if (!rd_phase) begin
+          globals_read_a(INVALID_EXN[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          heap_write(Heap_index_of_ptr(temp_field1) + 1, gm_rd_a);
+          state <= S_BOUNDEXN_MSG_FIELD;
+        end
+
+        S_BOUNDEXN_MSG_FIELD: begin
+          heap_write(Heap_index_of_ptr(temp_field1) + 2, Ptr_of_heap_index(temp_heap_addr));
+          hp <= hp + 3;
+          state <= S_BOUNDEXN_STORE;
+        end
+
+        S_BOUNDEXN_STORE: begin
+          globals_write(BOUND_EXN_SLOT[GLOBALS_AW-1:0], temp_field1);
+          state <= S_FETCH;
+        end
+
+        // An index outside its array or string: raise the exception built at
+        // reset, and unwind as any other raise does.
+        S_BOUND_ERROR:
+        if (!rd_phase) begin
+          globals_read_a(BOUND_EXN_SLOT[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          accu  <= gm_rd_a;
+          state <= S_RAISE_ENTER;
+        end
+
+        // caml_array_get/set: the block's header is in temp_heap_val, so the
+        // index is checked against its size before the field is touched.
+        // The compare is unsigned, so a negative index -- which Int_val
+        // leaves as a very large one -- fails the same test.
+        S_ARRBOUND_GET:
+        if (temp_index >= Wosize_hd(temp_heap_val)) state <= S_BOUND_ERROR;
+        else begin
+          temp_heap_addr <= temp_heap_addr + 1 + temp_index[HEAP_AW-1:0];
+          state <= S_HEAP_READ;
+          next_state_after_mem <= S_GETFIELD_DONE;
+        end
+
+        S_ARRBOUND_SET:
+        if (temp_index >= Wosize_hd(temp_heap_val)) state <= S_BOUND_ERROR;
+        else state <= S_SETVECTITEM_WRITE;
+
+        // A string or bytes index needs the length, not the word count: the
+        // header gives the words and the last byte the padding, as
+        // caml_ml_string_length computes it.
+        S_STRBOUND_HDR:
+        if (!rd_phase) begin
+          heap_read_a(Heap_index_of_ptr(temp_base_ptr));
+          hold_for_read();
+        end else begin
+          str_words <= hm_rd_a[31:16];
+          temp_heap_addr <= Heap_index_of_ptr(temp_base_ptr) + hm_rd_a[31:16];
+          state <= S_STRBOUND_LAST;
+        end
+
+        S_STRBOUND_LAST:
+        if (!rd_phase) begin
+          heap_read_a(temp_heap_addr);
+          hold_for_read();
+        end else if (temp_index >= ({str_words, 2'b00} - 1 - hm_rd_a[31:24]))
+          state <= S_BOUND_ERROR;
+        else begin
+          temp_heap_addr <= Heap_index_of_ptr(temp_base_ptr) + 1 + temp_index[HEAP_AW+1:2];
+          str_byte       <= temp_index[1:0];
+          state          <= bound_next;
+        end
+
+        // The collection freed too little to carry on.  This used to raise
+        // trap 0xF1 and wait for the machine around it to answer, but
+        // nothing ever did -- ethmin_vm_core answers the I/O and
+        // floating-point traps and no others -- so the VM stopped there for
+        // good, which is what a program that outgrew the heap looked like
+        // from outside.  Raise Out_of_memory instead: it takes no
+        // allocation, it unwinds to the innermost handler, and dropping
+        // everything between is what lets the next collection succeed.
+        S_OUT_OF_MEMORY:
+        if (!rd_phase) begin
+          globals_read_a(OUT_OF_MEMORY_EXN[GLOBALS_AW-1:0]);
+          hold_for_read();
+        end else begin
+          accu  <= gm_rd_a;
+          state <= S_RAISE_ENTER;
+        end
+
+        S_RAISE_ENTER: begin
+          if (trapsp == {STACK_AW{1'b1}}) begin
+            uncaught_exn <= 1'b1;   // no handler left: stop, as STOP does
+            state        <= S_DONE;
+          end else begin
+            sp    <= trapsp;
+            state <= S_RAISE_READ;
+          end
         end
 
         S_GLOBALS_READ:
@@ -3173,7 +3690,9 @@ module ocaml4142_vm_rtl #(
 
 
         S_DONE: begin
+          `ifndef SYNTHESIS
           $display("  instruction done, acc=0x%08x, pc=%d", accu, pc);
+          `endif
           `ifndef SYNTHESIS  // debug peeks; not part of the two-port datapath
           $display("  stack[sp+0]=0x%08x", stack_mem[sp+0]);
           $display("  stack[sp+1]=0x%08x", stack_mem[sp+1]);
@@ -3194,7 +3713,9 @@ module ocaml4142_vm_rtl #(
         end
 
         default: begin
+          `ifndef SYNTHESIS
           $display("Invalid state %d", state);
+          `endif
 `ifndef SYNTHESIS
           $finish;
 `endif

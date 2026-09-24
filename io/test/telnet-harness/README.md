@@ -1,0 +1,36 @@
+# Testing io/telnet.ml against another TCP
+
+`harness.ml` builds a mirage-tcpip stack and the device's own TCP
+(`io/telnet.ml`, its hardware block replaced by `host_hw.ml`'s simulated
+packet window) on two ports of a mirage-vnetif backend, then connects from
+the mirage side to port 23, types lines and prints what came back.  An
+independent implementation is the peer, so the handshake, the ACKs, the
+telnet negotiation and the close are all checked against something that
+did not come from the same head.
+
+    opam switch 4.14.2         # tcpip 6.4.0, ethernet 2.2.1, mirage-vnetif
+    ./prepare.py               # telnet_core.ml from ../../telnet.ml
+    dune exec ./harness.exe    # the session; `harness.exe big` pastes long lines
+
+It writes `session.frames`, every frame the peer sent.  `replay.bc` feeds
+those to the device logic with nothing else running, so
+`OCAMLRUNPARAM=t=2 ocamlrund _build/default/replay.bc` counts the bytecode
+instructions one telnet session costs (see docs/minimal-tcp.md).
+`bench.bc` does the same for the checksum, the echo path and the copy into
+the transmit window, one byte at a time.
+
+## The other two customers
+
+`harness.exe busy` opens a second connection while the first is in session:
+the device has room for one, and answers the second with the handshake and a
+sentence saying so rather than a reset, so the person at the other end is
+told why.  `harness.exe reuse` closes the first session properly and connects
+again -- a close that does not free the session locks everyone out.
+
+`probe/synprobe.exe` puts frames the wire produces in front of the device's
+TCP with nothing else in the process: a SYN carrying the twenty bytes of
+options Linux sends, a peer that stops answering, and a caller knocking while
+a session is held by a peer that has gone home.  That last one is what a lost
+FIN leaves behind -- the receive window holds one frame -- and it is why a
+knock makes the device ask the incumbent, with a bare ACK, whether it is
+still there.

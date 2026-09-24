@@ -18,7 +18,18 @@
 //   0x1006  r  milliseconds since reset (30 bits, wraps after ~12 days)
 //   0x1007  w  boot the image staged in the staging RAM
 //   0x1008  r  the next byte received on the UART, or -1 (a 256-byte FIFO)
-//   0x10000..0x1FFFF  the staging RAM, a byte per address
+//   0x1009  r  the board's DIP switches (8 bits), synchronised
+//   0x100b  r  the board's push buttons (5 bits), synchronised
+//   0x100a  r  who built this bitstream: bits 27:0 the git commit (7 hex
+//              digits), bit 28 set if the tree was dirty, bits 31:30 the
+//              flow (1 = the open flow, 2 = Vivado, 0 = unsaid)
+//   0x100c  w  the program's length in words: what the fetch unit will
+//              reach, which a compiler raises as it appends
+//   0x10000..0x2FFFF  the staging RAM, a byte per address
+//   0x60000..0x7FFFF  the program's code, a byte per address, readable and
+//              writable while it runs: a compiler on this machine appends
+//              closures to the program it is itself part of, and reads it
+//              back to find the places it must patch
 //
 // The packet RAM is a true dual-port BRAM: port B belongs to the DMA on
 // eth_clk, port A to the VM on clk_sys; eth_stream_dma's ownership handshake
@@ -29,10 +40,13 @@ module ethmin_vm_core #(
 	parameter [13:0] TX_WORD_BASE = 14'd512,
 	parameter integer WINDOW_WORDS = 512,
 	parameter integer CLK_HZ = 25_000_000,
+	parameter [31:0]  BUILD_ID = 32'd0,   // the commit, the dirty bit and the flow
 	parameter integer BAUD = 115_200
 ) (
 	input  wire        clk_sys,
 	input  wire        resetn,
+	input  wire [7:0]  DIP,           // the board's DIP switches (SW11)
+	input  wire [4:0]  BTN,           // the board's push buttons
 	input  wire        eth_clk,
 	input  wire        eth_rst,
 
@@ -57,7 +71,7 @@ module ethmin_vm_core #(
 	wire        mem_b_en, mem_b_we;
 	wire [13:0] mem_b_addr;
 	wire [31:0] mem_b_wdata;
-	reg  [31:0] mem_b_rdata;
+	wire [31:0] mem_b_rdata;
 	wire        rx_valid /*verilator public_flat_rd*/;  // the testbench feeds frames when it is clear
 	wire        rx_trunc, tx_busy;
 	wire [10:0] rx_len;
@@ -82,30 +96,41 @@ module ethmin_vm_core #(
 		.tx_busy(tx_busy));
 
 	// ─── packet RAM: 2 KiB RX + 2 KiB TX, little-endian bytes ───────────
-	reg  [31:0] pkt [0:1023];
+	// One byte-wide memory per lane, each a plain two-port RAM with a whole-
+	// word write enable.  As one 32-bit memory with byte enables it is what
+	// Vivado infers from a byte-write template, but yosys consolidates the
+	// two write ports and then finds no block RAM that fits, so the open
+	// flow cannot map it (memory_libmap: "no valid mapping found").
+	//
+	// Each port also leaves its read register alone while it writes (the
+	// block RAM's NO_CHANGE mode).  Reading the old word of the address
+	// being written is READ_FIRST, which Vivado infers but yosys has no
+	// block RAM rule for; neither side here reads while it writes.
 	reg         pa_en;
 	reg  [3:0]  pa_we;
 	reg  [9:0]  pa_addr;
 	reg  [31:0] pa_wdata;
-	reg  [31:0] pa_rdata;
-	integer lane;
+	wire [31:0] pa_rdata;
 
-	// Both ports are written per byte lane (port B always all four) so the
-	// synthesiser sees one byte-write template and infers a single BRAM.
-	integer lane_b;
-	always @(posedge eth_clk)
-		if (mem_b_en) begin
-			for (lane_b = 0; lane_b < 4; lane_b = lane_b + 1)
-				if (mem_b_we) pkt[mem_b_addr[9:0]][8*lane_b +: 8] <= mem_b_wdata[8*lane_b +: 8];
-			mem_b_rdata <= pkt[mem_b_addr[9:0]];
+	genvar lane;
+	generate
+		for (lane = 0; lane < 4; lane = lane + 1) begin : pkt_lane
+			reg [7:0] mem [0:1023];
+			reg [7:0] b_q, a_q;
+			always @(posedge eth_clk)
+				if (mem_b_en) begin
+					if (mem_b_we) mem[mem_b_addr[9:0]] <= mem_b_wdata[8*lane +: 8];
+					else b_q <= mem[mem_b_addr[9:0]];
+				end
+			always @(posedge clk_sys)
+				if (pa_en) begin
+					if (pa_we[lane]) mem[pa_addr] <= pa_wdata[8*lane +: 8];
+					else a_q <= mem[pa_addr];
+				end
+			assign mem_b_rdata[8*lane +: 8] = b_q;
+			assign pa_rdata[8*lane +: 8] = a_q;
 		end
-
-	always @(posedge clk_sys)
-		if (pa_en) begin
-			for (lane = 0; lane < 4; lane = lane + 1)
-				if (pa_we[lane]) pkt[pa_addr][8*lane +: 8] <= pa_wdata[8*lane +: 8];
-			pa_rdata <= pkt[pa_addr];
-		end
+	endgenerate
 
 	// ─── code, images and the boot sequencer ─────────────────────────────
 	// The resident program (tools/progimage.sh: program.hex, heap.hex,
@@ -113,15 +138,36 @@ module ethmin_vm_core #(
 	// image (tools/mkvmimage.py) in the staging RAM and write BOOT: the
 	// sequencer then loads that image into the program code RAM and the VM
 	// and starts it, until the next reset brings the resident one back.
-	localparam integer PROG_WORDS  = 8192;    // program code RAM
-	localparam integer STAGE_WORDS = 16384;   // staging RAM: 64 KiB
-	localparam integer HEAP_AW     = 14;      // 16K-word heap: two 8K semi-spaces above the image
+	// Every memory here is 32K words deep, which is what makes yosys build it
+	// from RAMB36s in x1 mode -- one bit per block RAM, 32K deep, the mode the
+	// open flow gets right.  At 16K deep it picks x2 and at 8K x4, and those
+	// come out of nextpnr miscompiled: the board then runs the loader (whose
+	// code is a x9 ROM) while its heap is corrupt, so the strings are intact
+	// but every pointer into them is wrong.  Vivado is happy either way.
+	// The staging RAM is fully addressed: 32K words (128 KiB).
+	localparam integer PROG_WORDS  = 32768;   // program code RAM (block RAM)
+	localparam integer STAGE_WORDS = 32768;   // staging RAM: 128 KiB
+	// 32K words, two 16K semi-spaces.  It was briefly four times this, to
+	// give a tree-walking interpreter room for the frames it holds live,
+	// and that cost 0.7 ns and with it 100 MHz.  Compiled code keeps its
+	// frames on the VM's stack instead, so the room is better bought by
+	// compiling than by block RAM.
+	localparam integer HEAP_AW     = 15;
+	localparam integer GLOBALS_AW  = 13;      // see the VM instantiation
 
-	reg [31:0] code_rom    [0:`PROGRAM_WORDS-1];
-	reg [31:0] heap_rom    [0:`HEAP_WORDS-1];
-	reg [31:0] globals_rom [0:`GLOBALS_WORDS-1];
+	// 36 bits, not 32: at 32 bits yosys slices these ROMs x9, and a RAMB36 in
+	// x9 mode loses its ninth bit in the open flow -- the parity bit comes out
+	// of the lower RAMB18's wire, which prjxray's site-pin mapping does not
+	// model.  Every ninth bit of the program and its constants was wrong.
+	// Four unused bits per word buys x18/x36 slicing instead, and block RAM is
+	// what this design has spare.
+	// code_rom is not inferred: tools/gen_rom_bram.py writes it out as one
+	// RAMB36E1 per bit at x1 (program_bram.v), because inference picks x9 --
+	// fewest block RAMs -- and a RAMB36 at x9 loses its ninth bit in the open
+	// flow.  The others are small and do not land on x9.
+	reg [35:0] heap_rom    [0:`HEAP_WORDS-1];
+	reg [35:0] globals_rom [0:`GLOBALS_WORDS-1];
 	initial begin
-		$readmemh(`PROGRAM_HEX, code_rom);
 		$readmemh("heap.hex", heap_rom);
 		$readmemh("globals.hex", globals_rom);
 	end
@@ -130,12 +176,7 @@ module ethmin_vm_core #(
 
 	wire [23:0] pc /*verilator public_flat_rd*/;
 	reg         code_bank /*verilator public_flat_rd*/;  // 0: the resident program, 1: the loaded one
-	reg  [13:0] prog_words /*verilator public_flat_rd*/;
-	// Code is read asynchronously: the VM samples code_rdata in the cycle it
-	// presents pc.
-	wire [31:0] code_rdata =
-		code_bank ? ((pc < prog_words) ? prog_code[pc[12:0]] : 32'hDEADBEEF)
-		          : ((pc < `PROGRAM_WORDS) ? code_rom[pc] : 32'hDEADBEEF);
+	reg  [15:0] prog_words /*verilator public_flat_rd*/;
 
 	// The sequencer: after reset it loads the resident program's heap and
 	// globals into the VM; on BOOT the staged image's code, heap and globals.
@@ -154,20 +195,24 @@ module ethmin_vm_core #(
 	reg [HEAP_AW-1:0] load_addr, image_words;
 	reg [31:0] load_data;
 	reg        boot_req;
+	reg        set_pw;            // 0x100c: raise prog_words
+	reg [15:0] set_pw_val;
+	integer    code_lane;
 	reg [1:0]  hdr_i;
 
 	// The word read this cycle, available next cycle in rom_q (the resident
 	// images) or seq_q (the staged one): header words 2-4, then each section.
-	wire [13:0] seq_addr = (seq_state == SEQ_HEADER) ? 14'd2 + hdr_i
-	                     : 14'd8 + seq_i + ((seq_state != SEQ_CODE) ? stage_code : 16'd0)
+	wire [14:0] seq_addr = (seq_state == SEQ_HEADER) ? 15'd2 + hdr_i
+	                     : 15'd8 + seq_i + ((seq_state != SEQ_CODE) ? stage_code : 16'd0)
 	                                     + ((seq_state == SEQ_GLOBALS) ? stage_heap : 16'd0);
 	always @(posedge clk_sys) begin
-		rom_q <= (seq_state == SEQ_GLOBALS) ? globals_rom[seq_i] : heap_rom[seq_i];
+		rom_q <= (seq_state == SEQ_GLOBALS) ? globals_rom[seq_i][31:0] : heap_rom[seq_i][31:0];
 		seq_q <= stage_ram[seq_addr];
 	end
 
 	always @(posedge clk_sys) begin
 		load_we <= 1'b0;
+		if (set_pw) prog_words <= set_pw_val;
 		if (!resetn) begin
 			seq_state <= SEQ_RESIDENT;
 			seq_from_stage <= 1'b0;
@@ -201,7 +246,7 @@ module ethmin_vm_core #(
 			// Each section: read word i, write it the cycle after.
 			SEQ_CODE, SEQ_HEAP, SEQ_GLOBALS: begin
 				if (seq_data_ready) begin
-					if (seq_state == SEQ_CODE) prog_code[seq_i[12:0] - 1] <= seq_q;
+					if (seq_state == SEQ_CODE) ;   // written on the shared port
 					else begin
 						load_we <= 1'b1;
 						load_globals <= seq_state == SEQ_GLOBALS;
@@ -219,7 +264,7 @@ module ethmin_vm_core #(
 					case (seq_state)
 						SEQ_CODE: begin seq_n <= stage_heap; seq_state <= SEQ_HEAP; end
 						SEQ_HEAP: begin   // every global slot: no stale pointers for the GC
-							seq_n <= 16'd4096;
+							seq_n <= 16'd1 << GLOBALS_AW;   // every slot, so the GC never scans garbage
 							glob_count <= seq_from_stage ? stage_globals : `GLOBALS_WORDS;
 							seq_state <= SEQ_GLOBALS;
 						end
@@ -228,9 +273,13 @@ module ethmin_vm_core #(
 				end
 			end
 			SEQ_START: begin
-				image_words <= seq_from_stage ? stage_heap[HEAP_AW-1:0] : `HEAP_WORDS;
+				// stage_heap is 16 bits and image_words is HEAP_AW: the
+				// assignment pads or truncates as needed, where the slice
+				// that used to be here reached past the end of a heap
+				// wider than 16 bits
+				image_words <= seq_from_stage ? stage_heap : `HEAP_WORDS;
 				code_bank   <= seq_from_stage;
-				prog_words  <= stage_code[13:0];
+				prog_words  <= stage_code[15:0];
 				seq_state   <= SEQ_RUN;         // the VM leaves reset next cycle
 			end
 			SEQ_RUN: begin
@@ -248,6 +297,34 @@ module ethmin_vm_core #(
 	end
 	wire vm_reset = !resetn || vm_hold;
 
+	// Instruction fetch.  Both code memories are read synchronously so they
+	// infer block RAM (read asynchronously they cost ~14K LUTs of
+	// distributed RAM).  The word read is kept with the pc it came from:
+	// while it is the one the VM wants, code_valid is high and the next
+	// word is prefetched, so running straight through costs no extra cycle
+	// and only a jump pays one.
+	wire [31:0] code_rom_q_w;
+	reg  [31:0] code_prog_q;   // one registered output each: the block RAM's
+	reg  [23:0] code_q_pc;
+	reg         code_q_valid, fetch_in_range;
+	wire        code_valid = code_q_valid && code_q_pc == pc;
+	wire [23:0] fetch_pc = code_valid ? pc + 24'd1 : pc;   // prefetch past a hit
+	wire [31:0] code_rdata = !fetch_in_range ? 32'hDEADBEEF : code_bank ? code_prog_q : code_rom_q_w;
+
+	code_rom_bram code_rom_i (
+		.clk(clk_sys), .en(1'b1), .addr(fetch_pc[14:0]), .dout(code_rom_q_w));
+
+	always @(posedge clk_sys) begin
+		code_prog_q <= prog_code[fetch_pc[14:0]];
+		fetch_in_range <= code_bank ? (fetch_pc < {8'd0, prog_words})
+		                            : (fetch_pc < `PROGRAM_WORDS);
+		code_q_pc <= fetch_pc;
+		// a new program invalidates what was fetched, and so does writing
+		// over the word that was prefetched
+		code_q_valid <= !vm_reset && !code_wr;
+	end
+
+
 	// ─── the VM ──────────────────────────────────────────────────────────
 	wire        trap_valid;
 	wire [7:0]  trap_prim;
@@ -258,12 +335,18 @@ module ethmin_vm_core #(
 	wire [7:0]  putc_char;
 
 	ocaml4142_vm_rtl #(
-		.STACK_AW      (13),
+		.STACK_AW      (15),
 		.HEAP_AW       (HEAP_AW),
+		// 8K globals, not 4K: 4096 x 32 packs into exactly four RAMB36s at x9,
+		// and a RAMB36 at x9 loses its ninth bit in the open flow.  This is
+		// the pointer table -- every string constant is reached through it --
+		// which is how the board printed intact strings with wrong pointers
+		// and a MAC of "ting i".  At 8K deep yosys packs it x4, which works.
+		.GLOBALS_AW    (GLOBALS_AW),
 		.EXTERNAL_IMAGE(1'b1)
 	) vm (
 		.clk(clk_sys), .reset(vm_reset),
-		.pc(pc), .code_rdata(code_rdata),
+		.pc(pc), .code_rdata(code_rdata), .code_valid(code_valid),
 		.trap_valid(trap_valid), .trap_prim(trap_prim),
 		.trap_arg0(trap_arg0), .trap_arg1(trap_arg1),
 		.trap_ready(trap_ready), .trap_result(trap_result),
@@ -332,34 +415,81 @@ module ethmin_vm_core #(
 
 	// ─── millisecond timer ───────────────────────────────────────────────
 	localparam integer MS_DIV = CLK_HZ / 1000;
-	reg [15:0] ms_prescale;
+	localparam integer MS_W   = $clog2(MS_DIV);   // 100 MHz needs 17 bits, not 16
+	reg [MS_W-1:0] ms_prescale;
 	reg [29:0] ms_count;
 	always @(posedge clk_sys)
 		if (!resetn) begin
-			ms_prescale <= 16'd0;
+			ms_prescale <= {MS_W{1'b0}};
 			ms_count    <= 30'd0;
 		end else if (ms_prescale == MS_DIV - 1) begin
-			ms_prescale <= 16'd0;
+			ms_prescale <= {MS_W{1'b0}};
 			ms_count    <= ms_count + 30'd1;
-		end else ms_prescale <= ms_prescale + 16'd1;
+		end else ms_prescale <= ms_prescale + 1'b1;
 
 	// ─── the I/O space, answering the VM's trap port ─────────────────────
 	// One trap_ready per request; a request is not acted on again until
 	// trap_valid has dropped (the VM drops it on seeing trap_ready).
 	localparam [7:0] TRAP_IO_READ = 8'h01, TRAP_IO_WRITE = 8'h02;
+	// The floating-point peripheral: an operand at a time, then the
+	// operation, then the upper half of the answer.
+	localparam [7:0] TRAP_FP_A = 8'h10, TRAP_FP_B = 8'h11,
+	                 TRAP_FP_EXEC = 8'h12, TRAP_FP_HI = 8'h13;
 	localparam [2:0] IO_IDLE = 3'd0, IO_PKT_READ = 3'd1, IO_UART = 3'd2, IO_DONE = 3'd3,
-	                 IO_STAGE_READ = 3'd4;
+	                 IO_STAGE_READ = 3'd4, IO_FP_WAIT = 3'd5, IO_CODE_READ = 3'd6;
 	reg [2:0] io_state;
 	reg [1:0] io_lane;
 	reg [7:0] leds;
 	assign LED = leds;
+
+	// The DIP switches are asynchronous to everything: two flops before the
+	// processor ever sees them.
+	reg [7:0] dip_sync [0:1];
+	reg [4:0] btn_sync [0:1];
+	always @(posedge clk_sys) begin
+		dip_sync[0] <= DIP;
+		dip_sync[1] <= dip_sync[0];
+		btn_sync[0] <= BTN;
+		btn_sync[1] <= btn_sync[0];
+	end
+
+	// ─── the floating-point peripheral ───────────────────────────────────
+	reg  [63:0] fp_a, fp_b, fp_res;
+	reg         fp_start;
+	reg  [3:0]  fp_op;
+	wire        fp_done, fp_flag;
+	wire [63:0] fp_result;
+	fpu_hardfloat fpu (
+		.clk(clk_sys), .resetn(resetn && !vm_reset),
+		.start(fp_start), .op(fp_op), .a(fp_a), .b(fp_b),
+		.done(fp_done), .result(fp_result), .flag(fp_flag));
+
+	wire fp_is_cmp = (fp_op == 4'd5) || (fp_op == 4'd6) || (fp_op == 4'd7);
+	wire fp_trap = (trap_prim == TRAP_FP_A) || (trap_prim == TRAP_FP_B) ||
+	               (trap_prim == TRAP_FP_EXEC) || (trap_prim == TRAP_FP_HI);
+	wire fp_new  = trap_valid && fp_trap && io_state == IO_IDLE && !vm_reset;
 
 	wire io_read  = trap_prim == TRAP_IO_READ;
 	wire io_write = trap_prim == TRAP_IO_WRITE;
 	wire io_new   = trap_valid && (io_read || io_write) && io_state == IO_IDLE && !vm_reset;
 	wire [31:0] io_addr = trap_arg0;
 	wire io_is_packet = io_addr < 32'h1000;
-	wire io_is_stage  = io_addr >= 32'h10000 && io_addr < 32'h20000;
+	// 128 KiB, which is what STAGE_WORDS has always held: the decode used
+	// to reach only half of it, and a netboot image that outgrew 64 KiB
+	// stopped being acknowledged part way through the transfer.
+	wire io_is_stage  = io_addr >= 32'h10000 && io_addr < 32'h30000;
+
+	// Base-relative: the boot sequencer reads the image from word 0.  The old
+	// [15:2] did that by accident, dropping bit 16 of a window that was one
+	// bit wide; over 128 KiB the offset has to be taken properly.
+	wire [14:0] stage_idx = (io_addr - 32'h10000) >> 2;
+
+	// Code memory while the VM runs.  The sequencer's write port is idle
+	// then, so the two share it; they cannot collide, because the VM is
+	// held in reset for the whole of a load and io_new needs !vm_reset.
+	wire io_is_code = io_addr >= 32'h60000 && io_addr < 32'h80000;
+	wire [14:0] code_idx = (io_addr - 32'h60000) >> 2;
+	wire code_wr = io_new && io_is_code && io_write;
 
 	always @(*) begin
 		pa_en    = io_new && io_is_packet;
@@ -371,7 +501,26 @@ module ethmin_vm_core #(
 		uf_din   = putc_valid ? putc_char : trap_arg1[7:0];
 	end
 
-	wire [31:0] io_read_word = (io_state == IO_PKT_READ) ? pa_rdata : stage_q;
+	wire [31:0] io_read_word = (io_state == IO_PKT_READ) ? pa_rdata
+	                         : (io_state == IO_CODE_READ) ? code_q : stage_q;
+
+	// prog_code's second port.  The sequencer loads a program through it and
+	// a running program writes and reads its own code through it; the fetch
+	// unit has the other.  One block, one address, byte enables -- which is
+	// the pattern block RAM is inferred from, and mixing a whole-word write
+	// with byte writes over two blocks is not.
+	wire        pc_load  = (seq_state == SEQ_CODE) && seq_data_ready;
+	wire [14:0] pc_paddr = pc_load ? (seq_i[14:0] - 15'd1) : code_idx;
+	wire [31:0] pc_pdata = pc_load ? seq_q : {4{trap_arg1[7:0]}};
+	wire [ 3:0] pc_pbe   = pc_load ? 4'b1111
+	                     : (code_wr ? (4'b0001 << io_addr[1:0]) : 4'b0000);
+	reg [31:0] code_q;
+	always @(posedge clk_sys) begin
+		for (code_lane = 0; code_lane < 4; code_lane = code_lane + 1)
+			if (pc_pbe[code_lane])
+				prog_code[pc_paddr][8*code_lane +: 8] <= pc_pdata[8*code_lane +: 8];
+		code_q <= prog_code[pc_paddr];
+	end
 
 	// The staging RAM's program side: a byte per address, as the packet RAM.
 	reg [31:0] stage_q;
@@ -381,15 +530,17 @@ module ethmin_vm_core #(
 			if (io_write)
 				for (stage_lane = 0; stage_lane < 4; stage_lane = stage_lane + 1)
 					if (io_addr[1:0] == stage_lane)
-						stage_ram[io_addr[15:2]][8*stage_lane +: 8] <= trap_arg1[7:0];
-			stage_q <= stage_ram[io_addr[15:2]];
+						stage_ram[stage_idx][8*stage_lane +: 8] <= trap_arg1[7:0];
+			stage_q <= stage_ram[stage_idx];
 		end
 
 	always @(posedge clk_sys) begin
 		trap_ready <= 1'b0;
+		fp_start   <= 1'b0;
 		rx_ack     <= 1'b0;
 		tx_start   <= 1'b0;
 		boot_req   <= 1'b0;
+		set_pw     <= 1'b0;
 		rxf_pop    <= 1'b0;
 		if (!resetn || vm_reset) begin
 			io_state <= IO_IDLE;
@@ -398,9 +549,23 @@ module ethmin_vm_core #(
 				tx_len <= 11'd0;
 			end
 		end else case (io_state)
-			IO_IDLE: if (io_new) begin
+			IO_IDLE: if (fp_new) begin
+				case (trap_prim)
+					TRAP_FP_A: begin fp_a <= {trap_arg1, trap_arg0}; trap_ready <= 1'b1; io_state <= IO_DONE; end
+					TRAP_FP_B: begin fp_b <= {trap_arg1, trap_arg0}; trap_ready <= 1'b1; io_state <= IO_DONE; end
+					TRAP_FP_HI: begin trap_result <= fp_res[63:32];  trap_ready <= 1'b1; io_state <= IO_DONE; end
+					default: begin                 // TRAP_FP_EXEC
+						fp_op    <= trap_arg0[3:0];
+						fp_start <= 1'b1;
+						io_state <= IO_FP_WAIT;
+					end
+				endcase
+			end else if (io_new) begin
 				io_lane <= io_addr[1:0];
-				if (io_is_packet || io_is_stage) begin
+				if (io_is_code) begin
+					if (io_read) io_state <= IO_CODE_READ;   // block RAM data next cycle
+					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
+				end else if (io_is_packet || io_is_stage) begin
 					if (io_read) io_state <= io_is_packet ? IO_PKT_READ : IO_STAGE_READ;  // BRAM data next cycle
 					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
 				end else if (io_write && io_addr == 32'h1005) begin
@@ -412,6 +577,9 @@ module ethmin_vm_core #(
 						32'h1002: trap_result <= {21'd0, rx_len};
 						32'h1004: trap_result <= {24'd0, leds};
 						32'h1006: trap_result <= {2'b00, ms_count};
+						32'h1009: trap_result <= {24'd0, dip_sync[1]};  // the DIP switches
+						32'h100a: trap_result <= BUILD_ID;             // commit, dirty, flow
+						32'h100b: trap_result <= {27'd0, btn_sync[1]}; // the push buttons
 						32'h1008: begin                               // a received byte, or -1
 							trap_result <= rxf_empty ? 32'hFFFFFFFF : {24'd0, rx_fifo[rxf_rp[7:0]]};
 							rxf_pop <= io_read && !rxf_empty;
@@ -423,13 +591,14 @@ module ethmin_vm_core #(
 						32'h1003: begin tx_len <= trap_arg1[10:0]; tx_start <= 1'b1; end
 						32'h1004: leds <= trap_arg1[7:0];
 						32'h1007: boot_req <= 1'b1;                   // boot the staged image
+						32'h100c: begin set_pw <= 1'b1; set_pw_val <= trap_arg1[15:0]; end
 						default: ;
 					endcase
 					trap_ready <= 1'b1;
 					io_state   <= IO_DONE;
 				end
 			end
-			IO_PKT_READ, IO_STAGE_READ: begin
+			IO_PKT_READ, IO_STAGE_READ, IO_CODE_READ: begin
 				trap_result <= {24'd0, io_read_word[8*io_lane +: 8]};
 				trap_ready  <= 1'b1;
 				io_state    <= IO_DONE;
@@ -437,6 +606,14 @@ module ethmin_vm_core #(
 			IO_UART: if (!uf_full) begin                         // the FIFO took the byte
 				trap_ready <= 1'b1;
 				io_state   <= IO_DONE;
+			end
+			IO_FP_WAIT: if (fp_done) begin
+				fp_res      <= fp_result;
+				// a comparison answers with its bit; everything else with
+				// the lower half, the upper half fetched after it
+				trap_result <= fp_is_cmp ? {31'd0, fp_flag} : fp_result[31:0];
+				trap_ready  <= 1'b1;
+				io_state    <= IO_DONE;
 			end
 			IO_DONE: if (!trap_valid) io_state <= IO_IDLE;
 			default: io_state <= IO_IDLE;

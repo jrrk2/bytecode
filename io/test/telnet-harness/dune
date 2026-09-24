@@ -1,0 +1,19 @@
+; The device's TCP (io/telnet.ml) against mirage-tcpip, in one process.
+; `make -C io/test/telnet-harness` prepares telnet_core.ml from io/telnet.ml
+; (the same source, with the hardware block replaced by host_hw.ml).
+(executable
+ (name harness)
+ (modules host_hw telnet_core harness)
+ (libraries tcpip.tcp tcpip.ipv4 ethernet mirage-vnetif mirage-clock-unix lwt lwt.unix str))
+
+(executable
+ (name replay)
+ (modes byte exe)
+ (modules host_hw_r telnet_core_r replay))
+
+(executable
+ (name bench)
+ (modes byte exe)
+ (modules host_hw_b telnet_core_b bench))
+
+(env (_ (flags (:standard -w -a))))

@@ -5,7 +5,7 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 PROJ=$REPO/fpga/vc707-ethmin
-ETH=${XC7BT:-$HOME/xc7-bitstream-tools}/examples/vc707-ethmin/rtl
+ETH=$REPO/fpga/eth-rtl
 OBJ=${OBJ:-$HOME/bytecode-work/vc707-ethmin-sim-obj}
 cd "$PROJ"
 verilator --cc --exe --build -j 8 -Wno-fatal -Wno-lint -Wno-style --top-module ethmin_vm_core \

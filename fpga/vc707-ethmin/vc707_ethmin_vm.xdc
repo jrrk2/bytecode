@@ -71,8 +71,37 @@ create_clock -period 16.000 -name gt_rxoutclk \
 # TX, RX and the fabric are mutually asynchronous.  eth_gmii_retime256 is the
 # CDC between all three: each direction crosses to mac_clk through its own
 # toggle handshake, which is exactly why the retimer is mandatory here.
+# clk_sys and clk_mac come from one MMCM, so they are related clocks and were
+# analysed against each other.  At 50 and 125 MHz that left 3.975 ns and passed
+# unnoticed; at 100 and 125 the closest edges are 2 ns apart and 163 paths
+# fail.  They cross through the same toggle handshakes as everything else here
+# -- the DMA's, and the packet RAM's two independent clocks -- so the honest
+# statement is that they are asynchronous too.
 set_clock_groups -asynchronous \
-    -group [get_clocks -include_generated_clocks sysclk] \
+    -group [get_clocks clk_sys_unbuf] \
+    -group [get_clocks clk_mac_unbuf] \
     -group [get_clocks -include_generated_clocks gt_txoutclk] \
     -group [get_clocks -include_generated_clocks gt_rxoutclk] \
     -group [get_clocks -include_generated_clocks sgmii_refclk]
+
+# SW11, the user DIP switch: switches 0-6 are the image server's host
+# number on this board's network, switch 7 turns the receive log on (pins
+# from Vivado's vc707 board file).  A switch that is off drives nothing, so
+# the input needs a pull-down or it floats -- and floating reads as on.
+set_property -dict {PACKAGE_PIN AV30 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_DIP_SW[0]}]
+set_property -dict {PACKAGE_PIN AY33 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_DIP_SW[1]}]
+set_property -dict {PACKAGE_PIN BA31 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_DIP_SW[2]}]
+set_property -dict {PACKAGE_PIN BA32 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_DIP_SW[3]}]
+set_property -dict {PACKAGE_PIN AW30 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_DIP_SW[4]}]
+set_property -dict {PACKAGE_PIN AY30 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_DIP_SW[5]}]
+set_property -dict {PACKAGE_PIN BA30 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_DIP_SW[6]}]
+set_property -dict {PACKAGE_PIN BB31 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_DIP_SW[7]}]
+
+# The five push buttons (pins from Vivado's vc707 board file).  Holding any
+# of them turns the receive log on, which is a thing to do while watching
+# rather than a switch to remember to put back.
+set_property -dict {PACKAGE_PIN AV39 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[0]}]
+set_property -dict {PACKAGE_PIN AW40 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[1]}]
+set_property -dict {PACKAGE_PIN AP40 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[2]}]
+set_property -dict {PACKAGE_PIN AU38 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[3]}]
+set_property -dict {PACKAGE_PIN AR40 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[4]}]

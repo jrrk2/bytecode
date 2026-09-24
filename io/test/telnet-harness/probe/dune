@@ -1,0 +1,7 @@
+; A frame the device might meet on a real network, offered to its TCP with
+; nothing else running: the harness's peer is one stack, the wire is not.
+(executable
+ (name synprobe)
+ (modules host_hw telnet_core synprobe)
+ (libraries str))
+(env (_ (flags (:standard -w -a))))

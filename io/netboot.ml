@@ -1,6 +1,8 @@
 (* netboot: the resident loader.  It leases an address by DHCP (as
    dhcp.ml), then fetches a program image by TFTP -- from the server and file
-   the DHCP reply names (siaddr, file), else 192.168.1.106 and "vm.img" --
+   the DHCP reply names (siaddr, file) -- or, when the DIP switches are
+   set, this board's own network with the switches as the host number
+   (1..255) -- else 10.10.10.10 and "vm.img" --
    into the staging RAM, checks it (tools/mkvmimage.py's format) and writes
    BOOT: the boot sequencer then loads it into the VM and starts it.
    (siaddr counts only when the reply names a file too.)
@@ -60,9 +62,11 @@ let eth_txlen = 0x1003
 let leds = 0x1004
 let uart = 0x1005
 let timer_ms = 0x1006
+let dip_sw = 0x1009
+let buttons = 0x100b
 let boot_reg = 0x1007
 let stage = 0x10000
-let stage_size = 0x10000
+let stage_size = 0x20000   (* 128 KiB of staging RAM *)
 
 let eth_rx_valid = 1
 let eth_tx_busy = 2
@@ -249,7 +253,7 @@ let dhcp_parse len =
   !msg
 
 (* ---- where to boot from ---- *)
-let server_ip = [| 192; 168; 1; 106 |]
+let server_ip = [| 10; 10; 10; 10 |]
 let server_mac = [| 0; 0; 0; 0; 0; 0 |]
 let file_name = [| 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0;
                    0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0 |]
@@ -291,10 +295,25 @@ let handle_dhcp len =
     | Requesting, 5 ->                                          (* ACK *)
       for i = 0 to 3 do array_set my_ip i (array_get offered_ip i) done;
       note_boot_server ();
+      (* The address is the one the server handed out.  The DIP switches
+         (SW11) say who serves the image: this board's own network, with the
+         eight switches as the host number, 1..255 -- so the board can move
+         to another network with nothing to set, and which machine holds
+         vm.img is a front-panel decision.  All switches off leaves the
+         reply's siaddr (or the 10.10.10.10 fallback) in charge. *)
+      let dip = io_read dip_sw land 0xFF in
+      if dip <> 0 then begin
+        for i = 0 to 2 do array_set server_ip i (array_get my_ip i) done;
+        array_set server_ip 3 dip
+      end;
       state := Bound;
       deadline := now () + !lease_s * 500;                      (* T1: half the lease, in ms *)
       uart_puts "dhcp: bound ";
       uart_ip my_ip;
+      if io_read dip_sw land 0xFF <> 0 then begin
+        uart_puts " (dip "; uart_dec (io_read dip_sw land 0xFF);
+        uart_puts ": tftp from "; uart_ip server_ip; uart_putc ')'
+      end;
       uart_puts " lease ";
       uart_dec !lease_s;
       uart_puts " s from ";
@@ -394,8 +413,8 @@ let server_arp_reply len =
 (* ---- the image: tools/mkvmimage.py's header, then code, heap, globals ---- *)
 let byte i = io_read (stage + i)
 let small i = byte i lor (byte (i + 1) lsl 8) lor (byte (i + 2) lsl 16)   (* a word < 2^24 *)
-let code_max = 8192          (* the program code RAM, in words *)
-let heap_max = 2048          (* heap image words the VM's heap can take *)
+let code_max = 32768         (* the program code RAM, in words *)
+let heap_max = 4096          (* heap image words the VM's heap can take *)
 let globals_max = 4096
 let prims_digest = [| 0x21; 0xad; 0xa2; 0x86 |]   (* mkvmimage.py: this VM's primitives *)
 
@@ -485,13 +504,60 @@ let boot_tick () =
     | Checking -> check_and_boot (); boot_state := Done
     | Done -> ()
 
+(* The receive log: a line per frame -- what it was, from whom, and whether
+   its destination was this board, which is what a ping that does not come
+   back is asking.  It costs a few milliseconds of UART per frame, so on a
+   busy network it is not something to leave on: hold any of the board's
+   push buttons and the frames are logged while the button is down.
+   debug_rx_hex adds the raw head, for a receive path that delivers damaged
+   frames. *)
+let debug_rx () = io_read buttons land 0x1F <> 0
+let debug_rx_hex = false
+let uart_ip_at off =
+  for i = 0 to 3 do
+    uart_dec (rx (off + i));
+    if i < 3 then uart_putc '.'
+  done
+
+let uart_hex8 v =
+  let d n = if n < 10 then int_of_char '0' + n else int_of_char 'a' + n - 10 in
+  io_write uart (d ((v lsr 4) land 15)); io_write uart (d (v land 15))
 let uart_hex16 v =
   let digits = "0123456789abcdef" in
   for k = 3 downto 0 do uart_putc (string_get digits ((v lsr (4 * k)) land 0xF)) done
 
+let build_id = 0x100a
+
+(* "24d6527 open": the commit this bitstream was built from (with a + if the
+   tree was dirty) and which flow built it, so a board on a bench says what
+   it is running. *)
+let uart_build () =
+  (* the switches as the board sees them, so a switch that does nothing can
+     be told from a switch read the wrong way round *)
+  let digits = "0123456789abcdef" in
+  let v = io_read build_id in
+  if v = 0 then uart_puts "unstamped"
+  else begin
+    let digits = "0123456789abcdef" in
+    for k = 6 downto 0 do uart_putc (string_get digits ((v lsr (4 * k)) land 0xF)) done;
+    if v land 0x10000000 <> 0 then uart_putc '+';
+    let flow = (v lsr 29) land 3 in   (* 30:29: bit 31 is past a 31-bit int *)
+    if flow = 1 then uart_puts " open"
+    else if flow = 2 then uart_puts " vivado"
+    else uart_puts " ?"
+  end;
+  let d = io_read dip_sw land 0xFF in
+  uart_puts " dip=";
+  uart_putc (string_get digits ((d lsr 4) land 0xF));
+  uart_putc (string_get digits (d land 0xF));
+  uart_puts " btn=";
+  uart_putc (string_get digits (io_read buttons land 0x1F))
+
 let () =
   io_write leds 1;
-  uart_puts "netboot (OCaml VM): phy=";
+  uart_puts "netboot (OCaml processor): build ";
+  uart_build ();
+  uart_puts " phy=";
   uart_hex16 (io_read eth_status_phy);
   uart_putc '\n';
   let pkts = ref 0 in
@@ -501,6 +567,42 @@ let () =
     let st = io_read eth_status in
     if st land eth_rx_valid <> 0 then begin
       let len = io_read eth_rxlen land 0x7FF in
+      if debug_rx () then begin
+        (* One line per frame, named rather than dumped: which protocol
+           arrived, from and to which address, and -- the question a ping
+           that does not come back asks -- whether it was for us.  The raw
+           head is still there under debug_rx_hex, for a receive path that
+           delivers damaged frames. *)
+        uart_puts "rx "; uart_dec len; uart_putc ' ';
+        let et = (rx 12 lsl 8) lor rx 13 in
+        if et = 0x0806 then begin
+          uart_puts "arp ";
+          uart_dec (rx 27);                                  (* opcode: 1 request, 2 reply *)
+          uart_puts " who-has "; uart_ip_at 38;
+          uart_puts " tell "; uart_ip_at 28
+        end else if et = 0x0800 then begin
+          let ihl = (rx 14 land 0x0F) * 4 in
+          let proto = rx 23 in
+          uart_ip_at 26; uart_puts " -> "; uart_ip_at 30;
+          uart_puts (if ip_is_mine 30 then " (mine)" else " (not mine)");
+          if proto = 1 then begin
+            uart_puts " icmp type "; uart_dec (rx (14 + ihl))
+          end else if proto = 17 then begin
+            uart_puts " udp "; uart_dec ((rx (14 + ihl) lsl 8) lor rx (14 + ihl + 1));
+            uart_puts " -> "; uart_dec ((rx (14 + ihl + 2) lsl 8) lor rx (14 + ihl + 3))
+          end else begin
+            uart_puts " proto "; uart_dec proto
+          end
+        end else begin
+          uart_puts "ethertype 0x"; uart_hex16 et
+        end;
+        uart_putc '\n';
+        if debug_rx_hex then begin
+          uart_puts "   ";
+          for i = 0 to 15 do uart_putc ' '; uart_hex8 (rx i) done;
+          uart_putc '\n'
+        end
+      end;
       if rx 12 = 0x08 && rx 13 = 0x06 then begin handle_arp len; server_arp_reply len end
       else if rx 12 = 0x08 && rx 13 = 0x00 && len >= 42 then begin
         let ihl = (rx 14 land 0x0F) * 4 in

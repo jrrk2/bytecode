@@ -125,6 +125,11 @@
     // DIVINT / MODINT: one quotient bit per cycle
     S_DIV_ITER,
 
+    // MULINT: operands registered, then the product, so the multiplier is
+    // pipelined and off the critical path
+    S_MUL_MUL,
+    S_MUL_DONE,
+
     // Bytes: a byte store, caml_create_bytes, caml_string_equal
     S_BYTESET_RMW,
     S_CREATE_BYTES,
@@ -139,6 +144,35 @@
     // vm_io_read / vm_io_write: waiting on the trap port
     S_IO_WAIT,
 
+    // exceptions: the trap frame, the raise and the zero-divide raise
+    S_PUSHTRAP_WRITE_FRAME,
+    S_POPTRAP,
+    S_RAISE_ENTER,
+    S_RAISE_READ,
+    S_RAISE_FRAME,
+    S_ZERO_DIVIDE,
+    S_STACK_OVERFLOW,
+    S_OUT_OF_MEMORY,
+    S_BOUND_ERROR,
+    S_BOUNDEXN_MSG_HDR,
+    S_BOUNDEXN_MSG,
+    S_BOUNDEXN_EXN_HDR,
+    S_BOUNDEXN_ID,
+    S_BOUNDEXN_MSG_FIELD,
+    S_BOUNDEXN_STORE,
+    S_ARRBOUND_GET,
+    S_ARRBOUND_SET,
+    S_STRBOUND_HDR,
+    S_STRBOUND_LAST,
+    // floating point: the operands out of their boxes, through the FPU
+    // peripheral on the trap port, and the answer back into a fresh box
+    S_FP_READ_A,
+    S_FP_READ_B,
+    S_FP_SEND_A,
+    S_FP_SEND_B,
+    S_FP_EXEC,
+    S_FP_HI,
+    S_FP_BOX,
     // obsolete states
     S_OFFSETCLOSURE_READ,
     S_OFFSETCLOSURE_ADD,

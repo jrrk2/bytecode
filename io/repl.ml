@@ -6,8 +6,9 @@
      - = 3628800
 
    The language: integers and booleans; + - * / mod; = <> < > <= >=;
-   if/then/else; let [rec] f x y = e [in e]; fun x y -> e; application by
-   juxtaposition; parentheses.  Top-level lets extend the session.
+   if/then/else; let [rec] f x y = e [in e]; fun x y -> e; try e with _ ->
+   e (or "with m ->" to see the message); application by juxtaposition;
+   parentheses.  Top-level lets extend the session.
 
    Two ways in, one session: typing at the UART (echo, backspace), and UDP
    datagrams to port 7777 -- `nc -u <address> 7777` -- whose lines are
@@ -366,8 +367,10 @@ type expr =
   | Fun of string * expr
   | App of expr * expr
   | Let of bool * string * expr * expr    (* rec?, name, bound, body *)
+  | Try of expr * string * expr           (* try e with x -> e: x names the message *)
 
-let keyword s = string_equal s "let" || string_equal s "rec" || string_equal s "in"
+let keyword s = string_equal s "try" || string_equal s "with"
+                || string_equal s "let" || string_equal s "rec" || string_equal s "in"
                 || string_equal s "if" || string_equal s "then" || string_equal s "else"
                 || string_equal s "fun" || string_equal s "true" || string_equal s "false"
                 || string_equal s "mod"
@@ -413,6 +416,27 @@ let rec parse_expr toks = match toks with
              match parse_expr rest with
              | Err e -> Err e
              | Ok (b, rest) -> Ok (If (c, a, b), rest))
+  (* try e with _ -> e2, or "with x -> e2" to bind the failure's message:
+     an error anywhere in e -- division by zero, an unbound name, a bad
+     operand -- gives e2 instead.  The machine's own exceptions are what
+     this is built on: see io/exc.ml. *)
+  | t :: rest when is_kw t "try" ->
+    (match parse_expr rest with
+     | Err e -> Err e
+     | Ok (body, rest) ->
+       match expect rest "with" with
+       | Err e -> Err e
+       | Ok rest ->
+         let (name, rest) = match rest with
+           | TId x :: r when not (keyword x) -> (x, r)
+           | TSym x :: r when string_equal x "_" -> ("_", r)
+           | _ -> ("_", rest) in
+         match expect rest "->" with
+         | Err e -> Err e
+         | Ok rest ->
+           match parse_expr rest with
+           | Err e -> Err e
+           | Ok (handler, rest) -> Ok (Try (body, name, handler), rest))
   | t :: rest when is_kw t "fun" ->
     let (ps, rest) = params rest [] in
     (match ps with
@@ -510,6 +534,9 @@ and parse_atom toks = match toks with
     (match parse_atom rest with
      | Err e -> Err e
      | Ok (a, rest) -> Ok (Binop ("-", Int 0, a), rest))
+  (* () is the argument of a niladic builtin such as ms (); the language has
+     no unit, so it is 0 *)
+  | t :: t2 :: rest when is_sym t "(" && is_sym t2 ")" -> Ok (Int 0, rest)
   | t :: rest when is_sym t "(" ->
     (match parse_expr rest with
      | Err e -> Err e
@@ -523,6 +550,7 @@ and parse_atom toks = match toks with
 type value =
   | VInt of int
   | VBool of bool
+  | VStr of string                        (* a caught failure's message *)
   | VClosure of string * expr * env ref   (* the ref lets a let rec see itself *)
 and env = (string * value) list
 
@@ -573,6 +601,9 @@ let rec eval env e = match e with
      | Ok (VBool false) -> eval env b
      | Ok _ -> Err "if needs a bool"
      | Err m -> Err m)
+  (* ms (): milliseconds since reset, straight from the hardware counter,
+     so a program can time itself: let t = ms () in ... ms () - t *)
+  | App (Var f, _) when string_equal f "ms" -> Ok (VInt (now ()))
   | App (f, a) ->
     (match eval env f with
      | Err m -> Err m
@@ -581,6 +612,14 @@ let rec eval env e = match e with
         | Err m -> Err m
         | Ok va -> eval ((x, va) :: !cenv) body)
      | Ok _ -> Err "not a function")
+  | Try (body, name, handler) ->
+    (match eval env body with
+     | Ok v -> Ok v
+     | Err m ->
+       (* the handler sees the message as a string value if it asked for a
+          name; "_" discards it *)
+       if string_equal name "_" then eval env handler
+       else eval ((name, VStr m) :: env) handler)
   | Let (recursive, name, bound, body) ->
     (match eval env bound with
      | Err m -> Err m
@@ -594,9 +633,50 @@ let rec eval env e = match e with
 let print_value v = match v with
   | VInt n -> put_int n
   | VBool b -> puts (if b then "true" else "false")
+  | VStr s -> putc '"'; puts s; putc '"'
   | VClosure _ -> puts "<fun>"
 
 let session = ref []
+
+
+(* A name used but never bound is an error in the definition, not in the
+   call that finds out: OCaml says so when the let is typed, and a mini-ML
+   that waits until the closure runs gives "unbound fact" to someone who
+   has just seen "val fact = <fun>".  This walks an expression for the
+   first free name, with the session's own bindings counted as bound. *)
+let rec bound_in names x = match names with
+  | [] -> false
+  | y :: rest -> if string_equal x y then true else bound_in rest x
+
+let rec free_name names e = match e with
+  | Int _ -> Ok ()
+  | Bool _ -> Ok ()
+  | Var x -> if bound_in names x then Ok () else Err x
+  | Fun (p, body) -> free_name (p :: names) body
+  | App (f, a) ->
+    (match free_name names f with Err m -> Err m | Ok () -> free_name names a)
+  | Binop (_, a, b) ->
+    (match free_name names a with Err m -> Err m | Ok () -> free_name names b)
+  | If (c, a, b) ->
+    (match free_name names c with
+     | Err m -> Err m
+     | Ok () -> match free_name names a with Err m -> Err m | Ok () -> free_name names b)
+  | Try (body, x, handler) ->
+    (match free_name names body with Err m -> Err m | Ok () -> free_name (x :: names) handler)
+  | Let (recursive, name, bound, body) ->
+    let inner = if recursive then name :: names else names in
+    (match free_name inner bound with
+     | Err m -> Err m
+     | Ok () -> free_name (name :: names) body)
+
+let session_names () =
+  let rec go env acc = match env with
+    | [] -> acc
+    | (n, _) :: rest -> go rest (n :: acc) in
+  go !session []
+
+(* "ms" is the one name the evaluator answers for without a binding *)
+let scope_check e = free_name ("ms" :: session_names ()) e
 
 let evaluate_line () =
   if !line_len > 0 then begin
@@ -611,15 +691,34 @@ let evaluate_line () =
       | Err m -> puts "error: "; puts m; newline ()
       | Ok (_, _ :: _) -> puts "error: unexpected input at the end"; newline ()
       | Ok (e, []) ->
+        match scope_check e with
+        | Err x ->
+          puts "error: unbound "; puts x;
+          (* the usual cause: a function that calls itself, written without
+             rec, which binds nothing for its own body *)
+          (match e with
+           | Let (false, name, _, _) when string_equal name x ->
+             puts " (did you mean \"let rec\"?)"
+           | _ -> ());
+          newline ()
+        | Ok () ->
+        let t0 = now () in
         match eval !session e with
         | Err m -> puts "error: "; puts m; newline ()
         | Ok v ->
+          let elapsed = now () - t0 in
           (match top_let, e with
            | true, Let (_, name, _, Var _) ->
              session := (name, v) :: !session;
              puts "val "; puts name; puts " = "
            | _ -> puts "- = ");
-          print_value v; newline ()
+          print_value v;
+          (* what it cost on the board, with the network and the UART left
+             out: the millisecond counter around eval alone *)
+          if elapsed > 0 then begin
+            puts "   ("; put_int elapsed; puts " ms)"
+          end;
+          newline ()
   end
 
 (* ---- the UART: a line collected a byte at a time, echoed ---- *)
