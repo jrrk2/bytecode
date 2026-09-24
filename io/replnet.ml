@@ -1484,6 +1484,7 @@ let rec list_len l = match l with [] -> 0 | _ :: r -> 1 + list_len r
    would return to has been replaced. *)
 let boot_action = ref (fun (_ : string) -> 0)
 let restart_action = ref (fun (_ : int) -> 0)
+let load_action = ref (fun (_ : string) (_ : string) -> 0)
 
 let rec call_builtin name args = match args with
   | [VFloat x] ->
@@ -1504,6 +1505,7 @@ let rec call_builtin name args = match args with
     else if string_equal name "restart" then Ok (VInt ((!restart_action) n))
     else Err ("bad argument for " ^^ name)
   | [VStr f] when string_equal name "boot" -> Ok (VInt ((!boot_action) f))
+  | [VStr e; VStr f] when string_equal name "load" -> Ok (VInt ((!load_action) e f))
   | [VFloat a; VFloat b] ->
     if string_equal name "atan2" then Ok (VFloat (atan2 a b))
     else if string_equal name "pow" then Ok (VFloat (pow a b))
@@ -2417,6 +2419,9 @@ let builtins =
        fetches f over TFTP into the staging RAM and runs that instead *)
     ("restart", 1, TArrow (TInt, TInt));
     ("boot", 1, TArrow (TString, TInt));
+    (* load reads source and runs it here: whatever it says, it can only
+       reach the kernel through the rules.  boot replaces the kernel. *)
+    ("load", 2, TArrow (TString, TArrow (TString, TInt)));
     (* the kernel: types and terms are made and taken apart freely, but a
        thm comes only from one of the ten rules *)
     ("mk_vartype", 1, TArrow (TString, ty_ty));
@@ -3064,6 +3069,8 @@ let handle_repl len ihl =
 (* ---- one pass of the machine ---- *)
 let packets = ref 0
 
+
+
 (* ---- chain loading ----
    The same path the netboot loader takes, and the same hardware: the
    staging RAM is written a byte per address through the I/O window, and a
@@ -3077,7 +3084,7 @@ let packets = ref 0
    the session drop rather than a result. *)
 let boot_reg = 0x1007
 let stage = 0x10000
-let stage_size = 0x20000
+let stage_size = 0x40000
 let tftp_port = 6969
 let tftp_local = 50000
 
@@ -3094,7 +3101,7 @@ let received = ref 0
 let boot_deadline = ref 0
 let boot_tries = ref 0
 
-let udp_to_server dport payload_len =
+let udp_from sport dport payload_len =
   let len = 42 + payload_len in
   for i = 0 to 5 do tx i (array_get server_mac i); tx (6 + i) (mac i) done;
   tx 12 0x08; tx 13 0x00;
@@ -3104,11 +3111,13 @@ let udp_to_server dport payload_len =
   for i = 0 to 3 do tx (26 + i) (ip i); tx (30 + i) (array_get server_ip i) done;
   let s = ip_checksum 14 20 in
   tx 24 (s lsr 8); tx 25 (s land 0xFF);
-  tx 34 (tftp_local lsr 8); tx 35 (tftp_local land 0xFF);
+  tx 34 (sport lsr 8); tx 35 (sport land 0xFF);
   tx 36 (dport lsr 8); tx 37 (dport land 0xFF);
   tx 38 ((8 + payload_len) lsr 8); tx 39 ((8 + payload_len) land 0xFF);
   tx 40 0; tx 41 0;
   eth_send len
+
+let udp_to_server dport payload_len = udp_from tftp_local dport payload_len
 
 let arp_for_server () =
   for i = 0 to 5 do tx i 0xff; tx (6 + i) (mac i) done;
@@ -3253,6 +3262,275 @@ let boot_tick () =
     end
   end
 
+(* ---- NFS: reading a file over ONC RPC ----
+   XDR is four-byte-aligned and big-endian, which is the shape of
+   everything else in this window already.  Five exchanges: ask the
+   portmapper where mountd is, mount the export for its root handle, ask
+   where nfsd is, look the name up in that directory, then read it.
+
+   Reads are asked for in pieces under the MTU.  The reply to a big one
+   arrives as IP fragments, and nothing here reassembles them -- the count
+   is ours to choose, so choosing a small one is the whole fix. *)
+let nfs_lport = 1010            (* privileged: an export without "insecure" insists *)
+let pmap_port = 111
+let nfs_chunk = 1024
+let nfs_buf = 0x30000           (* staging, above the image the loader left *)
+
+let rpc_pmap = 100000
+let rpc_mount = 100005
+let rpc_nfs = 100003
+
+let xp = ref 42                 (* the write cursor into the TX window *)
+let rp = ref 0                  (* and the read cursor into the RX window *)
+
+let x32 v =
+  tx !xp ((v lsr 24) land 0xFF); tx (!xp + 1) ((v lsr 16) land 0xFF);
+  tx (!xp + 2) ((v lsr 8) land 0xFF); tx (!xp + 3) (v land 0xFF);
+  xp := !xp + 4
+
+let xstr s =
+  let n = string_length s in
+  x32 n;
+  for i = 0 to n - 1 do tx (!xp + i) (int_of_char (string_get s i)) done;
+  let pad = (4 - (n land 3)) land 3 in
+  for i = 0 to pad - 1 do tx (!xp + n + i) 0 done;
+  xp := !xp + n + pad
+
+(* the file handle mount gave us, and the one for the file itself *)
+let fh_root = create_bytes 64
+let fh_root_len = ref 0
+let fh_file = create_bytes 64
+let fh_file_len = ref 0
+
+let xfh b n =
+  x32 n;
+  for i = 0 to n - 1 do tx (!xp + i) (int_of_char (bytes_get b i)) done;
+  let pad = (4 - (n land 3)) land 3 in
+  for i = 0 to pad - 1 do tx (!xp + n + i) 0 done;
+  xp := !xp + n + pad
+
+let r32 () =
+  let v = (rx !rp lsl 24) lor (rx (!rp + 1) lsl 16)
+          lor (rx (!rp + 2) lsl 8) lor rx (!rp + 3) in
+  rp := !rp + 4; v
+
+(* The xid stays under 2^24 so that reading it back cannot overflow a
+   31-bit int, which a word with its top bit set would. *)
+let nfs_xid = ref 0x515100
+
+let rpc_call prog vers proc =
+  nfs_xid := (!nfs_xid + 1) land 0xFFFFFF;
+  xp := 42;
+  x32 !nfs_xid; x32 0; x32 2; x32 prog; x32 vers; x32 proc;
+  (* AUTH_UNIX with an empty machine name, uid and gid 0 *)
+  x32 1; x32 20; x32 0; x32 0; x32 0; x32 0; x32 0;
+  x32 0; x32 0                                    (* AUTH_NULL verifier *)
+
+let nfs_send dport = udp_from nfs_lport dport (!xp - 42)
+
+(* the reply's header: the xid we sent, accepted, and the call succeeded *)
+let rpc_reply_ok len =
+  let udp = 34 in
+  if len < udp + 8 + 24 then false
+  else begin
+    rp := udp + 8;
+    let xid = r32 () in
+    let mtype = r32 () in
+    let rstat = r32 () in
+    if xid <> !nfs_xid || mtype <> 1 || rstat <> 0 then false
+    else begin
+      let _flavor = r32 () in
+      let vlen = r32 () in
+      rp := !rp + ((vlen + 3) / 4) * 4;
+      r32 () = 0                                   (* accept_stat = SUCCESS *)
+    end
+  end
+
+
+(* ---- the exchanges ----
+   portmap for mountd, mount for the root handle, portmap for nfsd, look
+   the name up in the root, then read it in pieces. *)
+let nfs_idle = 0
+let nfs_arping = 1
+let nfs_pmap_mnt = 2
+let nfs_mounting = 3
+let nfs_pmap_nfs = 4
+let nfs_looking = 5
+let nfs_reading = 6
+
+let nfs_state = ref nfs_idle
+let nfs_deadline = ref 0
+let nfs_tries = ref 0
+let mnt_port = ref 0
+let nfsd_port = ref 2049
+let nfs_off = ref 0
+let nfs_eof = ref false
+let nfs_export = ref ""
+let nfs_file = ref ""
+
+let send_getport prog vers =
+  rpc_call rpc_pmap 2 3;
+  x32 prog; x32 vers; x32 17; x32 0;
+  nfs_send pmap_port
+
+let send_mnt () =
+  rpc_call rpc_mount 3 1;
+  xstr !nfs_export;
+  nfs_send !mnt_port
+
+let send_lookup () =
+  rpc_call rpc_nfs 3 3;
+  xfh fh_root !fh_root_len;
+  xstr !nfs_file;
+  nfs_send !nfsd_port
+
+let send_read () =
+  rpc_call rpc_nfs 3 6;
+  xfh fh_file !fh_file_len;
+  x32 0; x32 !nfs_off;        (* a 64-bit offset, high word first *)
+  x32 nfs_chunk;
+  nfs_send !nfsd_port
+
+(* a post_op_attr: a flag, and the 84 bytes of attributes if it is set *)
+let skip_attr () = if r32 () = 1 then rp := !rp + 84
+
+let take_fh b =
+  let n = r32 () in
+  if n > 64 then 0
+  else begin
+    for i = 0 to n - 1 do bytes_set b i (char_of_int (rx (!rp + i))) done;
+    rp := !rp + ((n + 3) / 4) * 4;
+    n
+  end
+
+let nfs_fail why =
+  nfs_state := nfs_idle;
+  puts "load failed: "; puts why; newline ();
+  uart_puts "nfs: "; uart_puts why; uart_putc '\n'
+
+(* set once evaluate_line is in scope: the lines just read are run *)
+let run_loaded = ref (fun (_ : int) -> ())
+
+let nfs_step () =
+  nfs_tries := 0;
+  nfs_deadline := now () + 1500
+
+let nfs_reply len =
+  if not_b (rpc_reply_ok len) then ()
+  else if !nfs_state = nfs_pmap_mnt then begin
+    mnt_port := r32 ();
+    if !mnt_port = 0 then nfs_fail "mountd is not registered"
+    else begin nfs_state := nfs_mounting; send_mnt (); nfs_step () end
+  end
+  else if !nfs_state = nfs_mounting then begin
+    if r32 () <> 0 then nfs_fail "the server would not mount that export"
+    else begin
+      fh_root_len := take_fh fh_root;
+      if !fh_root_len = 0 then nfs_fail "the root handle is too long"
+      else begin nfs_state := nfs_pmap_nfs; send_getport rpc_nfs 3; nfs_step () end
+    end
+  end
+  else if !nfs_state = nfs_pmap_nfs then begin
+    let p = r32 () in
+    nfsd_port := (if p = 0 then 2049 else p);
+    nfs_state := nfs_looking; send_lookup (); nfs_step ()
+  end
+  else if !nfs_state = nfs_looking then begin
+    if r32 () <> 0 then nfs_fail "no such file"
+    else begin
+      fh_file_len := take_fh fh_file;
+      if !fh_file_len = 0 then nfs_fail "the file handle is too long"
+      else begin
+        nfs_off := 0; nfs_eof := false;
+        nfs_state := nfs_reading; send_read (); nfs_step ()
+      end
+    end
+  end
+  else if !nfs_state = nfs_reading then begin
+    if r32 () <> 0 then nfs_fail "the read was refused"
+    else begin
+      skip_attr ();
+      let _count = r32 () in
+      let eof = r32 () in
+      let n = r32 () in
+      if !nfs_off + n > 0x10000 then nfs_fail "the file is too large"
+      else begin
+        for i = 0 to n - 1 do io_write (nfs_buf + !nfs_off + i) (rx (!rp + i)) done;
+        nfs_off := !nfs_off + n;
+        if eof <> 0 || n = 0 then begin
+          nfs_state := nfs_idle;
+          (!run_loaded) !nfs_off
+        end else begin send_read (); nfs_step () end
+      end
+    end
+  end
+
+let nfs_tick () =
+  if !nfs_state <> nfs_idle && now () > !nfs_deadline then begin
+    nfs_tries := !nfs_tries + 1;
+    if !nfs_tries > 4 then nfs_fail "no answer from the server"
+    else begin
+      (if !nfs_state = nfs_arping then arp_for_server ()
+       else if !nfs_state = nfs_pmap_mnt then send_getport rpc_mount 3
+       else if !nfs_state = nfs_mounting then send_mnt ()
+       else if !nfs_state = nfs_pmap_nfs then send_getport rpc_nfs 3
+       else if !nfs_state = nfs_looking then send_lookup ()
+       else send_read ());
+      nfs_deadline := now () + 1500
+    end
+  end
+
+let nfs_arp_reply len =
+  if !nfs_state = nfs_arping && len >= 42 && rx 21 = 2
+     && rx 28 = array_get server_ip 0 && rx 29 = array_get server_ip 1
+     && rx 30 = array_get server_ip 2 && rx 31 = array_get server_ip 3 then begin
+    for i = 0 to 5 do array_set server_mac i (rx (22 + i)) done;
+    nfs_state := nfs_pmap_mnt;
+    send_getport rpc_mount 3;
+    nfs_step ()
+  end
+
+let start_load export f =
+  if not_b (bound ()) then begin puts "no address yet"; newline (); 0 end
+  else if !nfs_state <> nfs_idle then begin puts "a load is already running"; newline (); 0 end
+  else begin
+    nfs_export := export; nfs_file := f;
+    puts "reading "; puts f; puts " from "; puts export; newline ();
+    nfs_state := nfs_arping;
+    arp_for_server ();
+    nfs_step ();
+    0
+  end
+
+let () = load_action := start_load
+
+(* The bytes just read, split on newlines and evaluated in order.  Output
+   goes back to whoever asked, if the connection is still up. *)
+let () = run_loaded := (fun n ->
+  let was_tcp = !to_tcp in
+  to_tcp := true;
+  let i = ref 0 and count = ref 0 in
+  while !i < n do
+    line_len := 0;
+    while !i < n && io_read (nfs_buf + !i) <> 10 do
+      (if !line_len < line_max then begin
+         bytes_set line !line_len (char_of_int (io_read (nfs_buf + !i)));
+         line_len := !line_len + 1
+       end);
+      i := !i + 1
+    done;
+    i := !i + 1;
+    (* a comment or a blank line is skipped rather than parsed *)
+    if !line_len > 0 && not_b (bytes_get line 0 = '(') then begin
+      evaluate_line ();
+      count := !count + 1
+    end
+  done;
+  line_len := 0;
+  puts "loaded "; put_int !count; puts " lines"; newline ();
+  puts "# ";
+  to_tcp := was_tcp)
+
 let () = boot_action := start_boot
 (* restart runs what is already staged, which is the image this program was
    booted from unless a boot has since overwritten it *)
@@ -3263,12 +3541,14 @@ let poll () =
   dhcp_tick ();
   tcp_tick ();
   boot_tick ();
+  nfs_tick ();
   let st = io_read eth_status in
   if st land eth_rx_valid <> 0 then begin
     let len = io_read eth_rxlen land 0x7FF in
     if rx 12 = 0x08 && rx 13 = 0x06 then begin
       handle_arp len;            (* requests for us *)
-      server_arp_reply len       (* and the reply we asked for *)
+      server_arp_reply len;      (* and the replies we asked for *)
+      nfs_arp_reply len
     end
     else if rx 12 = 0x08 && rx 13 = 0x00 && len >= 42 then begin
       let ihl = (rx 14 land 0x0F) * 4 in
@@ -3277,6 +3557,7 @@ let poll () =
       else if rx 23 = 17 && dport = 68 then handle_dhcp len
       else if rx 23 = 17 && dport = repl_port then handle_repl len ihl
       else if rx 23 = 17 && dport = tftp_local then tftp_data len
+      else if rx 23 = 17 && dport = nfs_lport then nfs_reply len
       else if rx 23 = 6 then handle_tcp len ihl
     end;
     io_write eth_rxlen 0;

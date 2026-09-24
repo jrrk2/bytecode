@@ -23,7 +23,7 @@
 //   0x100a  r  who built this bitstream: bits 27:0 the git commit (7 hex
 //              digits), bit 28 set if the tree was dirty, bits 31:30 the
 //              flow (1 = the open flow, 2 = Vivado, 0 = unsaid)
-//   0x10000..0x2FFFF  the staging RAM, a byte per address
+//   0x10000..0x4FFFF  the staging RAM, a byte per address
 //
 // The packet RAM is a true dual-port BRAM: port B belongs to the DMA on
 // eth_clk, port A to the VM on clk_sys; eth_stream_dma's ownership handshake
@@ -138,9 +138,9 @@ module ethmin_vm_core #(
 	// come out of nextpnr miscompiled: the board then runs the loader (whose
 	// code is a x9 ROM) while its heap is corrupt, so the strings are intact
 	// but every pointer into them is wrong.  Vivado is happy either way.
-	// The staging RAM is fully addressed: 32K words (128 KiB).
+	// The staging RAM is fully addressed: 64K words (256 KiB).
 	localparam integer PROG_WORDS  = 32768;   // program code RAM (block RAM)
-	localparam integer STAGE_WORDS = 32768;   // staging RAM: 128 KiB
+	localparam integer STAGE_WORDS = 65536;   // staging RAM: 256 KiB
 	// 128K words, two 64K semi-spaces: a tree-walking interpreter holds
 	// every frame of a recursion live, so the collector has nothing to take
 	// and the old 16K semi-space ran out at a few hundred frames.  Block RAM
@@ -192,8 +192,8 @@ module ethmin_vm_core #(
 
 	// The word read this cycle, available next cycle in rom_q (the resident
 	// images) or seq_q (the staged one): header words 2-4, then each section.
-	wire [14:0] seq_addr = (seq_state == SEQ_HEADER) ? 15'd2 + hdr_i
-	                     : 15'd8 + seq_i + ((seq_state != SEQ_CODE) ? stage_code : 16'd0)
+	wire [15:0] seq_addr = (seq_state == SEQ_HEADER) ? 16'd2 + hdr_i
+	                     : 16'd8 + seq_i + ((seq_state != SEQ_CODE) ? stage_code : 16'd0)
 	                                     + ((seq_state == SEQ_GLOBALS) ? stage_heap : 16'd0);
 	always @(posedge clk_sys) begin
 		rom_q <= (seq_state == SEQ_GLOBALS) ? globals_rom[seq_i][31:0] : heap_rom[seq_i][31:0];
@@ -262,9 +262,11 @@ module ethmin_vm_core #(
 				end
 			end
 			SEQ_START: begin
-				// stage_heap is 16 bits; with a heap wider than that the
-				// slice would reach past it, so widen rather than cut
-				image_words <= seq_from_stage ? HEAP_AW'(stage_heap) : `HEAP_WORDS;
+				// stage_heap is 16 bits and image_words is HEAP_AW: the
+				// assignment pads or truncates as needed, where the slice
+				// that used to be here reached past the end of a heap
+				// wider than 16 bits
+				image_words <= seq_from_stage ? stage_heap : `HEAP_WORDS;
 				code_bank   <= seq_from_stage;
 				prog_words  <= stage_code[15:0];
 				seq_state   <= SEQ_RUN;         // the VM leaves reset next cycle
@@ -462,12 +464,12 @@ module ethmin_vm_core #(
 	// 128 KiB, which is what STAGE_WORDS has always held: the decode used
 	// to reach only half of it, and a netboot image that outgrew 64 KiB
 	// stopped being acknowledged part way through the transfer.
-	wire io_is_stage  = io_addr >= 32'h10000 && io_addr < 32'h30000;
+	wire io_is_stage  = io_addr >= 32'h10000 && io_addr < 32'h50000;
 
 	// Base-relative: the boot sequencer reads the image from word 0.  The old
 	// [15:2] did that by accident, dropping bit 16 of a window that was one
 	// bit wide; over 128 KiB the offset has to be taken properly.
-	wire [14:0] stage_idx = (io_addr - 32'h10000) >> 2;
+	wire [15:0] stage_idx = (io_addr - 32'h10000) >> 2;
 
 	always @(*) begin
 		pa_en    = io_new && io_is_packet;
