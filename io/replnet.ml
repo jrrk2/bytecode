@@ -140,6 +140,8 @@ let state = ref Init
 let my_ip = [| 0; 0; 0; 0 |]        (* 0.0.0.0 until bound *)
 let offered_ip = [| 0; 0; 0; 0 |]
 let server_id = [| 0; 0; 0; 0 |]
+let server_ip = [| 10; 10; 10; 10 |]   (* where an image is fetched from *)
+let server_mac = [| 0; 0; 0; 0; 0; 0 |]
 let xid = [| 0x56; 0x4d; 0; 0 |]    (* "VM" and two bytes of the clock *)
 let deadline = ref 0                 (* ms: retransmit or renew *)
 let lease_s = ref 0
@@ -290,6 +292,9 @@ let request () =
 let dhcp_parse len =
   let msg = ref 0 in
   for i = 0 to 3 do array_set offered_ip i (rx (bootp + 16 + i)) done;
+  (* siaddr: the host the netboot loader was told to fetch from *)
+  if rx (bootp + 20) <> 0 then
+    for i = 0 to 3 do array_set server_ip i (rx (bootp + 20 + i)) done;
   let o = ref (bootp + 240) in
   while !o + 1 < len && rx !o <> 255 do
     let code = rx !o in
@@ -323,6 +328,12 @@ let handle_dhcp len =
     | Selecting, 2 -> request ()                                (* OFFER *)
     | Requesting, 5 ->                                          (* ACK *)
       for i = 0 to 3 do array_set my_ip i (array_get offered_ip i) done;
+      (* the switches name the host, as they do for the loader *)
+      let dip = io_read dip_sw land 0xFF in
+      if dip <> 0 then begin
+        for i = 0 to 2 do array_set server_ip i (array_get my_ip i) done;
+        array_set server_ip 3 dip
+      end;
       state := Bound;
       deadline := now () + !lease_s * 500;                      (* T1: half the lease, in ms *)
       uart_puts "dhcp: bound ";
@@ -528,6 +539,7 @@ let pow x y = exp (y *. log x)
 
 (* ---- tokens ---- *)
 type token = TInt of int | TFloat of float | TId of string | TSym of string
+            | TStr of string
 
 let is_digit c = c >= 48 && c <= 57
 let is_alpha c = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c = 95
@@ -584,6 +596,30 @@ let tokenize () =
         let j = ref i in
         while !j < !line_len && (is_alpha (char_at !j) || is_digit (char_at !j)) do j := !j + 1 done;
         go !j (TId (substring i !j) :: acc)
+      end else if c = 34 then begin
+        (* a string literal.  A backslash escapes the next character, with
+           n, r and t meaning newline, return and tab; anything else after
+           one stands for itself, which covers the quote and the backslash.
+           Escapes change the length, so it is built in a buffer rather
+           than cut out of the line. *)
+        let b = create_bytes line_max and n = ref 0 and j = ref (i + 1) in
+        while !j < !line_len && char_at !j <> 34 do
+          let ch = char_at !j in
+          if ch = 92 && !j + 1 < !line_len then begin
+            let e = char_at (!j + 1) in
+            let v = if e = 110 then 10 else if e = 114 then 13
+                    else if e = 116 then 9 else e in
+            bytes_set b !n (char_of_int v); n := !n + 1; j := !j + 2
+          end else begin
+            bytes_set b !n (char_of_int ch); n := !n + 1; j := !j + 1
+          end
+        done;
+        if !j >= !line_len then Err "unterminated string"
+        else begin
+          let r = create_bytes !n in
+          for k = 0 to !n - 1 do bytes_set r k (bytes_get b k) done;
+          go (!j + 1) (TStr (bytes_to_string r) :: acc)
+        end
       end else if c = 39 && i + 1 < !line_len && is_alpha (char_at (i + 1)) then begin
         let j = ref (i + 1) in
         while !j < !line_len && (is_alpha (char_at !j) || is_digit (char_at !j)) do j := !j + 1 done;
@@ -601,6 +637,7 @@ let tokenize () =
 type expr =
   | Int of int
   | Float of float
+  | Str of string
   | Bool of bool
   | Var of string
   | Binop of string * expr * expr
@@ -929,6 +966,7 @@ and app_more f toks =
 and starts_atom toks = match toks with
   | TInt _ :: _ -> true
   | TFloat _ :: _ -> true
+  | TStr _ :: _ -> true
   | TId x :: _ -> not (keyword x) || string_equal x "true" || string_equal x "false"
   | t :: _ -> is_sym t "(" || is_sym t "[" || is_sym t "{"
   | [] -> false
@@ -936,6 +974,7 @@ and starts_atom toks = match toks with
 and parse_atom toks = match toks with
   | TInt n :: rest -> Ok (Int n, rest)
   | TFloat f :: rest -> Ok (Float f, rest)
+  | TStr s :: rest -> Ok (Str s, rest)
   | TId x :: rest when string_equal x "true" -> Ok (Bool true, rest)
   | TId x :: rest when string_equal x "false" -> Ok (Bool false, rest)
   | TId c :: rest when is_ctor c -> Ok (Con (c, []), rest)
@@ -1140,6 +1179,12 @@ let rec list_len l = match l with [] -> 0 | _ :: r -> 1 + list_len r
 (* The ones the FPU makes worth having.  Everything here is either a float
    function or a conversion; the types are seeded into the session below so
    that inference knows them without a declaration. *)
+(* Set once the loader below is in scope.  boot returns only if it could
+   not start; a successful one never comes back, because the machine it
+   would return to has been replaced. *)
+let boot_action = ref (fun (_ : string) -> 0)
+let restart_action = ref (fun (_ : int) -> 0)
+
 let call_builtin name args = match args with
   | [VFloat x] ->
     if string_equal name "sin" then Ok (VFloat (sin x))
@@ -1156,6 +1201,10 @@ let call_builtin name args = match args with
     else Err ("bad argument for " ^^ name)
   | [VInt n] ->
     if string_equal name "float_of_int" then Ok (VFloat (float_of_int n))
+    else if string_equal name "restart" then Ok (VInt ((!restart_action) n))
+    else Err ("bad argument for " ^^ name)
+  | [VStr f] ->
+    if string_equal name "boot" then Ok (VInt ((!boot_action) f))
     else Err ("bad argument for " ^^ name)
   | [VFloat a; VFloat b] ->
     if string_equal name "atan2" then Ok (VFloat (atan2 a b))
@@ -1505,6 +1554,7 @@ let int_op op =
 let rec infer env e = match e with
   | Int _ -> Ok TInt
   | Float _ -> Ok TFloat
+  | Str _ -> Ok TString
   | Bool _ -> Ok TBool
   | Var x -> lookup_scheme env x
   | Fun (x, body) ->
@@ -1708,6 +1758,7 @@ and infer_pats env ps ts = match ps, ts with
 let rec eval env e = match e with
   | Int n -> Ok (VInt n)
   | Float f -> Ok (VFloat f)
+  | Str s -> Ok (VStr s)
   | Bool b -> Ok (VBool b)
   | Var x -> lookup env x
   | Fun (x, body) -> Ok (VClosure (x, body, ref env))
@@ -1905,7 +1956,19 @@ let rec print_value v = match v with
   | VInt n -> put_int n
   | VFloat f -> print_float f
   | VBool b -> puts (if b then "true" else "false")
-  | VStr s -> putc '"'; puts s; putc '"'
+  (* printed back the way it would be written, so that a newline in a
+     string does not come out as a line break in the middle of the value *)
+  | VStr s ->
+    putc '"';
+    for i = 0 to string_length s - 1 do
+      let c = int_of_char (string_get s i) in
+      if c = 34 || c = 92 then begin putc '\\'; putc (char_of_int c) end
+      else if c = 10 then begin putc '\\'; putc 'n' end
+      else if c = 13 then begin putc '\\'; putc 'r' end
+      else if c = 9 then begin putc '\\'; putc 't' end
+      else putc (char_of_int c)
+    done;
+    putc '"'
   | VClosure _ -> puts "<fun>"
   | VBuiltin _ -> puts "<fun>"
   | VTuple l -> putc '('; print_commas l; putc ')'
@@ -1954,7 +2017,11 @@ let builtins =
     ("abs_float", 1, f2f);
     ("atan2", 2, ff2f); ("pow", 2, ff2f);
     ("float_of_int", 1, TArrow (TInt, TFloat));
-    ("int_of_float", 1, TArrow (TFloat, TInt)) ]
+    ("int_of_float", 1, TArrow (TFloat, TInt));
+    (* chain loading: restart () runs the staged image again, boot "f"
+       fetches f over TFTP into the staging RAM and runs that instead *)
+    ("restart", 1, TArrow (TInt, TInt));
+    ("boot", 1, TArrow (TString, TInt)) ]
 
 let rec builtin_values l = match l with
   | [] -> []
@@ -2577,20 +2644,219 @@ let handle_repl len ihl =
 (* ---- one pass of the machine ---- *)
 let packets = ref 0
 
+(* ---- chain loading ----
+   The same path the netboot loader takes, and the same hardware: the
+   staging RAM is written a byte per address through the I/O window, and a
+   write to boot_reg holds the VM, copies the staged image over the running
+   one and starts it.  The sequencer takes that request from SEQ_RUN, so a
+   running program can replace itself -- which is what the loader does, and
+   what these two do from the prompt.
+
+   There is no returning from it.  This program, its network stack and the
+   connection carrying the command all cease to exist, so the caller sees
+   the session drop rather than a result. *)
+let boot_reg = 0x1007
+let stage = 0x10000
+let stage_size = 0x20000
+let tftp_port = 6969
+let tftp_local = 50000
+
+let file_name = create_bytes 64
+let file_len = ref 0
+
+let boot_idle = 0
+let boot_arping = 1
+let boot_loading = 2
+let boot_state = ref boot_idle
+let boot_server_port = ref tftp_port
+let next_block = ref 1
+let received = ref 0
+let boot_deadline = ref 0
+let boot_tries = ref 0
+
+let udp_to_server dport payload_len =
+  let len = 42 + payload_len in
+  for i = 0 to 5 do tx i (array_get server_mac i); tx (6 + i) (mac i) done;
+  tx 12 0x08; tx 13 0x00;
+  tx 14 0x45; tx 15 0; tx 16 ((len - 14) lsr 8); tx 17 ((len - 14) land 0xFF);
+  for i = 18 to 21 do tx i 0 done;
+  tx 22 64; tx 23 17; tx 24 0; tx 25 0;
+  for i = 0 to 3 do tx (26 + i) (ip i); tx (30 + i) (array_get server_ip i) done;
+  let s = ip_checksum 14 20 in
+  tx 24 (s lsr 8); tx 25 (s land 0xFF);
+  tx 34 (tftp_local lsr 8); tx 35 (tftp_local land 0xFF);
+  tx 36 (dport lsr 8); tx 37 (dport land 0xFF);
+  tx 38 ((8 + payload_len) lsr 8); tx 39 ((8 + payload_len) land 0xFF);
+  tx 40 0; tx 41 0;
+  eth_send len
+
+let arp_for_server () =
+  for i = 0 to 5 do tx i 0xff; tx (6 + i) (mac i) done;
+  tx 12 0x08; tx 13 0x06;
+  tx 14 0x00; tx 15 0x01; tx 16 0x08; tx 17 0x00; tx 18 6; tx 19 4;
+  tx 20 0x00; tx 21 0x01;
+  for i = 0 to 5 do tx (22 + i) (mac i); tx (32 + i) 0 done;
+  for i = 0 to 3 do tx (28 + i) (ip i); tx (38 + i) (array_get server_ip i) done;
+  eth_send 42
+
+let send_rrq () =
+  tx 42 0; tx 43 1;
+  for i = 0 to !file_len - 1 do tx (44 + i) (int_of_char (bytes_get file_name i)) done;
+  let o = 44 + !file_len in
+  tx o 0;
+  let mode = "octet" in
+  for i = 0 to 4 do tx (o + 1 + i) (int_of_char (string_get mode i)) done;
+  tx (o + 6) 0;
+  udp_to_server tftp_port (o + 7 - 42)
+
+let send_ack block =
+  tx 42 0; tx 43 4; tx 44 (block lsr 8); tx 45 (block land 0xFF);
+  udp_to_server !boot_server_port 4
+
+(* ---- the staged image, as tools/mkvmimage.py wrote it ---- *)
+let sbyte i = io_read (stage + i)
+let sword i = sbyte i lor (sbyte (i + 1) lsl 8) lor (sbyte (i + 2) lsl 16)
+let code_max = 32768
+let heap_max = 4096
+let globals_max = 4096
+let prims_digest = [| 0x21; 0xad; 0xa2; 0x86 |]
+
+let crc16 from upto =
+  let crc = ref 0xFFFF in
+  for i = from to upto - 1 do
+    crc := !crc lxor (sbyte i lsl 8);
+    for _bit = 1 to 8 do
+      if !crc land 0x8000 <> 0 then crc := ((!crc lsl 1) lxor 0x1021) land 0xFFFF
+      else crc := (!crc lsl 1) land 0xFFFF
+    done
+  done;
+  !crc
+
+(* Checked before the machine is handed over, because a half-written image
+   leaves the staging RAM holding something that is no longer what this
+   program was booted from. *)
+let check_image n =
+  let code = sword 8 and heap = sword 12 and globals = sword 16 in
+  if n < 32 then Err "too short"
+  else if sbyte 0 <> 0x4f || sbyte 1 <> 0x43 || sbyte 2 <> 0x56 || sbyte 3 <> 0x4d then
+    Err "not an image"
+  else if sbyte 4 <> 1 || sword 5 <> 0 then Err "wrong version"
+  else if sbyte 11 <> 0 || sbyte 15 <> 0 || sbyte 19 <> 0
+          || code > code_max || heap > heap_max || globals > globals_max then Err "too large"
+  else if 32 + 4 * (code + heap + globals) <> n then Err "truncated"
+  else if sbyte 20 <> array_get prims_digest 0 || sbyte 21 <> array_get prims_digest 1
+          || sbyte 22 <> array_get prims_digest 2 || sbyte 23 <> array_get prims_digest 3 then
+    Err "built for other primitives"
+  else if crc16 32 n <> (sbyte 24 lor (sbyte 25 lsl 8)) then Err "checksum"
+  else Ok (code + heap + globals)
+
+let staged_len () = 32 + 4 * (sword 8 + sword 12 + sword 16)
+
+let boot_now n = match check_image n with
+  | Err why ->
+    puts "boot refused: "; puts why; newline ();
+    uart_puts "boot refused: "; uart_puts why; uart_putc '\n'; 0
+  | Ok _ ->
+    uart_puts "chain loading the staged image\n";
+    io_write boot_reg 1;
+    0
+
+let start_boot f =
+  if not (bound ()) then begin puts "no address yet"; newline (); 0 end
+  else if string_length f = 0 || string_length f > 63 then begin
+    puts "boot needs a file name"; newline (); 0
+  end else begin
+    file_len := string_length f;
+    for i = 0 to !file_len - 1 do bytes_set file_name i (string_get f i) done;
+    puts "fetching "; puts f; puts " from "; put_int (array_get server_ip 0);
+    putc '.'; put_int (array_get server_ip 1); putc '.';
+    put_int (array_get server_ip 2); putc '.'; put_int (array_get server_ip 3);
+    newline ();
+    received := 0; next_block := 1; boot_tries := 0;
+    boot_server_port := tftp_port;
+    arp_for_server ();
+    boot_state := boot_arping;
+    boot_deadline := now () + 1000;
+    0
+  end
+
+let server_arp_reply len =
+  if !boot_state = boot_arping && len >= 42 && rx 21 = 2
+     && rx 28 = array_get server_ip 0 && rx 29 = array_get server_ip 1
+     && rx 30 = array_get server_ip 2 && rx 31 = array_get server_ip 3 then begin
+    for i = 0 to 5 do array_set server_mac i (rx (22 + i)) done;
+    send_rrq ();
+    boot_state := boot_loading;
+    boot_tries := 0;
+    boot_deadline := now () + 1000
+  end
+
+let tftp_data len =
+  let udp = 34 in
+  let opcode = (rx (udp + 8) lsl 8) lor rx (udp + 9) in
+  if !boot_state = boot_loading && ip_is_mine 30
+     && rx 26 = array_get server_ip 0 && rx 27 = array_get server_ip 1
+     && rx 28 = array_get server_ip 2 && rx 29 = array_get server_ip 3 then begin
+    if opcode = 3 then begin
+      let block = (rx (udp + 10) lsl 8) lor rx (udp + 11) in
+      let n = ((rx (udp + 4) lsl 8) lor rx (udp + 5)) - 12 in
+      boot_server_port := (rx udp lsl 8) lor rx (udp + 1);
+      if block = !next_block && !received + n <= stage_size && len >= udp + 12 + n then begin
+        for i = 0 to n - 1 do io_write (stage + !received + i) (rx (udp + 12 + i)) done;
+        received := !received + n;
+        send_ack block;
+        next_block := block + 1;
+        boot_tries := 0;
+        boot_deadline := now () + 1000;
+        (* a short block ends the transfer *)
+        if n < 512 then begin
+          boot_state := boot_idle;
+          let _ = boot_now !received in ()
+        end
+      end else if block < !next_block then send_ack block
+    end else if opcode = 5 then begin
+      boot_state := boot_idle;
+      uart_puts "boot: the server refused the file\n"
+    end
+  end
+
+let boot_tick () =
+  if !boot_state <> boot_idle && now () > !boot_deadline then begin
+    boot_tries := !boot_tries + 1;
+    if !boot_tries > 5 then begin
+      boot_state := boot_idle;
+      uart_puts "boot: no answer\n"
+    end else begin
+      if !boot_state = boot_arping then arp_for_server ()
+      else if !next_block = 1 then send_rrq () else send_ack (!next_block - 1);
+      boot_deadline := now () + 1000
+    end
+  end
+
+let () = boot_action := start_boot
+(* restart runs what is already staged, which is the image this program was
+   booted from unless a boot has since overwritten it *)
+let () = restart_action := (fun (_ : int) -> boot_now (staged_len ()))
+
 let poll () =
   uart_poll ();
   dhcp_tick ();
   tcp_tick ();
+  boot_tick ();
   let st = io_read eth_status in
   if st land eth_rx_valid <> 0 then begin
     let len = io_read eth_rxlen land 0x7FF in
-    if rx 12 = 0x08 && rx 13 = 0x06 then handle_arp len
+    if rx 12 = 0x08 && rx 13 = 0x06 then begin
+      handle_arp len;            (* requests for us *)
+      server_arp_reply len       (* and the reply we asked for *)
+    end
     else if rx 12 = 0x08 && rx 13 = 0x00 && len >= 42 then begin
       let ihl = (rx 14 land 0x0F) * 4 in
       let dport = (rx (14 + ihl + 2) lsl 8) lor rx (14 + ihl + 3) in
       if rx 23 = 1 then handle_icmp len ihl
       else if rx 23 = 17 && dport = 68 then handle_dhcp len
       else if rx 23 = 17 && dport = repl_port then handle_repl len ihl
+      else if rx 23 = 17 && dport = tftp_local then tftp_data len
       else if rx 23 = 6 then handle_tcp len ihl
     end;
     io_write eth_rxlen 0;

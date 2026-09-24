@@ -151,6 +151,22 @@ let () =
                | Error e -> Format.printf "[read error: %a]@." Tcp.pp_error e; Lwt.return_unit in
              Lwt.pick [ rd (); Lwt_unix.sleep 2.0 ] >>= fun () ->
              Tcp.close f2)
+       else if Array.length Sys.argv > 1 && Sys.argv.(1) = "str" then
+         typ "\"hello\"\r" >>= fun () ->
+         typ "\"a\\nb\"\r" >>= fun () ->
+         typ "\"\"\r" >>= fun () ->
+         typ "\"quote \\\" here\"\r" >>= fun () ->
+         typ "\"abc\" = \"abc\"\r" >>= fun () ->
+         typ "\"abc\" = \"abd\"\r" >>= fun () ->
+         typ "let s = \"hi\"\r" >>= fun () ->
+         typ "(s, 1)\r" >>= fun () ->
+         typ "[\"a\"; \"b\"]\r" >>= fun () ->
+         typ "boot\r" >>= fun () ->
+         typ "restart\r" >>= fun () ->
+         typ "boot 3\r" >>= fun () ->
+         typ "\"unterminated\r" >>= fun () ->
+         typ "type r = { nm : string }\r" >>= fun () ->
+         typ "{ nm = \"x\" }\r"
        else if Array.length Sys.argv > 1 && Sys.argv.(1) = "rec" then
          typ "type point = { x : int; y : int }\r" >>= fun () ->
          typ "let p = { x = 3; y = 4 }\r" >>= fun () ->
