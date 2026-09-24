@@ -383,161 +383,7 @@ external abs_float : float -> float = "caml_abs_float" "%absfloat"
 let ( <. ) (a : float) (b : float) = flt_lt a b
 let ( <=. ) (a : float) (b : float) = flt_le a b
 let ( =. ) (a : float) (b : float) = flt_eq a b
-(* ==== MATH ==== *)
 
-let pi      = 3.14159265358979312
-let pio2    = 1.57079632679489656
-let pio6    = 0.523598775598298927
-let sqrt3   = 1.73205080756887730
-(* pi/2 and ln 2 in two pieces: subtracting k * pi/2 from a large argument
-   loses the low bits of pi/2 to rounding, so the high part is kept short
-   enough to multiply exactly and the remainder is taken off afterwards. *)
-let pio2_hi = 1.57079632673412562
-let pio2_lo = 6.07710050650619225e-11
-let ln2_hi  = 0.693147180369123816
-let ln2_lo  = 1.90821492927058770e-10
-let ln2     = 0.693147180559945286
-let two_over_pi = 0.636619772367581343
-
-(* 2^n, by squaring rather than n multiplications *)
-let pow2 n =
-  let rec go b e acc =
-    if e = 0 then acc
-    else go (b *. b) (e / 2) (if e mod 2 = 1 then acc *. b else acc) in
-  if n >= 0 then go 2.0 n 1.0 else 1.0 /. go 2.0 (0 - n) 1.0
-
-(* nearest integer, as an int: the reduction needs round-to-nearest and
-   int_of_float truncates *)
-let round_to_int x = int_of_float (if x <. 0.0 then x -. 0.5 else x +. 0.5)
-
-(* ---- exp and log ---- *)
-
-let exp x =
-  if x <. -745.0 then 0.0
-  else if 709.8 <. x then 1.0 /. 0.0
-  else begin
-    let k = round_to_int (x /. ln2) in
-    let kf = float_of_int k in
-    let r = x -. kf *. ln2_hi -. kf *. ln2_lo in
-    (* Taylor about zero on |r| <= ln2/2; the term after the last is about
-       1e-19 of the sum *)
-    let sum = ref 1.0 and term = ref 1.0 in
-    for i = 1 to 14 do
-      term := !term *. r /. float_of_int i;
-      sum := !sum +. !term
-    done;
-    !sum *. pow2 k
-  end
-
-let log x =
-  if x <. 0.0 then 0.0 /. 0.0
-  else if x =. 0.0 then ~-. (1.0 /. 0.0)
-  else begin
-    (* x = m * 2^e with m in [sqrt(1/2), sqrt(2)), coarsely first so that a
-       huge argument does not take a thousand halvings *)
-    let e = ref 0 and m = ref x in
-    while 65536.0 <=. !m do m := !m /. 65536.0; e := !e + 16 done;
-    while !m <. 1.52587890625e-05 do m := !m *. 65536.0; e := !e - 16 done;
-    while 1.41421356237309515 <=. !m do m := !m /. 2.0; e := !e + 1 done;
-    while !m <. 0.707106781186547524 do m := !m *. 2.0; e := !e - 1 done;
-    (* log m = 2 atanh s, s = (m-1)/(m+1), |s| <= 0.1716 *)
-    let s = (!m -. 1.0) /. (!m +. 1.0) in
-    let s2 = s *. s in
-    let acc = ref 0.0 and t = ref s in
-    for i = 0 to 12 do
-      acc := !acc +. !t /. float_of_int (2 * i + 1);
-      t := !t *. s2
-    done;
-    2.0 *. !acc +. float_of_int !e *. ln2
-  end
-
-(* ---- sine, cosine, tangent ---- *)
-
-let sin_small r =
-  let r2 = r *. r in
-  let term = ref r and sum = ref r in
-  for n = 1 to 10 do
-    term := ~-. (!term *. r2 /. float_of_int ((2 * n) * (2 * n + 1)));
-    sum := !sum +. !term
-  done;
-  !sum
-
-let cos_small r =
-  let r2 = r *. r in
-  let term = ref 1.0 and sum = ref 1.0 in
-  for n = 1 to 10 do
-    term := ~-. (!term *. r2 /. float_of_int ((2 * n - 1) * (2 * n)));
-    sum := !sum +. !term
-  done;
-  !sum
-
-(* x = k * pi/2 + r with |r| <= pi/4; which of sine and cosine to use, and
-   with which sign, follows k around the circle *)
-let quadrant x =
-  let k = round_to_int (x *. two_over_pi) in
-  let kf = float_of_int k in
-  let r = x -. kf *. pio2_hi -. kf *. pio2_lo in
-  (((k mod 4) + 4) mod 4, r)
-
-let sin x =
-  let (q, r) = quadrant x in
-  if q = 0 then sin_small r
-  else if q = 1 then cos_small r
-  else if q = 2 then ~-. (sin_small r)
-  else ~-. (cos_small r)
-
-let cos x =
-  let (q, r) = quadrant x in
-  if q = 0 then cos_small r
-  else if q = 1 then ~-. (sin_small r)
-  else if q = 2 then ~-. (cos_small r)
-  else sin_small r
-
-let tan x = sin x /. cos x
-
-(* ---- the inverses ---- *)
-
-let atan_small t =
-  let t2 = t *. t in
-  let p = ref t and sum = ref t in
-  for n = 1 to 16 do
-    p := ~-. (!p *. t2);
-    sum := !sum +. !p /. float_of_int (2 * n + 1)
-  done;
-  !sum
-
-(* 0 <= a: fold a > 1 through atan a = pi/2 - atan (1/a), then the rest
-   through atan a = pi/6 + atan ((a sqrt3 - 1)/(sqrt3 + a)), which leaves
-   |t| <= tan(pi/12) = 0.268 and a series that falls by 14 each term *)
-let atan_pos a =
-  let reduce b =
-    if 0.267949192431122706 <. b then
-      pio6 +. atan_small ((b *. sqrt3 -. 1.0) /. (sqrt3 +. b))
-    else atan_small b in
-  if 1.0 <. a then pio2 -. reduce (1.0 /. a) else reduce a
-
-let atan x = if x <. 0.0 then ~-. (atan_pos (~-. x)) else atan_pos x
-
-let atan2 y x =
-  if 0.0 <. x then atan (y /. x)
-  else if x <. 0.0 then
-    (if y <. 0.0 then atan (y /. x) -. pi else atan (y /. x) +. pi)
-  else if 0.0 <. y then pio2
-  else if y <. 0.0 then ~-. pio2
-  else 0.0
-
-(* asin a = atan (a / sqrt (1 - a^2)) loses its footing as a nears one,
-   where the square root is the difference of two close numbers; the half
-   angle moves the work back to the middle of the range *)
-let rec asin_pos a =
-  if a <=. 0.7 then atan (a /. sqrt (1.0 -. a *. a))
-  else if 1.0 <. a then 0.0 /. 0.0
-  else pio2 -. 2.0 *. asin_pos (sqrt ((1.0 -. a) /. 2.0))
-
-let asin x = if x <. 0.0 then ~-. (asin_pos (~-. x)) else asin_pos x
-let acos x = pio2 -. asin x
-
-let pow x y = exp (y *. log x)
 
 (* ---- tokens ---- *)
 type token = TInt of int | TFloat of float | TId of string | TSym of string
@@ -1160,7 +1006,6 @@ let parse_typedecl toks =
        arms rest [])
   | _ -> Err "expected a type name"
 
-let bool_eq (a : bool) (b : bool) = if a then b else if b then false else true
 let not_b (a : bool) = if a then false else true
 
 (* ---- evaluation ---- *)
@@ -1179,8 +1024,6 @@ type value =
   | VRec of (string * value) list
 and env = (string * value) list
 
-let rec rev_list l acc = match l with [] -> acc | x :: r -> rev_list r (x :: acc)
-let rec list_len l = match l with [] -> 0 | _ :: r -> 1 + list_len r
 
 (* The ones the FPU makes worth having.  Everything here is either a float
    function or a conversion; the types are seeded into the session below so
@@ -2632,15 +2475,18 @@ let rfs_find nm = rfs_find_from (rfs_count () - 1) nm
 let rfs_offset k = d32 (rfs_dir + k * rfs_ent + rfs_name_max)
 let rfs_length k = d32 (rfs_dir + k * rfs_ent + rfs_name_max + 4)
 
-(* a new entry, and where its data is to go; -1 if the disk is full *)
-let rfs_add nm len =
+(* The directory entry, written once the length is known.  A file that
+   arrives over the network is streamed into the free space first and
+   committed when its last chunk lands, so the two are separate: while a
+   fetch is in flight it owns everything above rfs_free (), and writing a
+   file from the language in the middle of one would take that space from
+   under it. *)
+let rfs_commit nm at len =
   let k = rfs_count () in
-  let at = rfs_free () in
-  if k >= rfs_max_files then 0 - 1
-  else if at + len > io_read disk_size_reg then 0 - 1
+  let n = string_length nm in
+  if k >= rfs_max_files || n > rfs_name_max then 0 - 1
   else begin
     let base = rfs_dir + k * rfs_ent in
-    let n = string_length nm in
     for i = 0 to n - 1 do db_set (base + i) (int_of_char (string_get nm i)) done;
     for i = n to rfs_name_max - 1 do db_set (base + i) 0 done;
     d32_set (base + rfs_name_max) at;
@@ -2649,6 +2495,12 @@ let rfs_add nm len =
     d32_set 8 (at + len);
     at
   end
+
+(* a new entry, and where its data is to go; -1 if the disk is full *)
+let rfs_add nm len =
+  let at = rfs_free () in
+  if at + len > io_read disk_size_reg then 0 - 1
+  else rfs_commit nm at len
 
 (* what the language sees: a file is a string in and a string out *)
 let rfs_put nm (v : string) =
@@ -2670,6 +2522,309 @@ let rfs_get nm =
     let b = create_bytes n in
     for i = 0 to n - 1 do bytes_set b i (char_of_int (db (at + i))) done;
     Ok (bytes_to_string b)
+  end
+
+(* ---- NFS, straight into the RAM disk ----
+   ONC RPC over UDP: portmap for mountd, mount for the root handle,
+   portmap for nfsd, look the name up in it, then read it in chunks.  Each
+   chunk goes to the disk as it arrives rather than to a buffer in the
+   staging RAM -- io/replnet.ml read into 0x30000, one byte past what
+   io_is_stage decodes, which staging going back to 128 KiB left stranded
+   and nothing complained about -- so what arrives is a file in the filing
+   system and run_file can compile it.
+
+   Asynchronous, as the loader is: the replies come back in a later poll.
+   nfs_fetch starts a load and nfs_done reports on it.  Pumping the network
+   from inside the builtin instead would re-enter the receive window under
+   whatever delivered the command, which is exactly the hazard that made
+   re-entrant output draining unsafe. *)
+let nfs_lport = 1010            (* privileged: an export without "insecure" insists *)
+let pmap_port = 111
+let nfs_chunk = 1024
+let rpc_pmap = 100000
+let rpc_mount = 100005
+let rpc_nfs = 100003
+
+(* its own address and MAC: the boot server is not usually the file server *)
+let nfs_ip = [| 0; 0; 0; 0 |]
+let nfs_mac = [| 0; 0; 0; 0; 0; 0 |]
+
+let xp = ref 42                 (* the write cursor into the TX window *)
+let rp = ref 0                  (* and the read cursor into the RX window *)
+
+let x32 v =
+  tx !xp ((v lsr 24) land 0xFF); tx (!xp + 1) ((v lsr 16) land 0xFF);
+  tx (!xp + 2) ((v lsr 8) land 0xFF); tx (!xp + 3) (v land 0xFF);
+  xp := !xp + 4
+
+let xpad n =
+  let pad = (4 - (n land 3)) land 3 in
+  for i = 0 to pad - 1 do tx (!xp + n + i) 0 done;
+  xp := !xp + n + pad
+
+let xstr s =
+  let n = string_length s in
+  x32 n;
+  for i = 0 to n - 1 do tx (!xp + i) (int_of_char (string_get s i)) done;
+  xpad n
+
+(* the file handle mount gave us, and the one for the file itself *)
+let fh_root = create_bytes 64
+let fh_root_len = ref 0
+let fh_file = create_bytes 64
+let fh_file_len = ref 0
+
+let xfh b n =
+  x32 n;
+  for i = 0 to n - 1 do tx (!xp + i) (int_of_char (bytes_get b i)) done;
+  xpad n
+
+let r32 () =
+  let v = (rx !rp lsl 24) lor (rx (!rp + 1) lsl 16)
+          lor (rx (!rp + 2) lsl 8) lor rx (!rp + 3) in
+  rp := !rp + 4; v
+
+(* The xid stays under 2^24 so that reading it back cannot overflow a
+   31-bit int, which a word with its top bit set would. *)
+let nfs_xid = ref 0x515100
+
+let rpc_call prog vers proc =
+  nfs_xid := (!nfs_xid + 1) land 0xFFFFFF;
+  xp := 42;
+  x32 !nfs_xid; x32 0; x32 2; x32 prog; x32 vers; x32 proc;
+  (* AUTH_UNIX with an empty machine name, uid and gid 0 *)
+  x32 1; x32 20; x32 0; x32 0; x32 0; x32 0; x32 0;
+  x32 0; x32 0                                    (* AUTH_NULL verifier *)
+
+let nfs_udp dport payload_len =
+  let len = 42 + payload_len in
+  for i = 0 to 5 do tx i (array_get nfs_mac i); tx (6 + i) (mac i) done;
+  tx 12 0x08; tx 13 0x00;
+  tx 14 0x45; tx 15 0; tx 16 ((len - 14) lsr 8); tx 17 ((len - 14) land 0xFF);
+  for i = 18 to 21 do tx i 0 done;
+  tx 22 64; tx 23 17; tx 24 0; tx 25 0;
+  for i = 0 to 3 do tx (26 + i) (ip i); tx (30 + i) (array_get nfs_ip i) done;
+  let s = ip_checksum 14 20 in
+  tx 24 (s lsr 8); tx 25 (s land 0xFF);
+  tx 34 (nfs_lport lsr 8); tx 35 (nfs_lport land 0xFF);
+  tx 36 (dport lsr 8); tx 37 (dport land 0xFF);
+  tx 38 ((8 + payload_len) lsr 8); tx 39 ((8 + payload_len) land 0xFF);
+  tx 40 0; tx 41 0;
+  eth_send len
+
+let nfs_send dport = nfs_udp dport (!xp - 42)
+
+let nfs_arp_request () =
+  for i = 0 to 5 do tx i 0xff; tx (6 + i) (mac i) done;
+  tx 12 0x08; tx 13 0x06;
+  tx 14 0x00; tx 15 0x01; tx 16 0x08; tx 17 0x00; tx 18 6; tx 19 4;
+  tx 20 0x00; tx 21 0x01;
+  for i = 0 to 5 do tx (22 + i) (mac i); tx (32 + i) 0 done;
+  for i = 0 to 3 do tx (28 + i) (ip i); tx (38 + i) (array_get nfs_ip i) done;
+  eth_send 42
+
+(* the reply's header: the xid we sent, accepted, and the call succeeded *)
+let rpc_reply_ok len =
+  let udp = 34 in
+  if len < udp + 8 + 24 then false
+  else begin
+    rp := udp + 8;
+    let xid = r32 () in
+    let mtype = r32 () in
+    let rstat = r32 () in
+    if xid <> !nfs_xid || mtype <> 1 || rstat <> 0 then false
+    else begin
+      let _flavor = r32 () in
+      let vlen = r32 () in
+      rp := !rp + ((vlen + 3) / 4) * 4;
+      r32 () = 0                                   (* accept_stat = SUCCESS *)
+    end
+  end
+
+let nfs_idle = 0
+let nfs_arping = 1
+let nfs_pmap_mnt = 2
+let nfs_mounting = 3
+let nfs_pmap_nfs = 4
+let nfs_looking = 5
+let nfs_reading = 6
+
+let nfs_state = ref nfs_idle
+let nfs_deadline = ref 0
+let nfs_tries = ref 0
+let mnt_port = ref 0
+let nfsd_port = ref 2049
+let nfs_off = ref 0              (* bytes taken so far *)
+let nfs_at = ref 0               (* where they are going on the disk *)
+let nfs_export = ref ""
+let nfs_file = ref ""
+let nfs_result = ref (0 - 1)     (* -1 running, -2 failed, else the length *)
+
+let send_getport prog vers =
+  rpc_call rpc_pmap 2 3;
+  x32 prog; x32 vers; x32 17; x32 0;
+  nfs_send pmap_port
+
+let send_mnt () =
+  rpc_call rpc_mount 3 1;
+  xstr !nfs_export;
+  nfs_send !mnt_port
+
+let send_lookup () =
+  rpc_call rpc_nfs 3 3;
+  xfh fh_root !fh_root_len;
+  xstr !nfs_file;
+  nfs_send !nfsd_port
+
+let send_read () =
+  rpc_call rpc_nfs 3 6;
+  xfh fh_file !fh_file_len;
+  x32 0; x32 !nfs_off;        (* a 64-bit offset, high word first *)
+  x32 nfs_chunk;
+  nfs_send !nfsd_port
+
+(* a post_op_attr: a flag, and the 84 bytes of attributes if it is set *)
+let skip_attr () = if r32 () = 1 then rp := !rp + 84
+
+let take_fh b =
+  let n = r32 () in
+  if n > 64 then 0
+  else begin
+    for i = 0 to n - 1 do bytes_set b i (char_of_int (rx (!rp + i))) done;
+    rp := !rp + ((n + 3) / 4) * 4;
+    n
+  end
+
+let nfs_fail why =
+  nfs_state := nfs_idle;
+  nfs_result := 0 - 2;
+  uart_puts "nfs: "; uart_puts why; uart_putc '\n'
+
+let nfs_step () =
+  nfs_tries := 0;
+  nfs_deadline := now () + 1500
+
+let nfs_reply len =
+  if not_b (rpc_reply_ok len) then ()
+  else if !nfs_state = nfs_pmap_mnt then begin
+    mnt_port := r32 ();
+    if !mnt_port = 0 then nfs_fail "no mountd"
+    else begin nfs_state := nfs_mounting; send_mnt (); nfs_step () end
+  end
+  else if !nfs_state = nfs_mounting then begin
+    if r32 () <> 0 then nfs_fail "mount refused"
+    else begin
+      fh_root_len := take_fh fh_root;
+      if !fh_root_len = 0 then nfs_fail "bad handle"
+      else begin nfs_state := nfs_pmap_nfs; send_getport rpc_nfs 3; nfs_step () end
+    end
+  end
+  else if !nfs_state = nfs_pmap_nfs then begin
+    let p = r32 () in
+    nfsd_port := (if p = 0 then 2049 else p);
+    nfs_state := nfs_looking; send_lookup (); nfs_step ()
+  end
+  else if !nfs_state = nfs_looking then begin
+    if r32 () <> 0 then nfs_fail "no such file"
+    else begin
+      fh_file_len := take_fh fh_file;
+      if !fh_file_len = 0 then nfs_fail "bad handle"
+      else begin
+        nfs_off := 0;
+        nfs_at := rfs_free ();
+        nfs_state := nfs_reading; send_read (); nfs_step ()
+      end
+    end
+  end
+  else if !nfs_state = nfs_reading then begin
+    if r32 () <> 0 then nfs_fail "read refused"
+    else begin
+      skip_attr ();
+      let _count = r32 () in
+      let eof = r32 () in
+      let n = r32 () in
+      if !nfs_at + !nfs_off + n > io_read disk_size_reg then
+        nfs_fail "disk full"
+      else begin
+        (* straight to the disk: no copy in staging, and nothing to move
+           afterwards -- the bytes are already where the file will live *)
+        for i = 0 to n - 1 do
+          db_set (!nfs_at + !nfs_off + i) (rx (!rp + i))
+        done;
+        nfs_off := !nfs_off + n;
+        if eof <> 0 || n = 0 then begin
+          nfs_state := nfs_idle;
+          if rfs_commit !nfs_file !nfs_at !nfs_off < 0 then
+            nfs_fail "disk full"
+          else begin
+            nfs_result := !nfs_off;
+            uart_puts "nfs: "; uart_dec !nfs_off; uart_puts " bytes\n"
+          end
+        end else begin send_read (); nfs_step () end
+      end
+    end
+  end
+
+let nfs_tick () =
+  if !nfs_state <> nfs_idle && now () > !nfs_deadline then begin
+    nfs_tries := !nfs_tries + 1;
+    if !nfs_tries > 4 then nfs_fail "no answer"
+    else begin
+      (if !nfs_state = nfs_arping then nfs_arp_request ()
+       else if !nfs_state = nfs_pmap_mnt then send_getport rpc_mount 3
+       else if !nfs_state = nfs_mounting then send_mnt ()
+       else if !nfs_state = nfs_pmap_nfs then send_getport rpc_nfs 3
+       else if !nfs_state = nfs_looking then send_lookup ()
+       else send_read ());
+      nfs_deadline := now () + 1500
+    end
+  end
+
+let nfs_arp_reply len =
+  if !nfs_state = nfs_arping && len >= 42 && rx 21 = 2
+     && rx 28 = array_get nfs_ip 0 && rx 29 = array_get nfs_ip 1
+     && rx 30 = array_get nfs_ip 2 && rx 31 = array_get nfs_ip 3 then begin
+    for i = 0 to 5 do array_set nfs_mac i (rx (22 + i)) done;
+    nfs_state := nfs_pmap_mnt;
+    send_getport rpc_mount 3;
+    nfs_step ()
+  end
+
+(* what the language sees *)
+(* "192.168.1.106" as one argument: the compiler applies at most two at a
+   time, so four octets could not be passed even though they would read
+   better as numbers *)
+let nfs_set_server (a : string) =
+  let oct = ref 0 and k = ref 0 and ok = ref true in
+  for i = 0 to string_length a - 1 do
+    let c = int_of_char (string_get a i) in
+    if c = 46 then begin
+      (if !k < 4 then array_set nfs_ip !k !oct);
+      k := !k + 1; oct := 0
+    end
+    else if c >= 48 && c <= 57 then oct := !oct * 10 + (c - 48)
+    else ok := false
+  done;
+  (if !k < 4 then array_set nfs_ip !k !oct);
+  if !ok && !k = 3 then begin
+    for i = 0 to 5 do array_set nfs_mac i 0 done; 1
+  end else begin
+    for i = 0 to 3 do array_set nfs_ip i 0 done; 0
+  end
+
+let nfs_start export f =
+  if not_b (bound ()) then 0
+  else if !nfs_state <> nfs_idle then 0
+  else if array_get nfs_ip 0 = 0 then 0
+  else if string_length f > rfs_name_max then 0
+  else begin
+    let _ = rfs_ready () in
+    nfs_export := export; nfs_file := f;
+    nfs_result := 0 - 1;
+    nfs_state := nfs_arping;
+    nfs_arp_request ();
+    nfs_step ();
+    1
   end
 
 (* ---- evaluating a line, whichever way it came ---- *)
@@ -2783,18 +2938,22 @@ let f2f  = TArrow (TFloat, TFloat)
 let ff2f = TArrow (TFloat, TArrow (TFloat, TFloat))
 
 let builtins =
-  [ ("sin", 1, f2f); ("cos", 1, f2f); ("tan", 1, f2f);
-    ("asin", 1, f2f); ("acos", 1, f2f); ("atan", 1, f2f);
-    ("exp", 1, f2f); ("log", 1, f2f); ("sqrt", 1, f2f);
-    ("abs_float", 1, f2f);
-    ("atan2", 2, ff2f); ("pow", 2, ff2f);
+  (* sqrt and abs_float are the FPU's own, emitted as primitives; the
+     series functions that used to sit beside them -- exp, log, sin, cos,
+     tan, asin, acos, atan -- were only ever reachable from the
+     tree-walker, so they went with it and come back as source over NFS. *)
+  [ ("sqrt", 1, f2f); ("abs_float", 1, f2f);
+
     ("float_of_int", 1, TArrow (TInt, TFloat));
     ("int_of_float", 1, TArrow (TFloat, TInt));
     (* the RAM disk: what is written here outlives a chain load *)
     ("write_file", 2, TArrow (TString, TArrow (TString, TInt)));
     ("read_file", 1, TArrow (TString, TString));
     ("run_file", 1, TArrow (TString, TInt));
-    ("files", 1, TArrow (TInt, TInt)) ]
+    ("files", 1, TArrow (TInt, TInt));
+    ("nfs_server", 1, TArrow (TString, TInt));
+    ("nfs_fetch", 2, TArrow (TString, TArrow (TString, TInt)));
+    ("nfs_done", 1, TArrow (TInt, TInt)) ]
 
 let rec builtin_values l = match l with
   | [] -> []
@@ -3462,11 +3621,12 @@ let poll () =
   uart_poll ();
   dhcp_tick ();
   tcp_tick ();
+  nfs_tick ();
   let st = io_read eth_status in
   if st land eth_rx_valid <> 0 then begin
     let len = io_read eth_rxlen land 0x7FF in
     if rx 12 = 0x08 && rx 13 = 0x06 then begin
-      handle_arp len
+      handle_arp len; nfs_arp_reply len
     end
     else if rx 12 = 0x08 && rx 13 = 0x00 && len >= 42 then begin
       let ihl = (rx 14 land 0x0F) * 4 in
@@ -3474,6 +3634,7 @@ let poll () =
       if rx 23 = 1 then handle_icmp len ihl
       else if rx 23 = 17 && dport = 68 then handle_dhcp len
       else if rx 23 = 17 && dport = repl_port then handle_repl len ihl
+      else if rx 23 = 17 && dport = nfs_lport then nfs_reply len
 
       else if rx 23 = 6 then handle_tcp len ihl
     end;
@@ -3523,7 +3684,11 @@ let () =
     install_fn "read_file"
       (magic (fun (a : string) -> match (!fs_get) a with Ok v -> v | Err _ -> ""));
     install_fn "run_file" (magic (fun (a : string) -> (!fs_run) a));
-    install_fn "files" (magic (fun (n : int) -> (!fs_ls) n))
+    install_fn "files" (magic (fun (n : int) -> (!fs_ls) n));
+    install_fn "nfs_server" (magic (fun (a : string) -> nfs_set_server a));
+    install_fn "nfs_fetch"
+      (magic (fun (e : string) (f : string) -> nfs_start e f));
+    install_fn "nfs_done" (magic (fun (_n : int) -> !nfs_result))
   end;
   puts "OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build ";
   uart_build ();
