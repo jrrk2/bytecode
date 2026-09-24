@@ -494,6 +494,9 @@ module ocaml4142_vm_rtl #(
   logic [ 7:0] restart_n;          // RESTART: arguments saved in the closure
   localparam logic [VALUEW-1:0] CLOSINFO = 32'h5;  // Make_closinfo(0, 2): env from field 2
 
+  // a comparison of two blocks, waiting on the tag to say what it is
+  logic [3:0] cmp_fp_op;
+  logic       cmp_negate;
   logic [VALUEW-1:0] temp_arg1, temp_arg2, temp_arg3;
   logic [VALUEW-1:0] temp_field1, temp_field2, temp_field3;
   logic [VALUEW-1:0] temp_stack_val;
@@ -1562,36 +1565,76 @@ module ocaml4142_vm_rtl #(
             if (!rd_phase) begin
               stack_read_a(sp);  // tos
               hold_for_read();
-            end else begin
+            end else if (accu[0] || st_rd_a[0]) begin
               accu <= (accu == st_rd_a) ? VAL_TRUE : VAL_FALSE;
               sp   <= sp + 1;
+            end else begin
+              // two blocks: if they are boxed doubles this is a float
+              // comparison.  A language whose operators are shared between
+              // the integers and the floats cannot say which it meant, and
+              // the tag can.  The immediate case above is untouched, so
+              // integer code pays one bit test and no memory access.
+              cmp_fp_op <= FP_EQ;
+              cmp_negate <= 1'b0;
+              temp_heap_addr <= Heap_index_of_ptr(accu);
+              state <= S_CMP_TAG;
             end
 
             NEQ:
             if (!rd_phase) begin
               stack_read_a(sp);  // tos
               hold_for_read();
-            end else begin
+            end else if (accu[0] || st_rd_a[0]) begin
               accu <= (accu != st_rd_a) ? VAL_TRUE : VAL_FALSE;
               sp   <= sp + 1;
+            end else begin
+              // two blocks: if they are boxed doubles this is a float
+              // comparison.  A language whose operators are shared between
+              // the integers and the floats cannot say which it meant, and
+              // the tag can.  The immediate case above is untouched, so
+              // integer code pays one bit test and no memory access.
+              cmp_fp_op <= FP_EQ;
+              cmp_negate <= 1'b1;
+              temp_heap_addr <= Heap_index_of_ptr(accu);
+              state <= S_CMP_TAG;
             end
 
             LTINT:
             if (!rd_phase) begin
               stack_read_a(sp);  // tos
               hold_for_read();
-            end else begin
+            end else if (accu[0] || st_rd_a[0]) begin
               accu <= (Int_val(accu) < Int_val(st_rd_a)) ? VAL_TRUE : VAL_FALSE;
               sp   <= sp + 1;
+            end else begin
+              // two blocks: if they are boxed doubles this is a float
+              // comparison.  A language whose operators are shared between
+              // the integers and the floats cannot say which it meant, and
+              // the tag can.  The immediate case above is untouched, so
+              // integer code pays one bit test and no memory access.
+              cmp_fp_op <= FP_LT;
+              cmp_negate <= 1'b0;
+              temp_heap_addr <= Heap_index_of_ptr(accu);
+              state <= S_CMP_TAG;
             end
 
             LEINT:
             if (!rd_phase) begin
               stack_read_a(sp);  // tos
               hold_for_read();
-            end else begin
+            end else if (accu[0] || st_rd_a[0]) begin
               accu <= (Int_val(accu) <= Int_val(st_rd_a)) ? VAL_TRUE : VAL_FALSE;
               sp   <= sp + 1;
+            end else begin
+              // two blocks: if they are boxed doubles this is a float
+              // comparison.  A language whose operators are shared between
+              // the integers and the floats cannot say which it meant, and
+              // the tag can.  The immediate case above is untouched, so
+              // integer code pays one bit test and no memory access.
+              cmp_fp_op <= FP_LE;
+              cmp_negate <= 1'b0;
+              temp_heap_addr <= Heap_index_of_ptr(accu);
+              state <= S_CMP_TAG;
             end
 
             GTINT:
@@ -2967,6 +3010,24 @@ module ocaml4142_vm_rtl #(
         // A double lives in a two-word box, so both words come back in one
         // read on the two ports.  The peripheral takes an operand in two
         // halves over the trap port, and gives the answer back the same way.
+        // The header of the first operand of a block comparison.  A boxed
+        // double goes to the floating-point peripheral, which already
+        // implements caml_lt_float and its neighbours; anything else keeps
+        // the comparison it would have had before, which for two pointers
+        // is what it always was.
+        S_CMP_TAG:
+        if (!rd_phase) begin
+          heap_read_a(temp_heap_addr);
+          hold_for_read();
+        end else if (hm_rd_a[7:0] == DOUBLE_TAG) begin
+          sp <= sp + 1;
+          fp_begin(cmp_fp_op, 1'b0, 1'b0, 1'b0, cmp_negate);
+        end else begin
+          accu <= (cmp_negate ^ (accu == st_rd_a)) ? VAL_TRUE : VAL_FALSE;
+          sp    <= sp + 1;
+          state <= S_DONE;
+        end
+
         S_FP_READ_A:
         if (!rd_phase) begin
           heap_read_a(Heap_index_of_ptr(accu) + 1);

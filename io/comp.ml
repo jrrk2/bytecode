@@ -2626,12 +2626,12 @@ and comp_binop env op a b =
       else begin emit op_c_call2; emit fprim; true end
     end
   end
-  (* the comparisons are shared with the integers and nothing here carries
-     a type, so a float one would compare the boxes rather than what is in
-     them.  Refused where it can be seen, rather than answered wrongly. *)
-  else if is_comparison op && (looks_float a || looks_float b) then begin
-    comp_err := "comparing floats is not compiled yet"; false
-  end
+  (* > and >= are < and <= the other way about.  The floating-point
+     peripheral has no greater-than, and the comparisons now dispatch on
+     the operands' tags in the VM, so it is cheaper to swap here than to
+     teach the hardware an operation it does not have. *)
+  else if string_equal op ">" then comp_binop env "<" b a
+  else if string_equal op ">=" then comp_binop env "<=" b a
   else begin
     if not_b (comp env b) then false
     else begin
