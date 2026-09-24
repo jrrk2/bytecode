@@ -28,7 +28,7 @@
 //              a compiler can append without being told; written, it
 //              admits what was appended.
 //   0x10000..0x2FFFF  the staging RAM, a byte per address
-//   0x60000..0x7FFFF  the program's code, a byte per address, readable and
+//   0x60000..0x9FFFF  the program's code, a byte per address, readable and
 //              writable while it runs: a compiler on this machine appends
 //              closures to the program it is itself part of, and reads it
 //              back to find the places it must patch
@@ -147,7 +147,11 @@ module ethmin_vm_core #(
 	// code is a x9 ROM) while its heap is corrupt, so the strings are intact
 	// but every pointer into them is wrong.  Vivado is happy either way.
 	// The staging RAM is fully addressed: 32K words (128 KiB).
-	localparam integer PROG_WORDS  = 32768;   // program code RAM (block RAM)
+	// 64K words.  It was 32768, which was a constant and not a limit: the
+	// part has 853 RAMB36 spare of 1030, and PCW is 24 bits, so nothing
+	// but that number stood in the way.  Doubling it costs about 33 tiles
+	// and turns 3941 free words into some 37000.
+	localparam integer PROG_WORDS  = 65536;
 	localparam integer STAGE_WORDS = 32768;   // staging RAM: 128 KiB
 	// 32K words, two 16K semi-spaces.  It was briefly four times this, to
 	// give a tree-walking interpreter room for the frames it holds live,
@@ -178,7 +182,7 @@ module ethmin_vm_core #(
 
 	wire [23:0] pc /*verilator public_flat_rd*/;
 	reg         code_bank /*verilator public_flat_rd*/;  // 0: the resident program, 1: the loaded one
-	reg  [15:0] prog_words /*verilator public_flat_rd*/;
+	reg  [16:0] prog_words /*verilator public_flat_rd*/;   // 17 bits: 65536 does not fit in 16
 
 	// The sequencer: after reset it loads the resident program's heap and
 	// globals into the VM; on BOOT the staged image's code, heap and globals.
@@ -201,7 +205,7 @@ module ethmin_vm_core #(
 	reg [35:0] load_data;
 	reg        boot_req;
 	reg        set_pw;            // 0x100c: raise prog_words
-	reg [15:0] set_pw_val;
+	reg [16:0] set_pw_val;
 	integer    code_lane;
 	reg [1:0]  hdr_i;
 
@@ -284,7 +288,7 @@ module ethmin_vm_core #(
 				// wider than 16 bits
 				image_words <= seq_from_stage ? stage_heap : `HEAP_WORDS;
 				code_bank   <= seq_from_stage;
-				prog_words  <= stage_code[15:0];
+				prog_words  <= {1'b0, stage_code[15:0]};
 				seq_state   <= SEQ_RUN;         // the VM leaves reset next cycle
 			end
 			SEQ_RUN: begin
@@ -320,8 +324,8 @@ module ethmin_vm_core #(
 		.clk(clk_sys), .en(1'b1), .addr(fetch_pc[14:0]), .dout(code_rom_q_w));
 
 	always @(posedge clk_sys) begin
-		code_prog_q <= prog_code[fetch_pc[14:0]];
-		fetch_in_range <= code_bank ? (fetch_pc < {8'd0, prog_words})
+		code_prog_q <= prog_code[fetch_pc[15:0]];
+		fetch_in_range <= code_bank ? (fetch_pc < {7'd0, prog_words})
 		                            : (fetch_pc < `PROGRAM_WORDS);
 		code_q_pc <= fetch_pc;
 		// a new program invalidates what was fetched, and so does writing
@@ -492,8 +496,8 @@ module ethmin_vm_core #(
 	// Code memory while the VM runs.  The sequencer's write port is idle
 	// then, so the two share it; they cannot collide, because the VM is
 	// held in reset for the whole of a load and io_new needs !vm_reset.
-	wire io_is_code = io_addr >= 32'h60000 && io_addr < 32'h80000;
-	wire [14:0] code_idx = (io_addr - 32'h60000) >> 2;
+	wire io_is_code = io_addr >= 32'h60000 && io_addr < 32'hA0000;
+	wire [15:0] code_idx = (io_addr - 32'h60000) >> 2;
 	wire code_wr = io_new && io_is_code && io_write;
 
 	always @(*) begin
@@ -515,7 +519,7 @@ module ethmin_vm_core #(
 	// the pattern block RAM is inferred from, and mixing a whole-word write
 	// with byte writes over two blocks is not.
 	wire        pc_load  = (seq_state == SEQ_CODE) && seq_data_ready;
-	wire [14:0] pc_paddr = pc_load ? (seq_i[14:0] - 15'd1) : code_idx;
+	wire [15:0] pc_paddr = pc_load ? ({1'b0, seq_i[14:0]} - 16'd1) : code_idx;
 	wire [31:0] pc_pdata = pc_load ? seq_q : {4{trap_arg1[7:0]}};
 	wire [ 3:0] pc_pbe   = pc_load ? 4'b1111
 	                     : (code_wr ? (4'b0001 << io_addr[1:0]) : 4'b0000);
@@ -587,7 +591,7 @@ module ethmin_vm_core #(
 						32'h100b: trap_result <= {27'd0, btn_sync[1]}; // the push buttons
 						// the program's length: read to find where its code
 						// ends, written to admit what was appended
-						32'h100c: trap_result <= {16'd0, prog_words};
+						32'h100c: trap_result <= {15'd0, prog_words};
 						32'h1008: begin                               // a received byte, or -1
 							trap_result <= rxf_empty ? 32'hFFFFFFFF : {24'd0, rx_fifo[rxf_rp[7:0]]};
 							rxf_pop <= io_read && !rxf_empty;
@@ -599,7 +603,7 @@ module ethmin_vm_core #(
 						32'h1003: begin tx_len <= trap_arg1[10:0]; tx_start <= 1'b1; end
 						32'h1004: leds <= trap_arg1[7:0];
 						32'h1007: boot_req <= 1'b1;                   // boot the staged image
-						32'h100c: begin set_pw <= 1'b1; set_pw_val <= trap_arg1[15:0]; end
+						32'h100c: begin set_pw <= 1'b1; set_pw_val <= trap_arg1[16:0]; end
 						default: ;
 					endcase
 					trap_ready <= 1'b1;
