@@ -141,7 +141,11 @@ module ethmin_vm_core #(
 	// The staging RAM is fully addressed: 32K words (128 KiB).
 	localparam integer PROG_WORDS  = 32768;   // program code RAM (block RAM)
 	localparam integer STAGE_WORDS = 32768;   // staging RAM: 128 KiB
-	localparam integer HEAP_AW     = 15;      // 32K-word heap: two 16K semi-spaces above the image
+	// 128K words, two 64K semi-spaces: a tree-walking interpreter holds
+	// every frame of a recursion live, so the collector has nothing to take
+	// and the old 16K semi-space ran out at a few hundred frames.  Block RAM
+	// is what this part has spare -- 168 RAMB36 of 1030 before this.
+	localparam integer HEAP_AW     = 17;
 	localparam integer GLOBALS_AW  = 13;      // see the VM instantiation
 
 	// 36 bits, not 32: at 32 bits yosys slices these ROMs x9, and a RAMB36 in
@@ -258,7 +262,9 @@ module ethmin_vm_core #(
 				end
 			end
 			SEQ_START: begin
-				image_words <= seq_from_stage ? stage_heap[HEAP_AW-1:0] : `HEAP_WORDS;
+				// stage_heap is 16 bits; with a heap wider than that the
+				// slice would reach past it, so widen rather than cut
+				image_words <= seq_from_stage ? HEAP_AW'(stage_heap) : `HEAP_WORDS;
 				code_bank   <= seq_from_stage;
 				prog_words  <= stage_code[15:0];
 				seq_state   <= SEQ_RUN;         // the VM leaves reset next cycle

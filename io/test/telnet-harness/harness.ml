@@ -151,6 +151,31 @@ let () =
                | Error e -> Format.printf "[read error: %a]@." Tcp.pp_error e; Lwt.return_unit in
              Lwt.pick [ rd (); Lwt_unix.sleep 2.0 ] >>= fun () ->
              Tcp.close f2)
+       else if Array.length Sys.argv > 1 && Sys.argv.(1) = "hol" then
+         typ "let a = mk_vartype \"A\"\r" >>= fun () ->
+         typ "let x = mk_var \"x\" a\r" >>= fun () ->
+         typ "let y = mk_var \"y\" a\r" >>= fun () ->
+         typ "let f = mk_var \"f\" (mk_fun a a)\r" >>= fun () ->
+         typ "x\r" >>= fun () ->
+         typ "type_of f\r" >>= fun () ->
+         typ "REFL x\r" >>= fun () ->
+         typ "BETA (mk_comb (mk_abs x x) x)\r" >>= fun () ->
+         typ "ASSUME (mk_eq x y)\r" >>= fun () ->
+         typ "TRANS (ASSUME (mk_eq x y)) (REFL y)\r" >>= fun () ->
+         typ "MK_COMB (REFL f) (REFL x)\r" >>= fun () ->
+         typ "ABS x (REFL x)\r" >>= fun () ->
+         typ "DEDUCT_ANTISYM_RULE (ASSUME (mk_eq x y)) (ASSUME (mk_eq y x))\r" >>= fun () ->
+         typ "concl (REFL x)\r" >>= fun () ->
+         typ "hyps (ASSUME (mk_eq x y))\r" >>= fun () ->
+         typ "string_of_thm (REFL x)\r" >>= fun () ->
+         typ "REFL 3\r" >>= fun () ->
+         typ "mk_comb x x\r" >>= fun () ->
+         typ "BETA (mk_comb (mk_abs x x) y)\r" >>= fun () ->
+         typ "TRANS (REFL x) (REFL y)\r" >>= fun () ->
+         typ "ABS x (ASSUME (mk_eq x y))\r" >>= fun () ->
+         typ "ASSUME x\r" >>= fun () ->
+         typ "let rec chain n t = if n = 0 then t else chain (n-1) (TRANS t (REFL x))\r" >>= fun () ->
+         typ "chain 50 (REFL x)\r"
        else if Array.length Sys.argv > 1 && Sys.argv.(1) = "str" then
          typ "\"hello\"\r" >>= fun () ->
          typ "\"a\\nb\"\r" >>= fun () ->

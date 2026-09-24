@@ -49,6 +49,7 @@ external ( || ) : bool -> bool -> bool = "%sequor"
 external not : bool -> bool = "%boolnot"
 external int_of_char : char -> int = "%identity"
 external char_of_int : int -> char = "%identity"
+external raise : exn -> 'a = "%raise"
 external string_length : string -> int = "%string_length"
 external string_get : string -> int -> char = "%string_safe_get"
 external string_equal : string -> string -> bool = "caml_string_equal"
@@ -683,6 +684,7 @@ let is_sym t s = match t with TSym x -> string_equal x s | _ -> false
 let is_kw t s = match t with TId x -> string_equal x s | _ -> false
 
 let rec rev_acc l acc = match l with [] -> acc | x :: r -> rev_acc r (x :: acc)
+let rec apps f l = match l with [] -> f | a :: r -> apps (App (f, a)) r
 (* a constructor starts with a capital, a type variable with a quote *)
 let is_ctor s =
   string_length s > 0 && (let c = int_of_char (string_get s 0) in c >= 65 && c <= 90)
@@ -1157,6 +1159,299 @@ let parse_typedecl toks =
        arms rest [])
   | _ -> Err "expected a type name"
 
+let bool_eq (a : bool) (b : bool) = if a then b else if b then false else true
+let not_b (a : bool) = if a then false else true
+
+(* ==== the HOL kernel ====
+   fusion.ml's logical core and nothing above it.  These types are the
+   interpreter's own, not the language's: the language is handed hol_type,
+   term and thm as types with no constructors, so a theorem cannot be
+   written down -- it can only come back from one of the ten primitive
+   rules below.  That is the LCF discipline, kept by the host because this
+   language has no module signatures to hide a constructor behind. *)
+type hol_type =
+  | Tyvar of string
+  | Tyapp of string * hol_type list
+
+type term =
+  | TmVar of string * hol_type
+  | TmConst of string * hol_type
+  | TmComb of term * term
+  | TmAbs of term * term
+
+(* the hypotheses, and what they prove *)
+type thm = Sequent of term list * term
+
+exception Clash of term
+
+let bool_ty = Tyapp ("bool", [])
+let mk_fun_ty a b = Tyapp ("fun", [a; b])
+
+let rec ty_eq a b = match a, b with
+  | Tyvar x, Tyvar y -> string_equal x y
+  | Tyapp (x, l), Tyapp (y, m) -> string_equal x y && ty_eq_list l m
+  | _ -> false
+and ty_eq_list l m = match l, m with
+  | [], [] -> true
+  | a :: r, b :: s -> ty_eq a b && ty_eq_list r s
+  | _ -> false
+
+(* terms are well typed by construction, so this need not fail *)
+let rec type_of tm = match tm with
+  | TmVar (_, ty) -> ty
+  | TmConst (_, ty) -> ty
+  | TmComb (f, _) -> (match type_of f with Tyapp (_, [_; r]) -> r | t -> t)
+  | TmAbs (v, b) -> mk_fun_ty (type_of v) (type_of b)
+
+let is_eq_const tm = match tm with
+  | TmConst (n, _) -> string_equal n "="
+  | _ -> false
+
+let eq_const ty = TmConst ("=", mk_fun_ty ty (mk_fun_ty ty bool_ty))
+let mk_eq l r = TmComb (TmComb (eq_const (type_of l), l), r)
+
+(* ---- alpha equivalence ----
+   The two sides carry a list pairing their bound variables; a variable
+   bound on one side matches one on the other only if they were bound at
+   the same place, and a free variable matches by name and type. *)
+let rec idx_l env x n = match env with
+  | [] -> 0 - 1
+  | (a, _) :: r -> if string_equal a x then n else idx_l r x (n + 1)
+let rec idx_r env y n = match env with
+  | [] -> 0 - 1
+  | (_, b) :: r -> if string_equal b y then n else idx_r r y (n + 1)
+
+let rec aconv env t1 t2 = match t1, t2 with
+  | TmVar (x, tx), TmVar (y, ty) ->
+    let i = idx_l env x 0 in
+    let j = idx_r env y 0 in
+    if i >= 0 || j >= 0 then i = j && ty_eq tx ty
+    else string_equal x y && ty_eq tx ty
+  | TmConst (x, tx), TmConst (y, ty) -> string_equal x y && ty_eq tx ty
+  | TmComb (a, b), TmComb (c, d) -> aconv env a c && aconv env b d
+  | TmAbs (TmVar (x, tx), b1), TmAbs (TmVar (y, ty), b2) ->
+    ty_eq tx ty && aconv ((x, y) :: env) b1 b2
+  | _ -> false
+
+let term_eq t1 t2 = aconv [] t1 t2
+
+let rec vfree_in v tm = match tm with
+  | TmAbs (bv, b) -> not_b (term_eq bv v) && vfree_in v b
+  | TmComb (f, a) -> vfree_in v f || vfree_in v a
+  | _ -> term_eq tm v
+
+(* ---- the hypothesis list, kept without duplicates ---- *)
+let rec term_mem t l = match l with
+  | [] -> false
+  | x :: r -> term_eq x t || term_mem t r
+let rec term_union l m = match l with
+  | [] -> m
+  | x :: r -> if term_mem x m then term_union r m else x :: term_union r m
+let rec term_remove t l = match l with
+  | [] -> []
+  | x :: r -> if term_eq x t then term_remove t r else x :: term_remove t r
+let rec term_image f l = match l with
+  | [] -> []
+  | x :: r -> let y = f x in
+              let s = term_image f r in
+              if term_mem y s then s else y :: s
+let rec any_free v l = match l with
+  | [] -> false
+  | t :: r -> vfree_in v t || any_free v r
+
+let rec frees tm = match tm with
+  | TmVar (_, _) -> [tm]
+  | TmConst (_, _) -> []
+  | TmComb (f, a) -> term_union (frees f) (frees a)
+  | TmAbs (v, b) -> term_remove v (frees b)
+
+(* a name not free in any of these terms, made by priming *)
+let rec variant avoid v = match v with
+  | TmVar (n, ty) ->
+    if any_free_list avoid v then variant avoid (TmVar (n ^^ "'", ty)) else v
+  | _ -> v
+and any_free_list l v = match l with
+  | [] -> false
+  | t :: r -> vfree_in v t || any_free_list r v
+
+(* ---- substitution: a term for a variable, avoiding capture ---- *)
+let rec rev_assoc_tm l v = match l with
+  | [] -> v
+  | (t, x) :: r -> if term_eq x v then t else rev_assoc_tm r v
+let rec drop_var l v = match l with
+  | [] -> []
+  | (t, x) :: r -> if term_eq x v then drop_var r v else (t, x) :: drop_var r v
+let rec clashes l v s = match l with
+  | [] -> false
+  | (t, x) :: r -> (vfree_in v t && vfree_in x s) || clashes r v s
+
+let rec vsubst ilist tm = match tm with
+  | TmVar (_, _) -> rev_assoc_tm ilist tm
+  | TmConst (_, _) -> tm
+  | TmComb (f, a) -> TmComb (vsubst ilist f, vsubst ilist a)
+  | TmAbs (v, s) ->
+    (match drop_var ilist v with
+     | [] -> tm
+     | l2 ->
+       let s2 = vsubst l2 s in
+       if clashes l2 v s then
+         let v2 = variant [s2] v in
+         TmAbs (v2, vsubst ((v2, v) :: l2) s)
+       else TmAbs (v, s2))
+
+(* ---- type instantiation ----
+   Renaming a bound variable is only needed when instantiating makes it
+   collide with one already there, which is what Clash reports back. *)
+let rec rev_assoc_ty l ty = match l with
+  | [] -> ty
+  | (t, x) :: r -> if ty_eq x ty then t else rev_assoc_ty r ty
+
+let rec type_subst tyin ty = match ty with
+  | Tyapp (n, args) -> Tyapp (n, type_subst_list tyin args)
+  | Tyvar _ -> rev_assoc_ty tyin ty
+and type_subst_list tyin l = match l with
+  | [] -> []
+  | t :: r -> type_subst tyin t :: type_subst_list tyin r
+
+let rec inst_tm env tyin tm = match tm with
+  | TmVar (n, ty) ->
+    let tm2 = TmVar (n, type_subst tyin ty) in
+    if term_eq (rev_assoc_tm env tm2) tm then tm2 else raise (Clash tm2)
+  | TmConst (c, ty) -> TmConst (c, type_subst tyin ty)
+  | TmComb (f, a) -> TmComb (inst_tm env tyin f, inst_tm env tyin a)
+  | TmAbs (y, t) ->
+    let y2 = inst_tm [] tyin y in
+    (try TmAbs (y2, inst_tm ((y2, y) :: env) tyin t)
+     with Clash w ->
+       if not_b (term_eq w y2) then raise (Clash w)
+       else
+         let ifrees = term_image (fun u -> inst_tm [] tyin u) (frees t) in
+         let y3 = variant ifrees y2 in
+         let z = match y3, y with
+           | TmVar (n, _), TmVar (_, ty) -> TmVar (n, ty)
+           | _ -> y in
+         inst_tm env tyin (TmAbs (z, vsubst [(z, y)] t)))
+
+let inst tyin tm = try Ok (inst_tm [] tyin tm) with Clash _ -> Err "INST_TYPE: clash"
+
+
+(* ---- the primitive rules ----
+   These ten are the whole of the logic: every theorem is built by them,
+   and nothing else returns a thm. *)
+let thm_refl tm = Ok (Sequent ([], mk_eq tm tm))
+
+let thm_trans t1 t2 = match t1, t2 with
+  | Sequent (a1, c1), Sequent (a2, c2) ->
+    (match c1, c2 with
+     | TmComb ((TmComb (e1, _) as eql), m1), TmComb (TmComb (e2, m2), r) ->
+       if is_eq_const e1 && is_eq_const e2 && term_eq m1 m2 then
+         Ok (Sequent (term_union a1 a2, TmComb (eql, r)))
+       else Err "TRANS: the middle terms differ"
+     | _ -> Err "TRANS: not equations")
+
+let thm_mk_comb t1 t2 = match t1, t2 with
+  | Sequent (a1, c1), Sequent (a2, c2) ->
+    (match c1, c2 with
+     | TmComb (TmComb (e1, l1), r1), TmComb (TmComb (e2, l2), r2) ->
+       if not_b (is_eq_const e1 && is_eq_const e2) then Err "MK_COMB: not equations"
+       else
+         (match type_of r1 with
+          | Tyapp (n, [ty; _]) when string_equal n "fun" ->
+            if ty_eq ty (type_of r2) then
+              Ok (Sequent (term_union a1 a2,
+                           mk_eq (TmComb (l1, l2)) (TmComb (r1, r2))))
+            else Err "MK_COMB: types do not agree"
+          | _ -> Err "MK_COMB: not a function")
+     | _ -> Err "MK_COMB: not equations")
+
+let thm_abs v t = match t with
+  | Sequent (asl, c) ->
+    (match v, c with
+     | TmVar (_, _), TmComb (TmComb (e, l), r) ->
+       if not_b (is_eq_const e) then Err "ABS: not an equation"
+       else if any_free v asl then Err "ABS: the variable is free in a hypothesis"
+       else Ok (Sequent (asl, mk_eq (TmAbs (v, l)) (TmAbs (v, r))))
+     | _ -> Err "ABS: needs a variable and an equation")
+
+let thm_beta tm = match tm with
+  | TmComb (TmAbs (v, bod), arg) ->
+    if term_eq arg v then Ok (Sequent ([], mk_eq tm bod))
+    else Err "BETA: the argument is not the bound variable"
+  | _ -> Err "BETA: not a redex"
+
+let thm_assume tm =
+  if ty_eq (type_of tm) bool_ty then Ok (Sequent ([tm], tm))
+  else Err "ASSUME: not a proposition"
+
+let thm_eq_mp t1 t2 = match t1, t2 with
+  | Sequent (a1, eq), Sequent (a2, c) ->
+    (match eq with
+     | TmComb (TmComb (e, l), r) when is_eq_const e ->
+       if term_eq l c then Ok (Sequent (term_union a1 a2, r))
+       else Err "EQ_MP: the sides do not match"
+     | _ -> Err "EQ_MP: not an equation")
+
+let thm_deduct t1 t2 = match t1, t2 with
+  | Sequent (a1, c1), Sequent (a2, c2) ->
+    Ok (Sequent (term_union (term_remove c2 a1) (term_remove c1 a2), mk_eq c1 c2))
+
+let thm_inst theta t = match t with
+  | Sequent (asl, c) ->
+    let f = fun u -> vsubst theta u in
+    Ok (Sequent (term_image f asl, f c))
+
+let thm_inst_type theta t = match t with
+  | Sequent (asl, c) ->
+    (match inst theta c with
+     | Err m -> Err m
+     | Ok c2 ->
+       let rec go l = match l with
+         | [] -> Ok []
+         | x :: r ->
+           (match inst theta x with
+            | Err m -> Err m
+            | Ok y -> match go r with
+                      | Err m -> Err m
+                      | Ok s -> Ok (if term_mem y s then s else y :: s)) in
+       match go asl with Err m -> Err m | Ok asl2 -> Ok (Sequent (asl2, c2)))
+
+(* ---- printing ---- *)
+let rec ty_str ty = match ty with
+  | Tyvar n -> n
+  | Tyapp (n, []) -> n
+  | Tyapp (n, [a; b]) when string_equal n "fun" ->
+    let l = ty_atom a in l ^^ "->" ^^ ty_str b
+  | Tyapp (n, l) -> "(" ^^ ty_list l ^^ ")" ^^ n
+and ty_atom ty = match ty with
+  | Tyapp (n, [_; _]) when string_equal n "fun" -> "(" ^^ ty_str ty ^^ ")"
+  | _ -> ty_str ty
+and ty_list l = match l with
+  | [] -> ""
+  | [a] -> ty_str a
+  | a :: r -> let h = ty_str a in h ^^ "," ^^ ty_list r
+
+let rec tm_str tm = match tm with
+  | TmVar (n, _) -> n
+  | TmConst (n, _) -> n
+  | TmComb (TmComb (e, l), r) when is_eq_const e ->
+    let a = tm_side l in let b = tm_side r in a ^^ " = " ^^ b
+  (* the function of an application needs brackets when it is itself an
+     abstraction, or (\x. x) x prints as \x. x x and reads as something
+     else entirely *)
+  | TmComb (f, a) -> let x = tm_fn f in let y = tm_atom a in x ^^ " " ^^ y
+  | TmAbs (v, b) -> let x = tm_str v in let y = tm_str b in "\\" ^^ x ^^ ". " ^^ y
+and tm_fn tm = match tm with
+  | TmAbs (_, _) -> "(" ^^ tm_str tm ^^ ")"
+  | _ -> tm_str tm
+and tm_side tm = match tm with
+  | TmAbs (_, _) -> "(" ^^ tm_str tm ^^ ")"
+  | TmComb (TmComb (e, _), _) when is_eq_const e -> "(" ^^ tm_str tm ^^ ")"
+  | _ -> tm_str tm
+and tm_atom tm = match tm with
+  | TmVar (_, _) -> tm_str tm
+  | TmConst (_, _) -> tm_str tm
+  | _ -> "(" ^^ tm_str tm ^^ ")"
+
 (* ---- evaluation ---- *)
 type value =
   | VInt of int
@@ -1171,6 +1466,11 @@ type value =
   | VTuple of value list
   | VCon of string * value list
   | VRec of (string * value) list
+  (* the kernel's three, which the language can hold and pass but cannot
+     construct: there are no constructors for them *)
+  | VType of hol_type
+  | VTerm of term
+  | VThm of thm
 and env = (string * value) list
 
 let rec rev_list l acc = match l with [] -> acc | x :: r -> rev_list r (x :: acc)
@@ -1185,7 +1485,7 @@ let rec list_len l = match l with [] -> 0 | _ :: r -> 1 + list_len r
 let boot_action = ref (fun (_ : string) -> 0)
 let restart_action = ref (fun (_ : int) -> 0)
 
-let call_builtin name args = match args with
+let rec call_builtin name args = match args with
   | [VFloat x] ->
     if string_equal name "sin" then Ok (VFloat (sin x))
     else if string_equal name "cos" then Ok (VFloat (cos x))
@@ -1203,22 +1503,92 @@ let call_builtin name args = match args with
     if string_equal name "float_of_int" then Ok (VFloat (float_of_int n))
     else if string_equal name "restart" then Ok (VInt ((!restart_action) n))
     else Err ("bad argument for " ^^ name)
-  | [VStr f] ->
-    if string_equal name "boot" then Ok (VInt ((!boot_action) f))
-    else Err ("bad argument for " ^^ name)
+  | [VStr f] when string_equal name "boot" -> Ok (VInt ((!boot_action) f))
   | [VFloat a; VFloat b] ->
     if string_equal name "atan2" then Ok (VFloat (atan2 a b))
     else if string_equal name "pow" then Ok (VFloat (pow a b))
     else Err ("bad argument for " ^^ name)
+  | _ -> kernel_builtin name args
+
+(* Everything the language can do with the kernel.  Nothing here returns a
+   thm except a rule, and nothing else in the interpreter builds a VThm, so
+   a theorem in the language is one that was proved. *)
+and kernel_builtin name args = match args with
+  | [VStr n] ->
+    if string_equal name "mk_vartype" then Ok (VType (Tyvar n))
+    else if string_equal name "mk_ty" then Ok (VType (Tyapp (n, [])))
+    else Err ("bad argument for " ^^ name)
+  | [VStr n; VType ty] ->
+    if string_equal name "mk_var" then Ok (VTerm (TmVar (n, ty)))
+    else if string_equal name "mk_const" then Ok (VTerm (TmConst (n, ty)))
+    else Err ("bad argument for " ^^ name)
+  | [VType a; VType b] ->
+    if string_equal name "mk_fun" then Ok (VType (mk_fun_ty a b))
+    else Err ("bad argument for " ^^ name)
+  | [VTerm f; VTerm a] ->
+    if string_equal name "mk_comb" then
+      (match type_of f with
+       | Tyapp (n, [ty; _]) when string_equal n "fun" ->
+         if ty_eq ty (type_of a) then Ok (VTerm (TmComb (f, a)))
+         else Err "mk_comb: the argument has the wrong type"
+       | _ -> Err "mk_comb: not a function")
+    else if string_equal name "mk_abs" then
+      (match f with
+       | TmVar (_, _) -> Ok (VTerm (TmAbs (f, a)))
+       | _ -> Err "mk_abs: not a variable")
+    else if string_equal name "mk_eq" then
+      (if ty_eq (type_of f) (type_of a) then Ok (VTerm (mk_eq f a))
+       else Err "mk_eq: the sides have different types")
+    else if string_equal name "aconv" then Ok (VBool (term_eq f a))
+    else Err ("bad argument for " ^^ name)
+  | [VTerm t] ->
+    if string_equal name "REFL" then thm_of (thm_refl t)
+    else if string_equal name "BETA" then thm_of (thm_beta t)
+    else if string_equal name "ASSUME" then thm_of (thm_assume t)
+    else if string_equal name "type_of" then Ok (VType (type_of t))
+    else if string_equal name "string_of_term" then Ok (VStr (tm_str t))
+    else Err ("bad argument for " ^^ name)
+  | [VType t] ->
+    if string_equal name "string_of_type" then Ok (VStr (ty_str t))
+    else Err ("bad argument for " ^^ name)
+  | [VThm a; VThm b] ->
+    if string_equal name "TRANS" then thm_of (thm_trans a b)
+    else if string_equal name "MK_COMB" then thm_of (thm_mk_comb a b)
+    else if string_equal name "EQ_MP" then thm_of (thm_eq_mp a b)
+    else if string_equal name "DEDUCT_ANTISYM_RULE" then thm_of (thm_deduct a b)
+    else Err ("bad argument for " ^^ name)
+  | [VTerm v; VThm t] ->
+    if string_equal name "ABS" then thm_of (thm_abs v t)
+    else Err ("bad argument for " ^^ name)
+  | [VThm t] ->
+    if string_equal name "concl" then
+      (match t with Sequent (_, c) -> Ok (VTerm c))
+    else if string_equal name "hyps" then
+      (match t with
+       | Sequent (asl, _) ->
+         let rec go l = match l with [] -> VCon ("[]", [])
+           | x :: r -> VCon ("::", [VTerm x; go r]) in
+         Ok (go asl))
+    else if string_equal name "string_of_thm" then
+      (match t with
+       | Sequent (asl, c) ->
+         let rec go l = match l with
+           | [] -> ""
+           | [x] -> tm_str x
+           | x :: r -> let h = tm_str x in h ^^ ", " ^^ go r in
+         let lhs = go asl in
+         let rhs = tm_str c in
+         Ok (VStr (lhs ^^ " |- " ^^ rhs)))
+    else Err ("bad argument for " ^^ name)
   | _ -> Err ("bad argument for " ^^ name)
+
+and thm_of r = match r with Err m -> Err m | Ok t -> Ok (VThm t)
 
 
 let rec lookup_rec l f = match l with
   | [] -> Err ("no field " ^^ f)
   | (g, v) :: r -> if string_equal f g then Ok v else lookup_rec r f
 
-let bool_eq (a : bool) (b : bool) = if a then b else if b then false else true
-let not_b (a : bool) = if a then false else true
 
 (* = and <> on the structured values: two constructors are equal when they
    are the same one and their arguments are *)
@@ -1230,6 +1600,8 @@ let rec val_eq a b = match a, b with
   | VTuple l, VTuple m -> val_eq_list l m
   | VCon (n, l), VCon (m, k) -> string_equal n m && val_eq_list l k
   | VRec l, VRec m -> val_eq_rec l m
+  | VType a, VType b -> ty_eq a b
+  | VTerm a, VTerm b -> term_eq a b
   | _ -> false
 and val_eq_rec l m = match l with
   | [] -> true
@@ -1664,6 +2036,13 @@ let rec infer env e = match e with
     (match infer_all env es [] with
      | Err m -> Err m
      | Ok ts -> Ok (TTuple ts))
+  (* The rules are spelled REFL, TRANS, MK_COMB, as they are in fusion.ml,
+     and the parser reads a capitalised name as a constructor.  One that no
+     declaration introduced is taken as an ordinary name instead, so those
+     read as the applications they are. *)
+  | Con (c, args) when (match find_ctor !constructors c with Err _ -> true | Ok _ -> false)
+                       && (match lookup_scheme env c with Ok _ -> true | Err _ -> false) ->
+    infer env (apps (Var c) args)
   | Con (c, args) ->
     (match ctor_types c with
      | Err m -> Err m
@@ -1848,6 +2227,9 @@ let rec eval env e = match e with
      | Ok _ -> Err "not a record")
   | Tuple es ->
     (match eval_all env es [] with Err m -> Err m | Ok vs -> Ok (VTuple vs))
+  | Con (c, args) when (match find_ctor !constructors c with Err _ -> true | Ok _ -> false)
+                       && (match lookup env c with Ok _ -> true | Err _ -> false) ->
+    eval env (apps (Var c) args)
   | Con (c, args) ->
     (match eval_all env args [] with Err m -> Err m | Ok vs -> Ok (VCon (c, vs)))
   | Match (scrut, arms) ->
@@ -1973,6 +2355,14 @@ let rec print_value v = match v with
   | VBuiltin _ -> puts "<fun>"
   | VTuple l -> putc '('; print_commas l; putc ')'
   | VRec l -> puts "{ "; print_fields l; puts " }"
+  | VType t -> puts (ty_str t)
+  | VTerm t -> puts "`"; puts (tm_str t); puts "`"
+  | VThm (Sequent (asl, c)) ->
+    let rec go l = match l with
+      | [] -> ()
+      | [x] -> puts (tm_str x)
+      | x :: r -> puts (tm_str x); puts ", "; go r in
+    go asl; puts " |- "; puts (tm_str c)
   | VCon (c, []) when string_equal c "[]" -> puts "[]"
   | VCon (c, [_; _]) when string_equal c "::" ->
     putc '['; print_items v; putc ']'
@@ -2007,6 +2397,11 @@ and print_arg v = match v with
 
 (* The pervasives: a value and a type for each, so that "sin 0.5" needs no
    declaration and "sin 1" is refused before it runs. *)
+(* No constructors are declared for these, so the language can hold one and
+   pass it on but has no way to write one down. *)
+let ty_ty  = TCon ("hol_type", [])
+let tm_ty  = TCon ("term", [])
+let thm_ty = TCon ("thm", [])
 let f2f  = TArrow (TFloat, TFloat)
 let ff2f = TArrow (TFloat, TArrow (TFloat, TFloat))
 
@@ -2021,7 +2416,32 @@ let builtins =
     (* chain loading: restart () runs the staged image again, boot "f"
        fetches f over TFTP into the staging RAM and runs that instead *)
     ("restart", 1, TArrow (TInt, TInt));
-    ("boot", 1, TArrow (TString, TInt)) ]
+    ("boot", 1, TArrow (TString, TInt));
+    (* the kernel: types and terms are made and taken apart freely, but a
+       thm comes only from one of the ten rules *)
+    ("mk_vartype", 1, TArrow (TString, ty_ty));
+    ("mk_ty", 1, TArrow (TString, ty_ty));
+    ("mk_fun", 2, TArrow (ty_ty, TArrow (ty_ty, ty_ty)));
+    ("mk_var", 2, TArrow (TString, TArrow (ty_ty, tm_ty)));
+    ("mk_const", 2, TArrow (TString, TArrow (ty_ty, tm_ty)));
+    ("mk_comb", 2, TArrow (tm_ty, TArrow (tm_ty, tm_ty)));
+    ("mk_abs", 2, TArrow (tm_ty, TArrow (tm_ty, tm_ty)));
+    ("mk_eq", 2, TArrow (tm_ty, TArrow (tm_ty, tm_ty)));
+    ("aconv", 2, TArrow (tm_ty, TArrow (tm_ty, TBool)));
+    ("type_of", 1, TArrow (tm_ty, ty_ty));
+    ("string_of_term", 1, TArrow (tm_ty, TString));
+    ("string_of_type", 1, TArrow (ty_ty, TString));
+    ("string_of_thm", 1, TArrow (thm_ty, TString));
+    ("concl", 1, TArrow (thm_ty, tm_ty));
+    ("hyps", 1, TArrow (thm_ty, TCon ("list", [tm_ty])));
+    ("REFL", 1, TArrow (tm_ty, thm_ty));
+    ("BETA", 1, TArrow (tm_ty, thm_ty));
+    ("ASSUME", 1, TArrow (tm_ty, thm_ty));
+    ("ABS", 2, TArrow (tm_ty, TArrow (thm_ty, thm_ty)));
+    ("TRANS", 2, TArrow (thm_ty, TArrow (thm_ty, thm_ty)));
+    ("MK_COMB", 2, TArrow (thm_ty, TArrow (thm_ty, thm_ty)));
+    ("EQ_MP", 2, TArrow (thm_ty, TArrow (thm_ty, thm_ty)));
+    ("DEDUCT_ANTISYM_RULE", 2, TArrow (thm_ty, TArrow (thm_ty, thm_ty))) ]
 
 let rec builtin_values l = match l with
   | [] -> []
