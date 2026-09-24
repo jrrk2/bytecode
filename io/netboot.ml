@@ -462,7 +462,14 @@ let tftp_data len =
       let block = (rx (udp + 10) lsl 8) lor rx (udp + 11) in
       let n = ((rx (udp + 4) lsl 8) lor rx (udp + 5)) - 12 in
       server_port := (rx udp lsl 8) lor rx (udp + 1);
-      if block = !next_block && !received + n <= stage_size && len >= udp + 12 + n then begin
+      if block = !next_block && !received + n > stage_size then begin
+        (* silence here looks like a dead server: say so instead *)
+        uart_puts "boot: image needs more than ";
+        uart_dec stage_size;
+        uart_puts " bytes of staging RAM\n";
+        boot_state := Waiting;
+        boot_deadline := now () + 5000
+      end else if block = !next_block && !received + n <= stage_size && len >= udp + 12 + n then begin
         for i = 0 to n - 1 do io_write (stage + !received + i) (rx (udp + 12 + i)) done;
         received := !received + n;
         send_ack block;
