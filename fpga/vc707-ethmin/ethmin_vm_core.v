@@ -28,6 +28,11 @@
 //              a compiler can append without being told; written, it
 //              admits what was appended.
 //   0x10000..0x2FFFF  the staging RAM, a byte per address
+//   0x100d  r  the RAM disk's size in bytes
+//   0x100000..0x17FFFF  the RAM disk, a byte per address.  Block RAM, so
+//              it is lost at power off, but the sequencer never touches it
+//              and the VM's reset does not reach it: it outlives a chain
+//              load, which is what makes it worth having a filesystem on.
 //   0x60000..0x9FFFF  the program's code, a byte per address, readable and
 //              writable while it runs: a compiler on this machine appends
 //              closures to the program it is itself part of, and reads it
@@ -151,6 +156,7 @@ module ethmin_vm_core #(
 	// part has 853 RAMB36 spare of 1030, and PCW is 24 bits, so nothing
 	// but that number stood in the way.  Doubling it costs about 33 tiles
 	// and turns 3941 free words into some 37000.
+	localparam integer DISK_WORDS  = 131072;  // the RAM disk: 512 KiB
 	localparam integer PROG_WORDS  = 65536;
 	localparam integer STAGE_WORDS = 32768;   // staging RAM: 128 KiB
 	// 32K words, two 16K semi-spaces.  It was briefly four times this, to
@@ -179,6 +185,7 @@ module ethmin_vm_core #(
 	end
 	reg [31:0] prog_code [0:PROG_WORDS-1];
 	reg [31:0] stage_ram [0:STAGE_WORDS-1];
+	reg [31:0] disk_ram  [0:DISK_WORDS-1];
 
 	wire [23:0] pc /*verilator public_flat_rd*/;
 	reg         code_bank /*verilator public_flat_rd*/;  // 0: the resident program, 1: the loaded one
@@ -445,7 +452,8 @@ module ethmin_vm_core #(
 	localparam [7:0] TRAP_FP_A = 8'h10, TRAP_FP_B = 8'h11,
 	                 TRAP_FP_EXEC = 8'h12, TRAP_FP_HI = 8'h13;
 	localparam [2:0] IO_IDLE = 3'd0, IO_PKT_READ = 3'd1, IO_UART = 3'd2, IO_DONE = 3'd3,
-	                 IO_STAGE_READ = 3'd4, IO_FP_WAIT = 3'd5, IO_CODE_READ = 3'd6;
+	                 IO_STAGE_READ = 3'd4, IO_FP_WAIT = 3'd5, IO_CODE_READ = 3'd6,
+	                 IO_DISK_READ = 3'd7;
 	reg [2:0] io_state;
 	reg [1:0] io_lane;
 	reg [7:0] leds;
@@ -500,6 +508,10 @@ module ethmin_vm_core #(
 	wire [15:0] code_idx = (io_addr - 32'h60000) >> 2;
 	wire code_wr = io_new && io_is_code && io_write;
 
+	// The RAM disk, written and read a byte at a time as the staging RAM is.
+	wire io_is_disk = io_addr >= 32'h100000 && io_addr < 32'h180000;
+	wire [16:0] disk_idx = (io_addr - 32'h100000) >> 2;
+
 	always @(*) begin
 		pa_en    = io_new && io_is_packet;
 		pa_we    = (io_new && io_is_packet && io_write) ? (4'b0001 << io_addr[1:0]) : 4'b0000;
@@ -511,7 +523,8 @@ module ethmin_vm_core #(
 	end
 
 	wire [31:0] io_read_word = (io_state == IO_PKT_READ) ? pa_rdata
-	                         : (io_state == IO_CODE_READ) ? code_q : stage_q;
+	                         : (io_state == IO_CODE_READ) ? code_q
+	                         : (io_state == IO_DISK_READ) ? disk_q : stage_q;
 
 	// prog_code's second port.  The sequencer loads a program through it and
 	// a running program writes and reads its own code through it; the fetch
@@ -530,6 +543,17 @@ module ethmin_vm_core #(
 				prog_code[pc_paddr][8*code_lane +: 8] <= pc_pdata[8*code_lane +: 8];
 		code_q <= prog_code[pc_paddr];
 	end
+
+	reg [31:0] disk_q;
+	integer disk_lane;
+	always @(posedge clk_sys)
+		if (io_new && io_is_disk) begin
+			if (io_write)
+				for (disk_lane = 0; disk_lane < 4; disk_lane = disk_lane + 1)
+					if (io_addr[1:0] == disk_lane)
+						disk_ram[disk_idx][8*disk_lane +: 8] <= trap_arg1[7:0];
+			disk_q <= disk_ram[disk_idx];
+		end
 
 	// The staging RAM's program side: a byte per address, as the packet RAM.
 	reg [31:0] stage_q;
@@ -571,7 +595,10 @@ module ethmin_vm_core #(
 				endcase
 			end else if (io_new) begin
 				io_lane <= io_addr[1:0];
-				if (io_is_code) begin
+				if (io_is_disk) begin
+					if (io_read) io_state <= IO_DISK_READ;
+					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
+				end else if (io_is_code) begin
 					if (io_read) io_state <= IO_CODE_READ;   // block RAM data next cycle
 					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
 				end else if (io_is_packet || io_is_stage) begin
@@ -592,6 +619,8 @@ module ethmin_vm_core #(
 						// the program's length: read to find where its code
 						// ends, written to admit what was appended
 						32'h100c: trap_result <= {15'd0, prog_words};
+						// the disk's size, so nothing has to assume it
+						32'h100d: trap_result <= DISK_WORDS * 4;
 						32'h1008: begin                               // a received byte, or -1
 							trap_result <= rxf_empty ? 32'hFFFFFFFF : {24'd0, rx_fifo[rxf_rp[7:0]]};
 							rxf_pop <= io_read && !rxf_empty;
@@ -610,7 +639,7 @@ module ethmin_vm_core #(
 					io_state   <= IO_DONE;
 				end
 			end
-			IO_PKT_READ, IO_STAGE_READ, IO_CODE_READ: begin
+			IO_PKT_READ, IO_STAGE_READ, IO_CODE_READ, IO_DISK_READ: begin
 				trap_result <= {24'd0, io_read_word[8*io_lane +: 8]};
 				trap_ready  <= 1'b1;
 				io_state    <= IO_DONE;

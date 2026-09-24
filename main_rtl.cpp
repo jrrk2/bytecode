@@ -17,6 +17,11 @@ uint32_t code_rom[1 << 20];
 // A write into the code window invalidates the one-deep prefetch, as
 // ethmin_vm_core does with code_q_valid.
 static bool code_dirty = false;
+// The RAM disk, as ethmin_vm_core decodes it at 0x100000.  Backed by a file
+// when +disk= names one, so a filesystem can be written and read here and
+// then looked at from outside.
+static uint8_t disk_ram[512 * 1024];
+static const char *disk_path = nullptr;
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,15 +171,29 @@ linbuf trace[4096];
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
-    if (argc < 3) {
-        std::cerr << "usage: " << argv[0] << " program.bc trace_file\n";
+    // With +notrace there is nothing to diverge from: a program that writes
+    // its own code has no reference run to be compared with, because the
+    // reference cannot execute what it generates.
+    const bool notrace = Verilated::commandArgsPlusMatch("notrace")[0] != 0;
+
+    if (argc < 2 || (!notrace && argc < 3)) {
+        std::cerr << "usage: " << argv[0]
+                  << " program.bc trace_file | " << argv[0]
+                  << " program.bc +notrace\n";
         return 1;
     }
 
     int prog_length = caml_bytecode(argv[1]);
     auto* top = new Vocaml4142_vm_rtl;
-    FILE *tracef = fopen(argv[2], "r");
-    fgets(trace[0], sizeof(linbuf), tracef);
+    FILE *tracef = nullptr;
+    if (!notrace) {
+        tracef = fopen(argv[2], "r");
+        if (!tracef) {
+            std::cerr << "cannot open trace file " << argv[2] << "\n";
+            return 1;
+        }
+        fgets(trace[0], sizeof(linbuf), tracef);
+    }
     
     // Optional waveform (+vcd): every signal every cycle, so gigabytes for
     // the long network tests
@@ -199,11 +218,22 @@ int main(int argc, char** argv) {
     linbuf opcode;
     uint32_t addr, op1, cnt, oldpc, vitems, cycle, accu, spaddr, items, oldcycle = 0;
     int matching = 1;
+    // a file to prime the RAM disk from, and to write back at the end
+    {
+        const char *d = Verilated::commandArgsPlusMatch("disk");
+        if (d && *d) {
+            // copied: the pointer commandArgsPlusMatch hands back is into
+            // a buffer it reuses on the next call, and the next call is two
+            // lines below
+            const char *eq = strchr(d, '=');
+            disk_path = eq ? strdup(eq + 1) : nullptr;
+            if (disk_path && *disk_path) {
+                FILE *f = fopen(disk_path, "rb");
+                if (f) { fread(disk_ram, 1, sizeof(disk_ram), f); fclose(f); }
+            }
+        }
+    }
     int windup = 10;
-    // With +notrace there is nothing to diverge from: a program that writes
-    // its own code has no reference run to be compared with, because the
-    // reference cannot execute what it generates.
-    const bool notrace = Verilated::commandArgsPlusMatch("notrace")[0] != 0;
     printf("Program length %d\n", prog_length);
 
     while (windup && !Verilated::gotFinish()) {
@@ -239,6 +269,12 @@ int main(int argc, char** argv) {
                 } else {
                     top->trap_result = (code_rom[w] >> (8 * lane)) & 0xFF;
                 }
+            } else if (a >= 0x100000 && a < 0x180000) {
+                uint32_t off = a - 0x100000;
+                if (top->trap_prim == 2) disk_ram[off] = (uint8_t)top->trap_arg1;
+                else top->trap_result = disk_ram[off];
+            } else if (a == 0x100d) {
+                if (top->trap_prim == 1) top->trap_result = sizeof(disk_ram);
             } else if (a == 0x100c) {
                 // prog_words.  Read, it says where the program's code ends,
                 // which is what lets a compiler find its own end; written,
@@ -407,6 +443,10 @@ int main(int argc, char** argv) {
 	windup -= (!matching && !notrace);
     }
 
+    if (disk_path && *disk_path) {
+        FILE *f = fopen(disk_path, "wb");
+        if (f) { fwrite(disk_ram, 1, sizeof(disk_ram), f); fclose(f); }
+    }
     if (tfp) { tfp->close(); delete tfp; }
     delete top;
     return 0;

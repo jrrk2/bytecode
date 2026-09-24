@@ -1189,6 +1189,12 @@ let rec list_len l = match l with [] -> 0 | _ :: r -> 1 + list_len r
    not start; a successful one never comes back, because the machine it
    would return to has been replaced. *)
 
+(* set once the disk and the evaluator are both in scope *)
+let fs_put = ref (fun (_ : string) (_ : string) -> 0)
+let fs_get = ref (fun (_ : string) -> Err "no filing system")
+let fs_run = ref (fun (_ : string) -> 0)
+let fs_ls = ref (fun (_ : int) -> 0)
+
 let rec call_builtin name args = match args with
   | [VFloat x] ->
     if string_equal name "sin" then Ok (VFloat (sin x))
@@ -1210,6 +1216,12 @@ let rec call_builtin name args = match args with
     if string_equal name "atan2" then Ok (VFloat (atan2 a b))
     else if string_equal name "pow" then Ok (VFloat (pow a b))
     else Err ("bad argument for " ^^ name)
+  | [VStr f] when string_equal name "read_file" ->
+    (match (!fs_get) f with Err m -> Err m | Ok v -> Ok (VStr v))
+  | [VStr f] when string_equal name "run_file" -> Ok (VInt ((!fs_run) f))
+  | [VStr f; VStr v] when string_equal name "write_file" ->
+    Ok (VInt ((!fs_put) f v))
+  | [VInt n] when string_equal name "files" -> Ok (VInt ((!fs_ls) n))
   | _ -> Err ("bad argument for " ^^ name)
 
 let rec lookup_rec l f = match l with
@@ -2709,6 +2721,25 @@ let rec install_floats l = match l with
      end);
     install_floats r
 
+(* A function of the compiler's own, put where compiled code can call it:
+   the same doorway trick as a literal, but the value handed over is a
+   closure.  Afterwards the name is an ordinary global, so it is reached
+   with GETGLOBAL and applied like anything else -- inside a closure as
+   well as out. *)
+let install_fn nm (v : int) =
+  let k = !next_global in
+  next_global := k + 1;
+  globals := (nm, k) :: !globals;
+  let st = here () in
+  emit op_acc; emit 0;
+  emit op_setglobal; emit k;
+  emit op_constint; emit 0;
+  emit op_return; emit 1;
+  io_write prog_words_reg (here ());
+  code_wr !doorway op_branch;
+  patch_branch (!doorway + 1) st;
+  let _ = dispatch v in ()
+
 let rec install_all l = match l with
   | [] -> ()
   | t :: r ->
@@ -2769,6 +2800,122 @@ let print_compiled ty v = match repr ty with
   | TFloat -> (!float_printer) (magic v)
   | TArrow (_, _) -> puts "<fun>"
   | _ -> puts "<value>"
+
+
+(* ==== the RAM disk, and a filing system on it ====
+   Block RAM the sequencer never touches and the VM's reset does not reach,
+   so what is written here outlives a chain load: compile in one image,
+   leave the results, boot another and read them back.
+
+   The format is ours, so it is the simple one.  A header, a directory of
+   fixed entries, then the data, all of it contiguous:
+
+     0     magic "RFS1"
+     4     the number of files
+     8     the first free byte of data
+     16    the directory: 64 entries of 32 bytes, a 24-byte name then the
+           offset and the length
+     2064  the data
+
+   The directory is a fixed size so that it cannot grow into the data; 64
+   files is more than a scratch disk wants.
+
+   Nothing is ever freed: a file written twice is written twice, and the
+   later entry is the one found.  That suits a scratch disk and costs
+   nothing to get right. *)
+let disk = 0x100000
+let disk_size_reg = 0x100d
+(* three bytes, not four: d32 reads 24 bits because a 32-bit word with its
+   top bit set does not fit in a 31-bit integer, and a magic that cannot be
+   read back means the disk is reformatted every time it is opened *)
+let rfs_magic = 0x534652            (* "RFS" *)
+let rfs_dir = 16
+let rfs_ent = 32
+let rfs_name_max = 24
+let rfs_max_files = 64
+let rfs_data = 16 + 64 * 32
+
+let db i = io_read (disk + i)
+let db_set i v = io_write (disk + i) v
+
+let d32 i = db i lor (db (i + 1) lsl 8) lor (db (i + 2) lsl 16)
+let d32_set i v =
+  db_set i (v land 0xFF); db_set (i + 1) ((v lsr 8) land 0xFF);
+  db_set (i + 2) ((v lsr 16) land 0xFF); db_set (i + 3) 0
+
+let rfs_count () = d32 4
+let rfs_free () = d32 8
+
+let rfs_format () =
+  d32_set 0 rfs_magic; d32_set 4 0; d32_set 8 rfs_data
+
+let rfs_ready () =
+  if d32 0 = rfs_magic then true else begin rfs_format (); true end
+
+(* the name in entry k, compared without copying it out *)
+let rfs_name_is k (nm : string) =
+  let base = rfs_dir + k * rfs_ent in
+  let n = string_length nm in
+  if n > rfs_name_max then false
+  else begin
+    let ok = ref true and i = ref 0 in
+    while !ok && !i < n do
+      if db (base + !i) <> int_of_char (string_get nm !i) then ok := false;
+      i := !i + 1
+    done;
+    !ok && db (base + n) = 0
+  end
+
+let rec rfs_find_from k nm =
+  if k < 0 then 0 - 1
+  else if rfs_name_is k nm then k
+  else rfs_find_from (k - 1) nm
+
+(* the last entry with this name, so a rewritten file wins *)
+let rfs_find nm = rfs_find_from (rfs_count () - 1) nm
+
+let rfs_offset k = d32 (rfs_dir + k * rfs_ent + rfs_name_max)
+let rfs_length k = d32 (rfs_dir + k * rfs_ent + rfs_name_max + 4)
+
+(* a new entry, and where its data is to go; -1 if the disk is full *)
+let rfs_add nm len =
+  let k = rfs_count () in
+  let at = rfs_free () in
+  if k >= rfs_max_files then 0 - 1
+  else if at + len > io_read disk_size_reg then 0 - 1
+  else begin
+    let base = rfs_dir + k * rfs_ent in
+    let n = string_length nm in
+    for i = 0 to n - 1 do db_set (base + i) (int_of_char (string_get nm i)) done;
+    for i = n to rfs_name_max - 1 do db_set (base + i) 0 done;
+    d32_set (base + rfs_name_max) at;
+    d32_set (base + rfs_name_max + 4) len;
+    d32_set 4 (k + 1);
+    d32_set 8 (at + len);
+    at
+  end
+
+(* what the language sees: a file is a string in and a string out *)
+let rfs_put nm (v : string) =
+  let _ = rfs_ready () in
+  let n = string_length v in
+  let at = rfs_add nm n in
+  if at < 0 then 0 - 1
+  else begin
+    for i = 0 to n - 1 do db_set (at + i) (int_of_char (string_get v i)) done;
+    n
+  end
+
+let rfs_get nm =
+  let _ = rfs_ready () in
+  let k = rfs_find nm in
+  if k < 0 then Err ("no file " ^^ nm)
+  else begin
+    let at = rfs_offset k and n = rfs_length k in
+    let b = create_bytes n in
+    for i = 0 to n - 1 do bytes_set b i (char_of_int (db (at + i))) done;
+    Ok (bytes_to_string b)
+  end
 
 (* ---- evaluating a line, whichever way it came ---- *)
 (* Printing a double, without caml_format_float -- which this processor does
@@ -2888,9 +3035,11 @@ let builtins =
     ("atan2", 2, ff2f); ("pow", 2, ff2f);
     ("float_of_int", 1, TArrow (TInt, TFloat));
     ("int_of_float", 1, TArrow (TFloat, TInt));
-    (* chain loading: restart () runs the staged image again, boot "f"
-       fetches f over TFTP into the staging RAM and runs that instead *)
-    ("int_of_float", 1, TArrow (TFloat, TInt)) ]
+    (* the RAM disk: what is written here outlives a chain load *)
+    ("write_file", 2, TArrow (TString, TArrow (TString, TInt)));
+    ("read_file", 1, TArrow (TString, TString));
+    ("run_file", 1, TArrow (TString, TInt));
+    ("files", 1, TArrow (TInt, TInt)) ]
 
 let rec builtin_values l = match l with
   | [] -> []
@@ -3006,6 +3155,47 @@ let evaluate_line () =
            if elapsed > 0 then begin puts "   ("; put_int elapsed; puts " ms)" end;
            newline ())
   end
+
+
+let () = fs_put := (fun nm v -> rfs_put nm v)
+let () = fs_get := (fun nm -> rfs_get nm)
+
+let () = fs_ls := (fun (_ : int) ->
+  let _ = rfs_ready () in
+  let n = rfs_count () in
+  for k = 0 to n - 1 do
+    let base = rfs_dir + k * rfs_ent in
+    let i = ref 0 in
+    while !i < rfs_name_max && db (base + !i) <> 0 do
+      putc (char_of_int (db (base + !i))); i := !i + 1
+    done;
+    puts "  "; put_int (rfs_length k); newline ()
+  done;
+  n)
+
+(* a file run as though it had been typed *)
+let () = fs_run := (fun nm ->
+  match rfs_get nm with
+  | Err m -> puts m; newline (); 0
+  | Ok text ->
+    let n = string_length text in
+    let i = ref 0 and count = ref 0 in
+    while !i < n do
+      line_len := 0;
+      while !i < n && string_get text !i <> '\n' do
+        (if !line_len < line_max then begin
+           bytes_set line !line_len (string_get text !i);
+           line_len := !line_len + 1
+         end);
+        i := !i + 1
+      done;
+      i := !i + 1;
+      if !line_len > 0 && not_b (bytes_get line 0 = '(') then begin
+        evaluate_line (); count := !count + 1
+      end
+    done;
+    line_len := 0;
+    !count)
 
 (* ---- the UART: a line collected a byte at a time, echoed ---- *)
 (* ---- 32-bit sequence numbers as two 16-bit halves ---- *)
@@ -3572,7 +3762,13 @@ let () =
   if not_b (find_doorway ()) then uart_puts "compiler: the doorway is missing\n"
   else begin
     uart_puts "compiler: doorway at "; uart_dec !doorway;
-    uart_puts ", emitting from "; uart_dec !cp; uart_putc '\n'
+    uart_puts ", emitting from "; uart_dec !cp; uart_putc '\n';
+    (* the filing system, reachable from compiled code *)
+    install_fn "write_file" (magic (fun (a : string) (b : string) -> (!fs_put) a b));
+    install_fn "read_file"
+      (magic (fun (a : string) -> match (!fs_get) a with Ok v -> v | Err _ -> ""));
+    install_fn "run_file" (magic (fun (a : string) -> (!fs_run) a));
+    install_fn "files" (magic (fun (n : int) -> (!fs_ls) n))
   end;
   puts "OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build ";
   uart_build ();

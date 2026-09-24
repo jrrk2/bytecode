@@ -1,0 +1,18 @@
+let rec fib n = if n < 2 then n else fib (n-1) + fib (n-2)
+fib 20
+let rec fact n = if n = 0 then 1 else n * fact (n - 1)
+fact 12
+let x = 1.5 +. 2.25
+x
+x <. 4.0
+type point = { px : float; py : float }
+let p = { px = 3.0; py = 4.0 }
+p.px +. p.py
+type col = Red | Green | Blue
+let name c = match c with Red -> "r" | Green -> "g" | Blue -> "b"
+name Green
+let k = let y = 3 in fun z -> y * z
+k 5
+write_file "a.txt" "hello"
+read_file "a.txt"
+files 0
