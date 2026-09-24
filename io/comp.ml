@@ -1636,7 +1636,16 @@ let code_wr w v =
    footgun: let the program outgrow it and the first phrase compiled lands
    on top of the compiler. *)
 let cp = ref 0
-let next_global = ref 4096
+(* The globals array is 1 << GLOBALS_AW words and GLOBALS_AW is 12, so
+   slot numbers are twelve bits wide: 4096 truncated to twelve bits is 0,
+   and a compiler that started numbering there quietly wrote its
+   definitions over the running program's own globals from slot 0 up.  The
+   symptom was a parse that failed or not depending on how many phrases had
+   been compiled before it, which reads like anything but a numbering bug.
+   Start above what an image uses -- comp itself has some 530 -- and refuse
+   rather than wrap at the top. *)
+let globals_max = 4096
+let next_global = ref 1024
 let doorway = ref (0 - 1)
 
 let emit w = code_wr !cp w; cp := !cp + 1
@@ -2295,9 +2304,12 @@ let slot_for name =
   if g >= 0 then g
   else begin
     let k = !next_global in
-    next_global := k + 1;
-    globals := (name, k) :: !globals;
-    k
+    if k >= globals_max then begin comp_err := "no globals left"; 0 - 1 end
+    else begin
+      next_global := k + 1;
+      globals := (name, k) :: !globals;
+      k
+    end
   end
 
 (* A literal cannot be written into the heap from here, but it can be
@@ -2379,11 +2391,17 @@ let run_phrase e name =
       let slot = if recursive then slot_for n else (0 - 1) in
       if comp [] bound then begin
         let slot = if slot >= 0 then slot else slot_for n in
-        emit op_push;
-        emit op_setglobal; emit slot;
-        emit op_acc; emit 0;
-        emit op_return; emit 2;
-        true
+        (* -1 is both "not allocated yet" above and "none left" from
+           slot_for, so the second call has to be checked or a setglobal
+           with a negative slot is emitted *)
+        if slot < 0 then begin comp_err := "no globals left"; false end
+        else begin
+          emit op_push;
+          emit op_setglobal; emit slot;
+          emit op_acc; emit 0;
+          emit op_return; emit 2;
+          true
+        end
       end else false
     | _ -> if comp [] e then begin emit op_return; emit 1; true end else false in
   (* what was emitted, on the console: there is no other way to look at it *)
