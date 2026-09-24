@@ -1,6 +1,10 @@
 module ocaml4142_vm_rtl #(
     parameter int PCW        = 24,
-    parameter int VALUEW     = 32,
+    // 36, not 32: a block RAM word is 36 bits in x36 mode, the four extra
+    // coming from the parity bits that x32 wastes, so they cost nothing.
+    // The value still lives in [31:0] with the low bit saying integer, as
+    // it always has; [35:32] is room for the collector's own metadata.
+    parameter int VALUEW     = 36,
     parameter int STACK_AW   = 16,
     parameter int HEAP_AW    = 18,
     parameter int GLOBALS_AW = 12,
@@ -278,12 +282,15 @@ module ocaml4142_vm_rtl #(
 
 
   function automatic logic [VALUEW-1:0] Val_int(input integer n);
-    Val_int = ((n <<< 1) | 1);
+    // the value is 32 bits wide however wide the word is
+    Val_int = {{(VALUEW-32){1'b0}}, ((n <<< 1) | 1)};
   endfunction
 
   function automatic integer Int_val(input logic [VALUEW-1:0] v);
 
-    Int_val = $signed(v) >>> 1;
+    // from bit 31, not from the top of the word: the bits above the value
+    // are the collector's, not sign
+    Int_val = $signed(v[31:0]) >>> 1;
   endfunction
 
   function automatic bit Is_int(input logic [VALUEW-1:0] v);
@@ -367,14 +374,16 @@ module ocaml4142_vm_rtl #(
   function automatic logic gc_points_to_from(input logic [VALUEW-1:0] v);
     logic [VALUEW-1:0] idx;
     idx = {2'b00, v[VALUEW-1:2]};
-    gc_points_to_from = !v[0] && !v[VALUEW-1] && idx >= from_lo && idx < from_lo + gc_semi;
+    gc_points_to_from = !v[0] && !v[31] && idx >= from_lo && idx < from_lo + gc_semi;
   endfunction
 
   // Code pointers (closure field 0, return addresses on the stack) set the
   // top bit, which no heap pointer (index << 2) has: the GC must tell them
   // apart, since both are otherwise even words.
   function automatic logic [VALUEW-1:0] Make_codeptr(input logic [PCW-1:0] pc);
-    Make_codeptr = {1'b1, {(VALUEW - PCW - 3) {1'b0}}, pc, 2'b00};
+    // the code-pointer bit stays at 31, inside the value, so that the
+    // bits above it stay free
+    Make_codeptr = {{(VALUEW-32){1'b0}}, 1'b1, {(32 - PCW - 3) {1'b0}}, pc, 2'b00};
   endfunction
 
   function automatic logic [VALUEW-1:0] Ptr_of_heap_index(input logic [HEAP_AW-1:0] idx);
@@ -827,16 +836,16 @@ module ocaml4142_vm_rtl #(
       if (hdr[7:0] < NO_SCAN_TAG)
         for (f = 1; f <= hdr[31:16]; f++) begin
           v = heap_mem[idx+f];
-          if (!v[0] && !v[VALUEW-1] && !gc_valid_target(v, is_block)) bad++;
+          if (!v[0] && !v[31] && !gc_valid_target(v, is_block)) bad++;
         end
     end
     for (idx = sp; idx < (1 << STACK_AW) - 1; idx++) begin
       v = stack_mem[idx];
-      if (!v[0] && !v[VALUEW-1] && !gc_valid_target(v, is_block)) bad++;
+      if (!v[0] && !v[31] && !gc_valid_target(v, is_block)) bad++;
     end
     for (idx = 0; idx < (1 << GLOBALS_AW); idx++) begin
       v = globals_mem[idx];
-      if (!v[0] && !v[VALUEW-1] && !gc_valid_target(v, is_block)) bad++;
+      if (!v[0] && !v[31] && !gc_valid_target(v, is_block)) bad++;
     end
     $display("GC %0d: %0d words live, semi-space %0d%s", gc_count + 1, gc_free - to_lo, gc_semi,
              bad ? " -- HEAP CHECK FAILED" : "");

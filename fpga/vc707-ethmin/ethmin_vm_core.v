@@ -195,7 +195,10 @@ module ethmin_vm_core #(
 	reg        vm_hold;
 	reg        load_we, load_globals;
 	reg [HEAP_AW-1:0] load_addr, image_words;
-	reg [31:0] load_data;
+	// 36 bits, to match the VM's word: the value is in [31:0] and the bits
+	// above it are the collector's.  The image supplies zeros there, which
+	// is what an object that has never been collected should have.
+	reg [35:0] load_data;
 	reg        boot_req;
 	reg        set_pw;            // 0x100c: raise prog_words
 	reg [15:0] set_pw_val;
@@ -253,8 +256,8 @@ module ethmin_vm_core #(
 						load_we <= 1'b1;
 						load_globals <= seq_state == SEQ_GLOBALS;
 						load_addr <= seq_i - 1;
-						load_data <= (seq_state == SEQ_GLOBALS && seq_i - 1 >= glob_count) ? 32'h1
-						           : seq_from_stage ? seq_q : rom_q;
+						load_data <= (seq_state == SEQ_GLOBALS && seq_i - 1 >= glob_count) ? 36'h1
+						           : seq_from_stage ? {4'd0, seq_q} : {4'd0, rom_q};
 					end
 				end
 				if (seq_i < seq_n) begin              // seq_addr reads word seq_i this cycle
