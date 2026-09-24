@@ -1948,6 +1948,22 @@ let op_grab = 42
 let op_apply2 = 34
 let op_envacc = 25
 let op_restart = 41
+(* 117..119 are XORINT, LSLINT, LSRINT: getting these wrong emits a shift
+   where a trap frame belongs, and the machine halts on the first raise *)
+let op_pushtrap = 89
+let op_poptrap = 90
+let op_c_call1 = 93
+let op_c_call2 = 94
+(* the float primitives, at their indices in this program's table *)
+let prim_add_float = 0x003
+let prim_sub_float = 0x166
+let prim_mul_float = 0x118
+let prim_div_float = 0x054
+let prim_float_of_int = 0x077
+let prim_int_of_float = 0x0e1
+let prim_sqrt_float = 0x157
+let prim_abs_float = 0x000
+let prim_neg_float = 0x12f
 let op_setglobal = 57
 
 
@@ -2054,6 +2070,8 @@ let scrut_name = " scrut"
 let cap : string list ref = ref []
 (* a literal's global slot, so the same text is installed once *)
 let literals : (string * int) list ref = ref []
+(* boxed, so a float literal is installed the same way a string is *)
+let float_lits : (float * int) list ref = ref []
 
 (* the names an expression uses that it does not itself bind *)
 let rec free_in e bound acc = match e with
@@ -2129,13 +2147,84 @@ and strs_in_fields l acc = match l with
   | [] -> acc
   | (_, x) :: r -> strs_in_fields r (strs_in x acc)
 
+let rec field_index l f i = match l with
+  | [] -> 0 - 1
+  | n :: r -> if string_equal n f then i else field_index r f (i + 1)
+
+let rec_type_of_field f = match find_field !fields f with
+  | Ok (tname, _, _) -> tname
+  | Err _ -> ""
+
+let rec_field_names tname = match find_rec_order !rec_order tname with
+  | Ok fs -> fs
+  | Err _ -> []
+
+let rec assoc_expr l f = match l with
+  | [] -> Err ("missing field " ^^ f)
+  | (n, e) :: r -> if string_equal n f then Ok e else assoc_expr r f
+
+(* A float is boxed, so a comparison of two of them compares pointers if it
+   is compiled as an integer one.  The operators are shared with the
+   integers, and nothing here carries a type, so the obvious cases are
+   refused rather than quietly answered wrongly. *)
+let rec looks_float e = match e with
+  | Float _ -> true
+  | Binop (op, _, _) ->
+    string_equal op "+." || string_equal op "-."
+    || string_equal op "*." || string_equal op "/."
+  | App (Var f, _) ->
+    string_equal f "float_of_int" || string_equal f "sqrt"
+    || string_equal f "abs_float"
+  | Let (_, _, _, b) -> looks_float b
+  | If (_, a, _) -> looks_float a
+  | _ -> false
+
 let rec lit_slot l t = match l with
   | [] -> 0 - 1
   | (u, k) :: r -> if string_equal u t then k else lit_slot r t
 
+let rec flit_slot l (t : float) = match l with
+  | [] -> 0 - 1
+  | (u, k) :: r -> if flt_eq u t then k else flit_slot r t
+
+let rec floats_in e acc = match e with
+  | Float f -> f :: acc
+  | Binop (_, a, b) -> floats_in b (floats_in a acc)
+  | If (c, a, b) -> floats_in b (floats_in a (floats_in c acc))
+  | Let (_, _, bnd, body) -> floats_in body (floats_in bnd acc)
+  | Fun (_, b) -> floats_in b acc
+  | App (f, a) -> floats_in a (floats_in f acc)
+  | Con (_, l) -> floats_in_list l acc
+  | Tuple l -> floats_in_list l acc
+  | Match (sc, arms) ->
+    let rec go l a = match l with [] -> a | (_, b) :: r -> go r (floats_in b a) in
+    go arms (floats_in sc acc)
+  | Try (b, _, h) -> floats_in h (floats_in b acc)
+  | Record fs -> floats_in_fields fs acc
+  | With (b, fs) -> floats_in_fields fs (floats_in b acc)
+  | Field (b, _) -> floats_in b acc
+  | _ -> acc
+and floats_in_list l acc = match l with
+  | [] -> acc
+  | x :: r -> floats_in_list r (floats_in x acc)
+and floats_in_fields l acc = match l with
+  | [] -> acc
+  | (_, x) :: r -> floats_in_fields r (floats_in x acc)
+
+let float_prim1 f =
+  if string_equal f "float_of_int" then prim_float_of_int
+  else if string_equal f "int_of_float" then prim_int_of_float
+  else if string_equal f "sqrt" then prim_sqrt_float
+  else if string_equal f "abs_float" then prim_abs_float
+  else 0 - 1
+
 let rec comp env e = match e with
   | Int n -> emit op_constint; emit n; true
   | Bool b -> emit op_constint; emit (if b then 1 else 0); true
+  | Float f ->
+    let k = flit_slot !float_lits f in
+    if k >= 0 then begin emit op_getglobal; emit k; true end
+    else begin comp_err := "this float has no slot"; false end
   | Str t ->
     let k = lit_slot !literals t in
     if k >= 0 then begin emit op_getglobal; emit k; true end
@@ -2232,6 +2321,9 @@ let rec comp env e = match e with
         true
       end
     end
+  | App (Var f, a) when float_prim1 f >= 0 ->
+    if not_b (comp env a) then false
+    else begin emit op_c_call1; emit (float_prim1 f); true end
   | App (_, _) ->
     let rec spine t acc = match t with
       | App (f, a) -> spine f (a :: acc)
@@ -2258,6 +2350,79 @@ let rec comp env e = match e with
   | Con (c, args) -> comp_con env c args
   | Tuple es -> comp_block env 0 es
   | Match (scrut, arms) -> comp_match env scrut arms
+  | Field (b, f) ->
+    let idx = field_index (rec_field_names (rec_type_of_field f)) f 0 in
+    if idx < 0 then begin comp_err := "unknown field " ^^ f; false end
+    else if not_b (comp env b) then false
+    else begin emit op_getfield; emit idx; true end
+  | Record fs ->
+    let names = rec_field_names (match fs with (f, _) :: _ -> rec_type_of_field f | [] -> "") in
+    let bad = ref false in
+    let rec ordered l acc = match l with
+      | [] -> rev_acc acc []
+      | fn :: r ->
+        (match assoc_expr fs fn with
+         | Ok x -> ordered r (x :: acc)
+         | Err m -> comp_err := m; bad := true; []) in
+    let es = ordered names [] in
+    if !bad then false else comp_block env 0 es
+  | With (base, fs) ->
+    let names = rec_field_names (match fs with (f, _) :: _ -> rec_type_of_field f | [] -> "") in
+    let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
+    let n = count names in
+    if n = 0 then begin comp_err := "not a record"; false end
+    else if not_b (comp env base) then false
+    else begin
+      emit op_push;
+      (* the base stays on the stack while the fields are built, so it moves
+         one slot further down with each of them *)
+      let ok = ref true in
+      let rec go i l = match l with
+        | [] -> ()
+        | fn :: r ->
+          (match assoc_expr fs fn with
+           | Ok x ->
+             let rec pad k m = if k = 0 then m else pad (k - 1) ("" :: m) in
+             if not_b (comp (pad i ("" :: env)) x) then ok := false
+           | Err _ ->
+             emit op_acc; emit i;
+             emit op_getfield; emit (field_index names fn 0));
+          if !ok then
+            (match r with
+             | [] -> ()
+             | _ -> emit op_push; go (i + 1) r) in
+      go 0 (rev_acc names []);
+      if not_b !ok then false
+      else begin
+        (if n <= 3 then
+           emit (if n = 1 then op_makeblock1 else if n = 2 then op_makeblock2 else op_makeblock3)
+         else begin emit op_makeblock; emit n end);
+        emit 0;
+        emit op_pop; emit 1;
+        true
+      end
+    end
+  | Try (body, name, handler) ->
+    emit op_pushtrap; let hp = here () in emit 0;
+    (* PUSHTRAP leaves a four-word frame on the stack, so everything in the
+       body is that much further from the accumulator *)
+    let benv = "" :: "" :: "" :: "" :: env in
+    if not_b (comp benv body) then false
+    else begin
+      emit op_poptrap;
+      emit op_branch; let skip = here () in emit 0;
+      patch_branch hp (here ());
+      (* the raise leaves its value in the accumulator and the frame is
+         gone, so a handler that names it has to put it on the stack *)
+      let henv = if string_equal name "_" then env
+                 else begin emit op_push; name :: env end in
+      if not_b (comp henv handler) then false
+      else begin
+        (if not_b (string_equal name "_") then begin emit op_pop; emit 1 end);
+        patch_branch skip (here ());
+        true
+      end
+    end
   | _ -> comp_err := "this is not compiled yet"; false
 
 (* field 0 comes from the accumulator and the rest from the stack, so the
@@ -2316,7 +2481,19 @@ and comp_test env depth path pat fails = match pat with
   | PBool b ->
     comp_path env depth path; emit op_push; emit op_constint; emit (if b then 1 else 0);
     emit op_eq; emit op_branchifnot; fails := here () :: !fails; emit 0; true
-  | PRec _ -> comp_err := "record patterns are not compiled yet"; false
+  | PRec fs ->
+    (* a record has one shape, so only the sub-patterns can fail *)
+    let ok = ref true in
+    let rec go l = match l with
+      | [] -> ()
+      | (fn, q) :: r ->
+        let idx = field_index (rec_field_names (rec_type_of_field fn)) fn 0 in
+        if idx < 0 then begin comp_err := "unknown field " ^^ fn; ok := false end
+        else begin
+          if not_b (comp_test env depth (path_snoc path idx) q fails) then ok := false
+          else go r
+        end in
+    go fs; !ok
   | PTuple sub -> comp_subtests env depth path sub 0 fails
   | PCon (c, sub) ->
     (match ctor_layout c with
@@ -2360,7 +2537,19 @@ and comp_bind env depth path pat pushed = match pat with
   | PBool _ -> Ok (env, pushed)
   | PTuple sub -> comp_binds env depth path sub 0 pushed
   | PCon (_, sub) -> comp_binds env depth path sub 0 pushed
-  | _ -> Err "this pattern is not compiled yet"
+  (* every named field binds, not only the first: this is what made
+     { x = a; y = b } leave b unbound *)
+  | PRec fs ->
+    let rec go l e n = match l with
+      | [] -> Ok (e, n)
+      | (fn, q) :: r ->
+        let idx = field_index (rec_field_names (rec_type_of_field fn)) fn 0 in
+        if idx < 0 then Err ("unknown field " ^^ fn)
+        else
+          (match comp_bind e depth (path_snoc path idx) q n with
+           | Err m -> Err m
+           | Ok (e2, n2) -> go r e2 n2) in
+    go fs env pushed
 
 and comp_binds env depth path l i pushed = match l with
   | [] -> Ok (env, pushed)
@@ -2423,8 +2612,29 @@ and comp_con env c args =
 (* accu holds the left operand and the stack the right, so the right is
    compiled first *)
 and comp_binop env op a b =
-  if not_b (comp env b) then false
+  let fprim =
+    if string_equal op "+." then prim_add_float
+    else if string_equal op "-." then prim_sub_float
+    else if string_equal op "*." then prim_mul_float
+    else if string_equal op "/." then prim_div_float
+    else 0 - 1 in
+  if fprim >= 0 then begin
+    if not_b (comp env b) then false
+    else begin
+      emit op_push;
+      if not_b (comp ("" :: env) a) then false
+      else begin emit op_c_call2; emit fprim; true end
+    end
+  end
+  (* the comparisons are shared with the integers and nothing here carries
+     a type, so a float one would compare the boxes rather than what is in
+     them.  Refused where it can be seen, rather than answered wrongly. *)
+  else if is_comparison op && (looks_float a || looks_float b) then begin
+    comp_err := "comparing floats is not compiled yet"; false
+  end
   else begin
+    if not_b (comp env b) then false
+    else begin
     emit op_push;
     if not_b (comp ("" :: env) a) then false
     else begin
@@ -2443,6 +2653,7 @@ and comp_binop env op a b =
         else 0 - 1 in
       if o < 0 then begin comp_err := op ^^ " is not compiled yet"; false end
       else begin emit o; true end
+    end
     end
   end
 
@@ -2476,6 +2687,28 @@ let install_literal slot (t : string) =
   patch_branch (!doorway + 1) st;
   let _ = dispatch (magic t) in ()
 
+let install_float slot (v : float) =
+  let st = here () in
+  emit op_acc; emit 0;
+  emit op_setglobal; emit slot;
+  emit op_constint; emit 0;
+  emit op_return; emit 1;
+  io_write prog_words_reg (here ());
+  code_wr !doorway op_branch;
+  patch_branch (!doorway + 1) st;
+  let _ = dispatch (magic v) in ()
+
+let rec install_floats l = match l with
+  | [] -> ()
+  | v :: r ->
+    (if flit_slot !float_lits v < 0 then begin
+       let k = !next_global in
+       next_global := k + 1;
+       float_lits := (v, k) :: !float_lits;
+       install_float k v
+     end);
+    install_floats r
+
 let rec install_all l = match l with
   | [] -> ()
   | t :: r ->
@@ -2492,6 +2725,7 @@ let run_phrase e name =
   (* the literals first, each into a global of its own, before anything
      that refers to them is compiled *)
   install_all (strs_in e []);
+  install_floats (floats_in e []);
   let start = here () in
   let ok = match e with
     | Let (recursive, n, bound, Var v) when string_equal v n ->
@@ -2525,12 +2759,14 @@ let run_phrase e name =
 
 (* what came back is the accumulator, which for an int or a bool is the
    value itself; a function stays in its global and is not brought out *)
+let float_printer = ref (fun (_ : float) -> ())
 let print_compiled ty v = match repr ty with
   | TInt -> put_int v
   | TBool -> puts (if v = 1 then "true" else "false")
   (* what came back is the string itself, which arrived as the
      accumulator and needs only to be read as one again *)
   | TString -> putc '"'; puts (magic v); putc '"'
+  | TFloat -> (!float_printer) (magic v)
   | TArrow (_, _) -> puts "<fun>"
   | _ -> puts "<value>"
 
@@ -2585,6 +2821,7 @@ let print_float (x : float) =
     end
   end
 
+let () = float_printer := print_float
 let rec print_value v = match v with
   | VInt n -> put_int n
   | VFloat f -> print_float f
