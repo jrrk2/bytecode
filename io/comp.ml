@@ -1483,6 +1483,10 @@ let constructors : (string * (string * string list * tyexp list)) list ref =
 let fields : (string * (string * string list * tyexp)) list ref = ref []
 (* record type name -> its fields in declaration order, for printing *)
 let rec_order : (string * string list) list ref = ref []
+(* a type's constructors in the order they were declared, which is what
+   decides their tags: the constant ones are numbered among themselves and
+   the others among themselves *)
+let type_ctors : (string * string list) list ref = ref [("list", ["[]"; "::"])]
 
 let rec find_rec_order l n = match l with
   | [] -> Err ("unknown record type " ^^ n)
@@ -1939,7 +1943,47 @@ let op_closure = 43
 let op_apply1 = 33
 let op_return = 40
 let op_getglobal = 53
+let op_grab = 42
+let op_apply2 = 34
 let op_setglobal = 57
+
+
+let op_switch = 87
+let op_getfield = 71
+let op_makeblock = 62
+let op_makeblock1 = 63
+let op_makeblock2 = 64
+let op_makeblock3 = 65
+
+(* How a constructor is represented: a constant one is an integer, counted
+   among the constant constructors of its type; one with arguments is a
+   block whose tag counts among those.  SWITCH wants both totals. *)
+let rec ctor_arity c = match find_ctor !constructors c with
+  | Err _ -> 0 - 1
+  | Ok (_, _, args) -> let rec n l = match l with [] -> 0 | _ :: r -> 1 + n r in n args
+
+let rec find_order l t = match l with
+  | [] -> Err ("unknown type " ^^ t)
+  | (n, cs) :: r -> if string_equal n t then Ok cs else find_order r t
+
+(* nconsts, nblocks, and this constructor's index within its own kind *)
+let ctor_layout c = match find_ctor !constructors c with
+  | Err m -> Err m
+  | Ok (tname, _, _) ->
+    match find_order !type_ctors tname with
+    | Err m -> Err m
+    | Ok cs ->
+      let nc = ref 0 and nb = ref 0 and mine = ref (0 - 1) in
+      let rec go l = match l with
+        | [] -> ()
+        | x :: r ->
+          let a = ctor_arity x in
+          (if string_equal x c then mine := (if a = 0 then !nc else !nb));
+          (if a = 0 then nc := !nc + 1 else nb := !nb + 1);
+          go r in
+      go cs;
+      if !mine < 0 then Err ("unknown constructor " ^^ c)
+      else Ok (!nc, !nb, !mine, ctor_arity c)
 
 let code_rd w =
   let a = code_win + w * 4 in
@@ -1955,7 +1999,7 @@ let code_wr w v =
 (* where the next phrase goes, and the first free global slot *)
 (* above this program's own code, which is about 24000 words: emitting
    into it would compile a phrase over the compiler *)
-let cp = ref 26000
+let cp = ref 28000
 let next_global = ref 4096
 let doorway = ref (0 - 1)
 
@@ -1993,6 +2037,9 @@ let rec stack_idx l x i = match l with
   | n :: r -> if string_equal n x then i else stack_idx r x (i + 1)
 
 let comp_err = ref ""
+let dump_code = ref false
+(* unparseable, so it cannot collide with a name from the source *)
+let scrut_name = " scrut"
 
 let rec comp env e = match e with
   | Int n -> emit op_constint; emit n; true
@@ -2025,27 +2072,214 @@ let rec comp env e = match e with
       if not_b (comp (x :: env) body) then false
       else begin emit op_pop; emit 1; true end
     end
-  | Fun (x, body) ->
-    (* a closed function: its names are its argument or globals, so there
-       is nothing to capture and the closure has no fields *)
+  | Fun (_, _) ->
+    (* fun x y -> e is one function of two arguments, not two of one: GRAB
+       takes them together, so the inner one has nothing to capture.  Its
+       names are its arguments or globals, and the closure has no fields. *)
+    let rec params t acc = match t with
+      | Fun (x, b) -> params b (x :: acc)
+      | _ -> (rev_acc acc [], t) in
+    let (ps, body) = params e [] in
+    let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
+    let n = count ps in
     emit op_closure; emit 0;
     let p = here () in emit 0;
     emit op_branch; let skip = here () in emit 0;
     patch_branch p (here ());
-    if not_b (comp [x] body) then false
+    (if n > 1 then begin emit op_grab; emit (n - 1) end);
+    if not_b (comp ps body) then false
     else begin
-      emit op_return; emit 1;
+      emit op_return; emit n;
       patch_branch skip (here ());
       true
     end
-  | App (f, a) ->
-    if not_b (comp env a) then false
-    else begin
-      emit op_push;
-      if not_b (comp ("" :: env) f) then false
-      else begin emit op_apply1; true end
+  | App (_, _) ->
+    let rec spine t acc = match t with
+      | App (f, a) -> spine f (a :: acc)
+      | _ -> (t, acc) in
+    let (f, args) = spine e [] in
+    let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
+    let n = count args in
+    if n > 2 then begin
+      comp_err := "more than two arguments at once is not compiled yet"; false
+    end else begin
+      let e2 = ref env and ok = ref true in
+      let rec push l = match l with
+        | [] -> ()
+        | x :: r ->
+          if !ok then begin
+            if not_b (comp !e2 x) then ok := false
+            else begin emit op_push; e2 := "" :: !e2; push r end
+          end in
+      push (rev_acc args []);
+      if not_b !ok then false
+      else if not_b (comp !e2 f) then false
+      else begin emit (if n = 1 then op_apply1 else op_apply2); true end
     end
+  | Con (c, args) -> comp_con env c args
+  | Tuple es -> comp_block env 0 es
+  | Match (scrut, arms) -> comp_match env scrut arms
   | _ -> comp_err := "this is not compiled yet"; false
+
+(* field 0 comes from the accumulator and the rest from the stack, so the
+   arguments are pushed last-first and the first is left in the accumulator *)
+and comp_block env tag es =
+  let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
+  let n = count es in
+  if n = 0 then begin emit op_constint; emit 0; true end
+  else if n > 3 then begin comp_err := "more than three fields is not compiled yet"; false end
+  else begin
+    let rec rev l acc = match l with [] -> acc | x :: r -> rev r (x :: acc) in
+    let rec push_rest l e = match l with
+      | [] -> true
+      | x :: r ->
+        if not_b (comp e x) then false
+        else begin emit op_push; push_rest r ("" :: e) end in
+    (* fields 1..n-1, pushed last first, so that sp[0] is field 1 *)
+    let rest = rev (match es with [] -> [] | _ :: r -> r) [] in
+    if not_b (push_rest rest env) then false
+    else begin
+      let e2 =
+        let rec pad k l = if k = 0 then l else pad (k - 1) ("" :: l) in
+        pad (n - 1) env in
+      match es with
+      | [] -> false
+      | first :: _ ->
+        if not_b (comp e2 first) then false
+        else begin
+          emit (if n = 1 then op_makeblock1 else if n = 2 then op_makeblock2 else op_makeblock3);
+          emit tag; true
+        end
+    end
+  end
+
+
+(* ---- match ----
+   The scrutinee is kept on the stack while the arms are tried in order.
+   Each arm tests its pattern, branching to the next arm on any failure;
+   SWITCH is what reads a constructor's tag, since nothing else does, and a
+   table whose entries all lead away except one is how a single tag is
+   tested.  Binding happens only once an arm has matched, so a failure
+   never has to undo a push. *)
+and comp_path env depth path =
+  emit op_acc; emit depth;
+  let rec go l = match l with
+    | [] -> ()
+    | i :: r -> emit op_getfield; emit i; go r in
+  go path
+
+and comp_test env depth path pat fails = match pat with
+  | PWild -> true
+  | PVar _ -> true
+  | PInt n ->
+    comp_path env depth path; emit op_push; emit op_constint; emit n; emit op_eq;
+    emit op_branchifnot; fails := here () :: !fails; emit 0; true
+  | PBool b ->
+    comp_path env depth path; emit op_push; emit op_constint; emit (if b then 1 else 0);
+    emit op_eq; emit op_branchifnot; fails := here () :: !fails; emit 0; true
+  | PRec _ -> comp_err := "record patterns are not compiled yet"; false
+  | PTuple sub -> comp_subtests env depth path sub 0 fails
+  | PCon (c, sub) ->
+    (match ctor_layout c with
+     | Err m -> comp_err := m; false
+     | Ok (nconsts, nblocks, idx, arity) ->
+       comp_path env depth path;
+       emit op_switch; emit (nconsts lor (nblocks lsl 16));
+       let base = here () in
+       let total = nconsts + nblocks in
+       let i = ref 0 in
+       while !i < total do emit 0; i := !i + 1 done;
+       (* everything that is not this constructor leaves by here *)
+       let away = here () in
+       emit op_branch; fails := here () :: !fails; emit 0;
+       let cont = here () in
+       let want = if arity = 0 then idx else nconsts + idx in
+       let k = ref 0 in
+       while !k < total do
+         code_wr (base + !k) ((if !k = want then cont else away) - (base + !k) + !k);
+         k := !k + 1
+       done;
+       if arity = 0 then true else comp_subtests env depth path sub 0 fails)
+
+and comp_subtests env depth path l i fails = match l with
+  | [] -> true
+  | p :: r ->
+    if not_b (comp_test env depth (path_snoc path i) p fails) then false
+    else comp_subtests env depth path r (i + 1) fails
+
+and path_snoc path i = match path with
+  | [] -> [i]
+  | x :: r -> x :: path_snoc r i
+
+(* once an arm has matched, its variables are pushed in order *)
+and comp_bind env depth path pat pushed = match pat with
+  | PVar x ->
+    comp_path env (depth + pushed) path; emit op_push;
+    Ok (x :: env, pushed + 1)
+  | PWild -> Ok (env, pushed)
+  | PInt _ -> Ok (env, pushed)
+  | PBool _ -> Ok (env, pushed)
+  | PTuple sub -> comp_binds env depth path sub 0 pushed
+  | PCon (_, sub) -> comp_binds env depth path sub 0 pushed
+  | _ -> Err "this pattern is not compiled yet"
+
+and comp_binds env depth path l i pushed = match l with
+  | [] -> Ok (env, pushed)
+  | p :: r ->
+    (match comp_bind env depth (path_snoc path i) p pushed with
+     | Err m -> Err m
+     | Ok (e2, n2) -> comp_binds e2 depth path r (i + 1) n2)
+
+and comp_match env scrut arms =
+  if not_b (comp env scrut) then false
+  else begin
+    emit op_push;
+    let env = scrut_name :: env in
+    let ends = ref [] in
+    let ok = ref true in
+    let rec go l = match l with
+      | [] ->
+        (* nothing matched: the value is left alone and 0 comes back *)
+        emit op_constint; emit 0
+      | (pat, body) :: r ->
+        let fails = ref [] in
+        let depth = stack_idx env scrut_name 0 in
+        if not_b (comp_test env depth [] pat fails) then ok := false
+        else begin
+          match comp_bind env depth [] pat 0 with
+          | Err m -> comp_err := m; ok := false
+          | Ok (env2, pushed) ->
+            if not_b (comp env2 body) then ok := false
+            else begin
+              (if pushed > 0 then begin emit op_pop; emit pushed end);
+              emit op_branch; ends := here () :: !ends; emit 0;
+              let next = here () in
+              let rec patch l = match l with
+                | [] -> ()
+                | a :: t -> code_wr a (next - a); patch t in
+              patch !fails;
+              go r
+            end
+        end in
+    go arms;
+    if not_b !ok then false
+    else begin
+      let fin = here () in
+      let rec patch l = match l with
+        | [] -> ()
+        | a :: t -> code_wr a (fin - a); patch t in
+      patch !ends;
+      emit op_pop; emit 1;
+      true
+    end
+  end
+
+and comp_con env c args =
+  match ctor_layout c with
+  | Err m -> comp_err := m; false
+  | Ok (_, _, idx, arity) ->
+    if arity = 0 then begin emit op_constint; emit idx; true end
+    else comp_block env idx args
 
 (* accu holds the left operand and the stack the right, so the right is
    compiled first *)
@@ -2103,6 +2337,15 @@ let run_phrase e name =
         true
       end else false
     | _ -> if comp [] e then begin emit op_return; emit 1; true end else false in
+  (* what was emitted, on the console: there is no other way to look at it *)
+  (if !dump_code && ok then begin
+     uart_puts "emit ["; uart_dec start; uart_puts ".."; uart_dec (here ()); uart_puts "]:";
+     let i = ref start in
+     while !i < here () do
+       uart_putc ' '; uart_dec (code_rd !i); i := !i + 1
+     done;
+     uart_putc '\n'
+   end);
   if not_b ok then Err !comp_err
   else if !doorway < 0 then Err "the doorway was not found"
   else begin
@@ -2300,6 +2543,12 @@ let evaluate_line () =
              | (c, args) :: r ->
                constructors := (c, (name, ps, args)) :: !constructors; add r in
            add arms;
+           let rec names_of l = match l with
+             | [] -> []
+             | (c, _) :: r -> c :: names_of r in
+           (match arms with
+            | [] -> ()
+            | _ -> type_ctors := (name, names_of arms) :: !type_ctors);
            let rec addf l names = match l with
              | [] -> rev_acc names []
              | (f, te) :: r ->

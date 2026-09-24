@@ -80,7 +80,7 @@ let () =
   else begin
     puts "selfmod: doorway at word "; dec !found; putc 10;
     (* the phrase: write a character, return 0 *)
-    let t = 4000 in
+    let t = 28000 in
     code_wr (t + 0) op_constint;   code_wr (t + 1) 71;       (* 'G' *)
     code_wr (t + 2) op_push;
     code_wr (t + 3) op_constint;   code_wr (t + 4) uart;

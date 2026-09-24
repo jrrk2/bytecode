@@ -14,6 +14,9 @@ typedef enum
 // Bytecode ROM (owned by C++)
 // ------------------------------------------------------------
 uint32_t code_rom[1 << 20];
+// A write into the code window invalidates the one-deep prefetch, as
+// ethmin_vm_core does with code_q_valid.
+static bool code_dirty = false;
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -197,6 +200,10 @@ int main(int argc, char** argv) {
     uint32_t addr, op1, cnt, oldpc, vitems, cycle, accu, spaddr, items, oldcycle = 0;
     int matching = 1;
     int windup = 10;
+    // With +notrace there is nothing to diverge from: a program that writes
+    // its own code has no reference run to be compared with, because the
+    // reference cannot execute what it generates.
+    const bool notrace = Verilated::commandArgsPlusMatch("notrace")[0] != 0;
     printf("Program length %d\n", prog_length);
 
     while (windup && !Verilated::gotFinish()) {
@@ -218,8 +225,25 @@ int main(int argc, char** argv) {
         top->trap_ready = 0;
         if (top->trap_valid && !trap_answered &&
             (top->trap_prim == 1 || top->trap_prim == 2)) {
-            if (top->trap_prim == 1) top->trap_result = ethmodel_read((int32_t)top->trap_arg0);
-            else ethmodel_write((int32_t)top->trap_arg0, (int32_t)top->trap_arg1);
+            uint32_t a = (uint32_t)top->trap_arg0;
+            if (a >= 0x60000 && a < 0x80000) {
+                // Code memory while the program runs, a byte per address:
+                // fpga/vc707-ethmin/ethmin_vm_core.v decodes 0x60000..0x7FFFF
+                // this way, and modelling it here is what lets a compiler
+                // that writes its own code be simulated at all.
+                uint32_t w = (a - 0x60000) >> 2, lane = a & 3;
+                if (top->trap_prim == 2) {
+                    code_rom[w] = (code_rom[w] & ~(0xFFu << (8 * lane)))
+                                | (((uint32_t)top->trap_arg1 & 0xFF) << (8 * lane));
+                    code_dirty = true;
+                } else {
+                    top->trap_result = (code_rom[w] >> (8 * lane)) & 0xFF;
+                }
+            } else if (a == 0x100c) {
+                // prog_words: the model fetches from the whole array, so the
+                // bound the hardware keeps has nothing to do here
+            } else if (top->trap_prim == 1) top->trap_result = ethmodel_read((int32_t)a);
+            else ethmodel_write((int32_t)a, (int32_t)top->trap_arg1);
             top->trap_ready = 1;
             trap_answered = true;
         } else if (top->trap_valid && !trap_answered &&
@@ -266,6 +290,7 @@ int main(int argc, char** argv) {
         // with the pc it came from, and the next one is prefetched while the
         // VM uses this one, so straight-line code costs no extra cycle.
         static uint32_t code_q = 0xDEADBEEF, code_q_pc = 0xFFFFFFFF;
+        if (code_dirty) { code_q_pc = 0xFFFFFFFF; code_dirty = false; }
         bool code_valid = code_q_pc == top->pc;
         top->code_rdata = code_q;
         top->code_valid = code_valid;
@@ -282,6 +307,7 @@ int main(int argc, char** argv) {
 	    if (!code_valid) break;   // waiting for the fetch unit
 	    oldpc = top->pc;
 	    op = opname(top->code_rdata);
+	    if (notrace) { printf("Fetch PC=%d %s\n", top->pc, op); break; }
 	    printf("Fetch PC=%d ROM = 0x%x, instruction = %s, SP=@%d\n", top->pc, top->code_rdata, op, vitems);
 	    cnt = 0;
 	    do {
@@ -372,7 +398,7 @@ int main(int argc, char** argv) {
             break;
         }
 
-	windup -= !matching;
+	windup -= (!matching && !notrace);
     }
 
     if (tfp) { tfp->close(); delete tfp; }
