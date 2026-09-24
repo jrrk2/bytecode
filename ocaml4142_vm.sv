@@ -934,10 +934,10 @@ module ocaml4142_vm #(
             end
 
             RAISE: begin
-              // jump to handler pc saved at trapsp+1
-              pc <= Int_val(stack_mem[trapsp + 1]);
-              // restore trapsp saved at trapsp
-              trapsp <= stack_mem[trapsp][STACK_AW-1:0];
+              // jump to handler pc saved at trapsp
+              pc <= Int_val(stack_mem[trapsp]);
+              // restore trapsp saved at trapsp+1
+              trapsp <= Int_val(stack_mem[trapsp + 1]);
             end
 
 	    VECTLENGTH: begin
@@ -976,6 +976,26 @@ module ocaml4142_vm #(
 		      16'h103: caml_ml_open_descriptor_in();
 		      16'h104: caml_ml_open_descriptor_out();
 		      16'h136: caml_obj_dup();
+		      16'h12f: begin // caml_neg_float
+			trap_valid <= 1'b1; trap_prim <= 8'h10; trap_arg0 <= accu;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h000: begin // caml_abs_float
+			trap_valid <= 1'b1; trap_prim <= 8'h11; trap_arg0 <= accu;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h157: begin // caml_sqrt_float
+			trap_valid <= 1'b1; trap_prim <= 8'h12; trap_arg0 <= accu;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h077: begin // caml_float_of_int
+			trap_valid <= 1'b1; trap_prim <= 8'h13; trap_arg0 <= accu;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h0e1: begin // caml_int_of_float
+			trap_valid <= 1'b1; trap_prim <= 8'h14; trap_arg0 <= accu;
+			state <= S_TRAP_WAIT;
+		      end
 		   default:
 		     begin
 			$display("Unsupported C_CALL1: 0x%x", imm);
@@ -990,6 +1010,38 @@ module ocaml4142_vm #(
 		      16'h108: caml_ml_output_char();
 		      16'h15b: caml_string_get();
 		      16'h00d: caml_array_get_addr();
+		      16'h003: begin // caml_add_float
+			trap_valid <= 1'b1; trap_prim <= 8'h20; trap_arg0 <= accu; trap_arg1 <= tos;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h166: begin // caml_sub_float
+			trap_valid <= 1'b1; trap_prim <= 8'h21; trap_arg0 <= accu; trap_arg1 <= tos;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h118: begin // caml_mul_float
+			trap_valid <= 1'b1; trap_prim <= 8'h22; trap_arg0 <= accu; trap_arg1 <= tos;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h054: begin // caml_div_float
+			trap_valid <= 1'b1; trap_prim <= 8'h23; trap_arg0 <= accu; trap_arg1 <= tos;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h068: begin // caml_eq_float
+			trap_valid <= 1'b1; trap_prim <= 8'h24; trap_arg0 <= accu; trap_arg1 <= tos;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h130: begin // caml_neq_float
+			trap_valid <= 1'b1; trap_prim <= 8'h25; trap_arg0 <= accu; trap_arg1 <= tos;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h0ee: begin // caml_lt_float
+			trap_valid <= 1'b1; trap_prim <= 8'h26; trap_arg0 <= accu; trap_arg1 <= tos;
+			state <= S_TRAP_WAIT;
+		      end
+		      16'h0e6: begin // caml_le_float
+			trap_valid <= 1'b1; trap_prim <= 8'h27; trap_arg0 <= accu; trap_arg1 <= tos;
+			state <= S_TRAP_WAIT;
+		      end
 		   default:
 		     begin
 			$display("Unsupported C_CALL2: 0x%x", imm);
@@ -1048,6 +1100,7 @@ module ocaml4142_vm #(
 
 	    MAKEBLOCK:
 	      begin
+		 pending_field <= accu;
 		 $display("MAKEBLOCK %d,%d", alloc_wosize, alloc_tag);
 		 state <= S_HEAP_ALLOC_HDR;
 	      end
@@ -1125,11 +1178,14 @@ module ocaml4142_vm #(
 //	  $display("Alloc fields left = %d/%d", alloc_fields_left, alloc_wosize);
           // For the closure case: write field0, then field1, then optional env vars.
           if (alloc_fields_left == alloc_wosize) begin
-            // field0: code pointer
+            // field0: code pointer for closures, first field (from accu) for blocks
             if (opcode == CLOSUREREC) begin
                heap_mem[hp] <= pending_field;
             end else if (opcode == CLOSURE) begin
                heap_mem[hp] <= pending_field;
+            end else if (opcode == MAKEBLOCK) begin
+               heap_mem[hp] <= pending_field;
+               sp <= sp + 1;
             end else begin
 	       heap_mem[hp] <= tos;
 	       sp <= sp + 1;
