@@ -2318,7 +2318,7 @@ let rec comp env e = match e with
     let rec ordered l acc = match l with
       | [] -> rev_acc acc []
       | fn :: r ->
-        match List.assoc_opt fn fs with
+        match assoc_opt fn fs with
         | Some e -> ordered r (e :: acc)
         | None -> begin comp_err := "missing field " ^^ fn; [] end in
     let es = ordered all_fields [] in
@@ -2338,7 +2338,7 @@ let rec comp env e = match e with
           | fn :: r ->
             let base_idx = i in
             let idx = field_index all_fields fn 0 in
-            let ok = match List.assoc_opt fn fs with
+            let ok = match assoc_opt fn fs with
               | Some e ->
                 (* modified field: compile with env padded for i pushes *)
                 let rec pad k l = if k = 0 then l else pad (k - 1) ("" :: l) in
