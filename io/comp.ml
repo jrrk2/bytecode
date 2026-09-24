@@ -49,6 +49,7 @@ external ( || ) : bool -> bool -> bool = "%sequor"
 external not : bool -> bool = "%boolnot"
 external int_of_char : char -> int = "%identity"
 external char_of_int : int -> char = "%identity"
+external magic : 'a -> 'b = "%identity"
 external raise : exn -> 'a = "%raise"
 external string_length : string -> int = "%string_length"
 external string_get : string -> int -> char = "%string_safe_get"
@@ -1945,6 +1946,8 @@ let op_return = 40
 let op_getglobal = 53
 let op_grab = 42
 let op_apply2 = 34
+let op_envacc = 25
+let op_restart = 41
 let op_setglobal = 57
 
 
@@ -2040,17 +2043,108 @@ let comp_err = ref ""
 let dump_code = ref false
 (* unparseable, so it cannot collide with a name from the source *)
 let scrut_name = " scrut"
+(* what a closure being compiled has captured, in field order; saved and
+   restored around each function so that nesting works *)
+let cap : string list ref = ref []
+(* a literal's global slot, so the same text is installed once *)
+let literals : (string * int) list ref = ref []
+
+(* the names an expression uses that it does not itself bind *)
+let rec free_in e bound acc = match e with
+  | Int _ -> acc
+  | Float _ -> acc
+  | Str _ -> acc
+  | Bool _ -> acc
+  | Var x -> if mem_str x bound then acc else (if mem_str x acc then acc else x :: acc)
+  | Binop (_, a, b) -> free_in b bound (free_in a bound acc)
+  | If (c, a, b) -> free_in b bound (free_in a bound (free_in c bound acc))
+  | Let (r, x, bnd, body) ->
+    let acc = free_in bnd (if r then x :: bound else bound) acc in
+    free_in body (x :: bound) acc
+  | Fun (x, b) -> free_in b (x :: bound) acc
+  | App (f, a) -> free_in a bound (free_in f bound acc)
+  | Con (_, l) -> free_in_list l bound acc
+  | Tuple l -> free_in_list l bound acc
+  | Match (sc, arms) ->
+    let acc = free_in sc bound acc in
+    let rec go l a = match l with
+      | [] -> a
+      | (pat, body) :: r -> go r (free_in body (pat_vars pat bound) a) in
+    go arms acc
+  | Try (b, n, h) -> free_in h (n :: bound) (free_in b bound acc)
+  | Record fs -> free_in_fields fs bound acc
+  | With (b, fs) -> free_in_fields fs bound (free_in b bound acc)
+  | Field (b, _) -> free_in b bound acc
+and free_in_list l bound acc = match l with
+  | [] -> acc
+  | x :: r -> free_in_list r bound (free_in x bound acc)
+and free_in_fields l bound acc = match l with
+  | [] -> acc
+  | (_, x) :: r -> free_in_fields r bound (free_in x bound acc)
+and pat_vars pat bound = match pat with
+  | PVar x -> x :: bound
+  | PTuple l -> pat_vars_list l bound
+  | PCon (_, l) -> pat_vars_list l bound
+  | PRec l -> let rec go m b = match m with
+                | [] -> b
+                | (_, q) :: r -> go r (pat_vars q b) in go l bound
+  | _ -> bound
+and pat_vars_list l bound = match l with
+  | [] -> bound
+  | q :: r -> pat_vars_list r (pat_vars q bound)
+
+and mem_str x l = match l with
+  | [] -> false
+  | y :: r -> string_equal x y || mem_str x r
+
+(* every literal in an expression, so each can be given a slot before the
+   phrase that uses it is compiled *)
+let rec strs_in e acc = match e with
+  | Str t -> if mem_str t acc then acc else t :: acc
+  | Binop (_, a, b) -> strs_in b (strs_in a acc)
+  | If (c, a, b) -> strs_in b (strs_in a (strs_in c acc))
+  | Let (_, _, bnd, body) -> strs_in body (strs_in bnd acc)
+  | Fun (_, b) -> strs_in b acc
+  | App (f, a) -> strs_in a (strs_in f acc)
+  | Con (_, l) -> strs_in_list l acc
+  | Tuple l -> strs_in_list l acc
+  | Match (sc, arms) ->
+    let rec go l a = match l with [] -> a | (_, b) :: r -> go r (strs_in b a) in
+    go arms (strs_in sc acc)
+  | Try (b, _, h) -> strs_in h (strs_in b acc)
+  | Record fs -> strs_in_fields fs acc
+  | With (b, fs) -> strs_in_fields fs (strs_in b acc)
+  | Field (b, _) -> strs_in b acc
+  | _ -> acc
+and strs_in_list l acc = match l with
+  | [] -> acc
+  | x :: r -> strs_in_list r (strs_in x acc)
+and strs_in_fields l acc = match l with
+  | [] -> acc
+  | (_, x) :: r -> strs_in_fields r (strs_in x acc)
+
+let rec lit_slot l t = match l with
+  | [] -> 0 - 1
+  | (u, k) :: r -> if string_equal u t then k else lit_slot r t
 
 let rec comp env e = match e with
   | Int n -> emit op_constint; emit n; true
   | Bool b -> emit op_constint; emit (if b then 1 else 0); true
+  | Str t ->
+    let k = lit_slot !literals t in
+    if k >= 0 then begin emit op_getglobal; emit k; true end
+    else begin comp_err := "this literal has no slot"; false end
   | Var x ->
     let i = stack_idx env x 0 in
     if i >= 0 then begin emit op_acc; emit i; true end
     else begin
-      let g = glob_slot !globals x in
-      if g >= 0 then begin emit op_getglobal; emit g; true end
-      else begin comp_err := "unbound " ^^ x; false end
+      let c = stack_idx !cap x 0 in
+      if c >= 0 then begin emit op_envacc; emit (2 + c); true end
+      else begin
+        let g = glob_slot !globals x in
+        if g >= 0 then begin emit op_getglobal; emit g; true end
+        else begin comp_err := "unbound " ^^ x; false end
+      end
     end
   | Binop (op, a, b) -> comp_binop env op a b
   | If (c, a, b) ->
@@ -2082,16 +2176,55 @@ let rec comp env e = match e with
     let (ps, body) = params e [] in
     let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
     let n = count ps in
-    emit op_closure; emit 0;
-    let p = here () in emit 0;
-    emit op_branch; let skip = here () in emit 0;
-    patch_branch p (here ());
-    (if n > 1 then begin emit op_grab; emit (n - 1) end);
-    if not_b (comp ps body) then false
+    (* whatever the body uses from out here has to travel with it; a global
+       is reachable from anywhere and so is left alone *)
+    let fv = free_in body ps [] in
+    let rec keep l acc = match l with
+      | [] -> acc
+      | x :: r ->
+        if stack_idx env x 0 >= 0 || stack_idx !cap x 0 >= 0 then keep r (x :: acc)
+        else keep r acc in
+    let caps = keep fv [] in
+    let nc = count caps in
+    (* field 2 comes from the accumulator and the rest from the stack, so
+       they go on last-first, as a block's do *)
+    let rec tl l = match l with [] -> [] | _ :: r -> r in
+    let pushed = rev_acc (tl caps) [] in
+    let e2 = ref env and ok = ref true in
+    let rec push l = match l with
+      | [] -> ()
+      | x :: r ->
+        if !ok then begin
+          if not_b (comp !e2 (Var x)) then ok := false
+          else begin emit op_push; e2 := "" :: !e2; push r end
+        end in
+    push pushed;
+    (if !ok && nc > 0 then
+       match caps with
+       | first :: _ -> if not_b (comp !e2 (Var first)) then ok := false
+       | [] -> ());
+    if not_b !ok then false
     else begin
-      emit op_return; emit n;
-      patch_branch skip (here ());
-      true
+      emit op_closure; emit nc;
+      let p = here () in emit 0;
+      emit op_branch; let skip = here () in emit 0;
+      (* GRAB's partial application returns a closure pointing one word
+         before the GRAB, where RESTART has to be waiting to unpack what was
+         saved.  Without it the second call lands on whatever preceded the
+         function and takes the machine with it. *)
+      (if n > 1 then emit op_restart);
+      patch_branch p (here ());
+      (if n > 1 then begin emit op_grab; emit (n - 1) end);
+      let saved = !cap in
+      cap := caps;
+      let r = comp ps body in
+      cap := saved;
+      if not_b r then false
+      else begin
+        emit op_return; emit n;
+        patch_branch skip (here ());
+        true
+      end
     end
   | App (_, _) ->
     let rec spine t acc = match t with
@@ -2322,8 +2455,37 @@ let slot_for name =
     k
   end
 
+(* A literal cannot be written into the heap from here, but it can be
+   handed through the doorway: a phrase of four instructions puts the
+   argument into a global, and from then on the text is fetched with
+   GETGLOBAL, which works inside a closure as well as out. *)
+let install_literal slot (t : string) =
+  let st = here () in
+  emit op_acc; emit 0;
+  emit op_setglobal; emit slot;
+  emit op_constint; emit 0;
+  emit op_return; emit 1;
+  io_write prog_words_reg (here () + 16);
+  code_wr !doorway op_branch;
+  patch_branch (!doorway + 1) st;
+  let _ = dispatch (magic t) in ()
+
+let rec install_all l = match l with
+  | [] -> ()
+  | t :: r ->
+    (if lit_slot !literals t < 0 then begin
+       let k = !next_global in
+       next_global := k + 1;
+       literals := (t, k) :: !literals;
+       install_literal k t
+     end);
+    install_all r
+
 let run_phrase e name =
   comp_err := "";
+  (* the literals first, each into a global of its own, before anything
+     that refers to them is compiled *)
+  install_all (strs_in e []);
   let start = here () in
   let ok = match e with
     | Let (recursive, n, bound, Var v) when string_equal v n ->
@@ -2360,6 +2522,9 @@ let run_phrase e name =
 let print_compiled ty v = match repr ty with
   | TInt -> put_int v
   | TBool -> puts (if v = 1 then "true" else "false")
+  (* what came back is the string itself, which arrived as the
+     accumulator and needs only to be read as one again *)
+  | TString -> putc '"'; puts (magic v); putc '"'
   | TArrow (_, _) -> puts "<fun>"
   | _ -> puts "<value>"
 
