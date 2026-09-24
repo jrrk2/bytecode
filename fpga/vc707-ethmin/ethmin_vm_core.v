@@ -23,8 +23,10 @@
 //   0x100a  r  who built this bitstream: bits 27:0 the git commit (7 hex
 //              digits), bit 28 set if the tree was dirty, bits 31:30 the
 //              flow (1 = the open flow, 2 = Vivado, 0 = unsaid)
-//   0x100c  w  the program's length in words: what the fetch unit will
-//              reach, which a compiler raises as it appends
+//   0x100c  rw the program's length in words: what the fetch unit will
+//              reach.  Read, it says where the program's own code ends, so
+//              a compiler can append without being told; written, it
+//              admits what was appended.
 //   0x10000..0x2FFFF  the staging RAM, a byte per address
 //   0x60000..0x7FFFF  the program's code, a byte per address, readable and
 //              writable while it runs: a compiler on this machine appends
@@ -580,6 +582,9 @@ module ethmin_vm_core #(
 						32'h1009: trap_result <= {24'd0, dip_sync[1]};  // the DIP switches
 						32'h100a: trap_result <= BUILD_ID;             // commit, dirty, flow
 						32'h100b: trap_result <= {27'd0, btn_sync[1]}; // the push buttons
+						// the program's length: read to find where its code
+						// ends, written to admit what was appended
+						32'h100c: trap_result <= {16'd0, prog_words};
 						32'h1008: begin                               // a received byte, or -1
 							trap_result <= rxf_empty ? 32'hFFFFFFFF : {24'd0, rx_fifo[rxf_rp[7:0]]};
 							rxf_pop <= io_read && !rxf_empty;

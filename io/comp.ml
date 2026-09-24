@@ -2000,9 +2000,11 @@ let code_wr w v =
   io_write (a + 3) 0
 
 (* where the next phrase goes, and the first free global slot *)
-(* above this program's own code, which is about 24000 words: emitting
-   into it would compile a phrase over the compiler *)
-let cp = ref 28000
+(* Set at startup from prog_words, which says where this program's own code
+   ends.  It used to be a constant kept above that by hand, which is a
+   footgun: let the program outgrow it and the first phrase compiled lands
+   on top of the compiler. *)
+let cp = ref 0
 let next_global = ref 4096
 let doorway = ref (0 - 1)
 
@@ -2018,8 +2020,12 @@ let marker = 0x5EED5E
 let dispatch (_x : int) = 0x5EED5E
 
 let find_doorway () =
+  (* the program's own code is all there is to search, and its length is
+     now something the machine will say *)
+  let last = io_read prog_words_reg in
+  cp := last;
   let p = ref 1 and f = ref (0 - 1) in
-  while !f < 0 && !p < 24000 do
+  while !f < 0 && !p < last do
     if code_rd !p = marker && code_rd (!p - 1) = op_constint then f := !p - 1;
     p := !p + 1
   done;
@@ -2465,7 +2471,7 @@ let install_literal slot (t : string) =
   emit op_setglobal; emit slot;
   emit op_constint; emit 0;
   emit op_return; emit 1;
-  io_write prog_words_reg (here () + 16);
+  io_write prog_words_reg (here ());
   code_wr !doorway op_branch;
   patch_branch (!doorway + 1) st;
   let _ = dispatch (magic t) in ()
@@ -2511,7 +2517,7 @@ let run_phrase e name =
   if not_b ok then Err !comp_err
   else if !doorway < 0 then Err "the doorway was not found"
   else begin
-    io_write prog_words_reg (here () + 16);
+    io_write prog_words_reg (here ());
     code_wr !doorway op_branch;
     patch_branch (!doorway + 1) start;
     Ok (dispatch 0)

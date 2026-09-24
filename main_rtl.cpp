@@ -240,8 +240,14 @@ int main(int argc, char** argv) {
                     top->trap_result = (code_rom[w] >> (8 * lane)) & 0xFF;
                 }
             } else if (a == 0x100c) {
-                // prog_words: the model fetches from the whole array, so the
-                // bound the hardware keeps has nothing to do here
+                // prog_words.  Read, it says where the program's code ends,
+                // which is what lets a compiler find its own end; written,
+                // the hardware widens what the fetch unit will reach, and
+                // the model fetches from the whole array anyway.
+                static uint32_t pw = 0;
+                // caml_bytecode returns a byte count; the register is words
+                if (top->trap_prim == 1) top->trap_result = pw ? pw : (uint32_t)prog_length / 4;
+                else pw = (uint32_t)top->trap_arg1;
             } else if (top->trap_prim == 1) top->trap_result = ethmodel_read((int32_t)a);
             else ethmodel_write((int32_t)a, (int32_t)top->trap_arg1);
             top->trap_ready = 1;
