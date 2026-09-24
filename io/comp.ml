@@ -1493,6 +1493,25 @@ let rec find_rec_order l n = match l with
   | [] -> Err ("unknown record type " ^^ n)
   | (m, fs) :: r -> if string_equal m n then Ok fs else find_rec_order r n
 
+(* field index lookup for code generation: name -> position in declaration order *)
+let rec field_index fields_list f i = match fields_list with
+  | [] -> 0 - 1
+  | name :: r -> if string_equal name f then i else field_index r f (i + 1)
+
+let rec assoc_opt k l = match l with
+  | [] -> None
+  | (key, v) :: r -> if string_equal k key then Some v else assoc_opt k r
+
+let rec_type_of_field f =
+  match assoc_opt f !fields with
+  | Some (tname, _, _) -> tname
+  | None -> ""
+
+let rec_field_names tname =
+  match assoc_opt tname !rec_order with
+  | Some fs -> fs
+  | None -> []
+
 let rec mem_field f l = match l with
   | [] -> false
   | (g, _) :: r -> string_equal f g || mem_field f r
@@ -1958,6 +1977,28 @@ let op_makeblock1 = 63
 let op_makeblock2 = 64
 let op_makeblock3 = 65
 
+let op_pushtrap = 117
+let op_poptrap = 118
+let op_raise = 119
+
+let op_c_call1 = 93
+let op_c_call2 = 94
+
+(* float primitive indices for C_CALL — matching the RTL VM's hardfloat peripheral *)
+let prim_add_float = 0x003
+let prim_sub_float = 0x166
+let prim_mul_float = 0x118
+let prim_div_float = 0x054
+let prim_neg_float = 0x12f
+let prim_sqrt_float = 0x157
+let prim_abs_float = 0x000
+let prim_lt_float = 0x0ee
+let prim_le_float = 0x0e6
+let prim_eq_float = 0x068
+let prim_neq_float = 0x130
+let prim_float_of_int = 0x077
+let prim_int_of_float = 0x0e1
+
 (* How a constructor is represented: a constant one is an integer, counted
    among the constant constructors of its type; one with arguments is a
    block whose tag counts among those.  SWITCH wants both totals. *)
@@ -2252,6 +2293,78 @@ let rec comp env e = match e with
   | Con (c, args) -> comp_con env c args
   | Tuple es -> comp_block env 0 es
   | Match (scrut, arms) -> comp_match env scrut arms
+  | Float _ -> comp_err := "float literal: use float_of_int"; false
+  | Try (body, name, handler) ->
+    emit op_pushtrap; let handler_pc = here () in emit 0;
+    if not_b (comp env body) then false
+    else begin
+      emit op_poptrap;
+      emit op_branch; let skip = here () in emit 0;
+      patch_branch handler_pc (here ());
+      let env2 = if string_equal name "_" then env else name :: env in
+      if not_b (comp env2 handler) then false
+      else begin patch_branch skip (here ()); true end
+    end
+  | Field (e, f) ->
+    let tname = rec_type_of_field f in
+    let all_fields = rec_field_names tname in
+    let idx = field_index all_fields f 0 in
+    if idx < 0 then begin comp_err := "unknown field " ^^ f; false end
+    else if not_b (comp env e) then false
+    else begin emit op_getfield; emit idx; true end
+  | Record fs ->
+    let tname = match fs with (f, _) :: _ -> rec_type_of_field f | [] -> "" in
+    let all_fields = rec_field_names tname in
+    let rec ordered l acc = match l with
+      | [] -> rev_acc acc []
+      | fn :: r ->
+        match assoc_opt fn fs with
+        | Some e -> ordered r (e :: acc)
+        | None -> begin comp_err := "missing field " ^^ fn; [] end in
+    let es = ordered all_fields [] in
+    if es = [] && all_fields <> [] then false
+    else comp_block env 0 es
+  | With (base, fs) ->
+    let tname = match fs with (f, _) :: _ -> rec_type_of_field f | [] -> "" in
+    let all_fields = rec_field_names tname in
+    let n = list_len all_fields in
+    if n = 0 then comp_block env 0 []
+    else begin
+      if not_b (comp env base) then false
+      else begin
+        emit op_push;  (* base is at stack position 0 for ACC 0 *)
+        let rec push_fields i l = match l with
+          | [] -> true
+          | fn :: r ->
+            let base_idx = i in
+            let idx = field_index all_fields fn 0 in
+            let ok = match assoc_opt fn fs with
+              | Some e ->
+                (* modified field: compile with env padded for i pushes *)
+                let rec pad k l = if k = 0 then l else pad (k - 1) ("" :: l) in
+                let e_env = pad base_idx ("" :: env) in
+                comp e_env e
+              | None ->
+                (* unmodified field: read from base at stack index base_idx *)
+                emit op_acc; emit base_idx;
+                emit op_getfield; emit idx;
+                true in
+            if not_b ok then false
+            else if r = [] then true
+            else begin emit op_push; push_fields (i + 1) r end in
+        let rev_fields = rev_acc all_fields [] in
+        if not_b (push_fields 0 rev_fields) then false
+        else begin
+          if n <= 3 then
+            emit (if n = 1 then op_makeblock1 else if n = 2 then op_makeblock2 else op_makeblock3)
+          else begin emit op_makeblock; emit n end;
+          emit 0;
+          (* pop the saved base from the stack *)
+          emit op_pop; emit 1;
+          true
+        end
+      end
+    end
   | _ -> comp_err := "this is not compiled yet"; false
 
 (* field 0 comes from the accumulator and the rest from the stack, so the
@@ -2260,7 +2373,6 @@ and comp_block env tag es =
   let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
   let n = count es in
   if n = 0 then begin emit op_constint; emit 0; true end
-  else if n > 3 then begin comp_err := "more than three fields is not compiled yet"; false end
   else begin
     let rec rev l acc = match l with [] -> acc | x :: r -> rev r (x :: acc) in
     let rec push_rest l e = match l with
@@ -2280,7 +2392,9 @@ and comp_block env tag es =
       | first :: _ ->
         if not_b (comp e2 first) then false
         else begin
-          emit (if n = 1 then op_makeblock1 else if n = 2 then op_makeblock2 else op_makeblock3);
+          if n <= 3 then
+            emit (if n = 1 then op_makeblock1 else if n = 2 then op_makeblock2 else op_makeblock3)
+          else begin emit op_makeblock; emit n end;
           emit tag; true
         end
     end
@@ -2310,7 +2424,17 @@ and comp_test env depth path pat fails = match pat with
   | PBool b ->
     comp_path env depth path; emit op_push; emit op_constint; emit (if b then 1 else 0);
     emit op_eq; emit op_branchifnot; fails := here () :: !fails; emit 0; true
-  | PRec _ -> comp_err := "record patterns are not compiled yet"; false
+  | PRec fs ->
+    let tname = match fs with (f, _) :: _ -> rec_type_of_field f | [] -> "" in
+    let all_fields = rec_field_names tname in
+    let rec test_fields l = match l with
+      | [] -> true
+      | (fn, p) :: r ->
+        let idx = field_index all_fields fn 0 in
+        if idx < 0 then begin comp_err := "unknown field " ^^ fn; false end
+        else if not_b (comp_test env depth (path_snoc path idx) p fails) then false
+        else test_fields r in
+    test_fields fs
   | PTuple sub -> comp_subtests env depth path sub 0 fails
   | PCon (c, sub) ->
     (match ctor_layout c with
@@ -2354,6 +2478,17 @@ and comp_bind env depth path pat pushed = match pat with
   | PBool _ -> Ok (env, pushed)
   | PTuple sub -> comp_binds env depth path sub 0 pushed
   | PCon (_, sub) -> comp_binds env depth path sub 0 pushed
+  | PRec fs ->
+    let tname = match fs with (f, _) :: _ -> rec_type_of_field f | [] -> "" in
+    let all_fields = rec_field_names tname in
+    let rec bind_fields l pushed = match l with
+      | [] -> Ok (env, pushed)
+      | (fn, p) :: r ->
+        let idx = field_index all_fields fn 0 in
+        match comp_bind env depth (path_snoc path idx) p pushed with
+        | Err m -> Err m
+        | Ok (e2, n2) -> bind_fields r n2 in
+    bind_fields fs pushed
   | _ -> Err "this pattern is not compiled yet"
 
 and comp_binds env depth path l i pushed = match l with
@@ -2417,28 +2552,48 @@ and comp_con env c args =
 (* accu holds the left operand and the stack the right, so the right is
    compiled first *)
 and comp_binop env op a b =
-  if not_b (comp env b) then false
-  else begin
-    emit op_push;
-    if not_b (comp ("" :: env) a) then false
+  (* float binary operators: compile right, push, compile left, C_CALL2 *)
+  let float_prim =
+    if string_equal op "+." then Some prim_add_float
+    else if string_equal op "-." then Some prim_sub_float
+    else if string_equal op "*." then Some prim_mul_float
+    else if string_equal op "./." then Some prim_div_float
+    else if string_equal op "<." then Some prim_lt_float
+    else if string_equal op "<=." then Some prim_le_float
+    else if string_equal op "=." then Some prim_eq_float
+    else if string_equal op "<>." then Some prim_neq_float
+    else None in
+  match float_prim with
+  | Some prim ->
+    if not_b (comp env b) then false
     else begin
-      let o =
-        if string_equal op "+" then op_addint
-        else if string_equal op "-" then op_subint
-        else if string_equal op "*" then op_mulint
-        else if string_equal op "/" then op_divint
-        else if string_equal op "mod" then op_modint
-        else if string_equal op "=" then op_eq
-        else if string_equal op "<>" then op_neq
-        else if string_equal op "<" then op_ltint
-        else if string_equal op "<=" then op_leint
-        else if string_equal op ">" then op_gtint
-        else if string_equal op ">=" then op_geint
-        else 0 - 1 in
-      if o < 0 then begin comp_err := op ^^ " is not compiled yet"; false end
-      else begin emit o; true end
+      emit op_push;
+      if not_b (comp ("" :: env) a) then false
+      else begin emit op_c_call2; emit prim; true end
     end
-  end
+  | None ->
+    if not_b (comp env b) then false
+    else begin
+      emit op_push;
+      if not_b (comp ("" :: env) a) then false
+      else begin
+        let o =
+          if string_equal op "+" then op_addint
+          else if string_equal op "-" then op_subint
+          else if string_equal op "*" then op_mulint
+          else if string_equal op "/" then op_divint
+          else if string_equal op "mod" then op_modint
+          else if string_equal op "=" then op_eq
+          else if string_equal op "<>" then op_neq
+          else if string_equal op "<" then op_ltint
+          else if string_equal op "<=" then op_leint
+          else if string_equal op ">" then op_gtint
+          else if string_equal op ">=" then op_geint
+          else 0 - 1 in
+        if o < 0 then begin comp_err := op ^^ " is not compiled yet"; false end
+        else begin emit o; true end
+      end
+    end
 
 
 (* A whole phrase: compile it above the program, point the doorway at it,
