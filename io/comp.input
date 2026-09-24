@@ -16,3 +16,9 @@ k 5
 write_file "a.txt" "hello"
 read_file "a.txt"
 files 0
+let rec esum n x t s = if n > 16 then s else let u = t *. x /. float_of_int n in esum (n + 1) x u (s +. u)
+esum 1 1.0 1.0 1.0
+let f4 a b c d = a + b * c - d
+f4 1 2 3 4
+let f5 a b c d e = a + b + c + d + e
+f5 1 2 3 4 5

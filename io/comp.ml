@@ -1556,6 +1556,11 @@ let op_return = 40
 let op_getglobal = 53
 let op_grab = 42
 let op_apply2 = 34
+let op_apply3 = 35
+(* four or more arguments: the caller pushes the frame APPLY1..3 make for
+   themselves, then APPLY takes the count as an immediate *)
+let op_push_retaddr = 31
+let op_apply = 32
 let op_envacc = 25
 let op_restart = 41
 (* 117..119 are XORINT, LSLINT, LSRINT: getting these wrong emits a shift
@@ -1941,21 +1946,34 @@ let rec comp env e = match e with
     let (f, args) = spine e [] in
     let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
     let n = count args in
-    if n > 2 then begin
-      comp_err := "more than two arguments at once is not compiled yet"; false
-    end else begin
-      let e2 = ref env and ok = ref true in
-      let rec push l = match l with
-        | [] -> ()
-        | x :: r ->
-          if !ok then begin
-            if not_b (comp !e2 x) then ok := false
-            else begin emit op_push; e2 := "" :: !e2; push r end
-          end in
-      push (rev_acc args []);
-      if not_b !ok then false
-      else if not_b (comp !e2 f) then false
-      else begin emit (if n = 1 then op_apply1 else op_apply2); true end
+    (* APPLY1..3 build their own return frame; beyond that PUSH_RETADDR
+       has to put one there first, and it is three words, so the
+       compile-time stack grows by three as well or every local under it
+       is read from the wrong slot. *)
+    let big = n > 3 in
+    let ra = ref 0 in
+    let e2 = ref env and ok = ref true in
+    if big then begin
+      emit op_push_retaddr; ra := here (); emit 0;
+      e2 := "" :: "" :: "" :: !e2
+    end;
+    let rec push l = match l with
+      | [] -> ()
+      | x :: r ->
+        if !ok then begin
+          if not_b (comp !e2 x) then ok := false
+          else begin emit op_push; e2 := "" :: !e2; push r end
+        end in
+    push (rev_acc args []);
+    if not_b !ok then false
+    else if not_b (comp !e2 f) then false
+    else begin
+      (if n = 1 then emit op_apply1
+       else if n = 2 then emit op_apply2
+       else if n = 3 then emit op_apply3
+       else begin emit op_apply; emit n end);
+      if big then patch_branch !ra (here ());
+      true
     end
   | Con (c, args) -> comp_con env c args
   | Tuple es -> comp_block env 0 es
