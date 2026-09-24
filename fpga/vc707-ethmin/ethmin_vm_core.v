@@ -23,7 +23,13 @@
 //   0x100a  r  who built this bitstream: bits 27:0 the git commit (7 hex
 //              digits), bit 28 set if the tree was dirty, bits 31:30 the
 //              flow (1 = the open flow, 2 = Vivado, 0 = unsaid)
-//   0x10000..0x4FFFF  the staging RAM, a byte per address
+//   0x100c  w  the program's length in words: what the fetch unit will
+//              reach, which a compiler raises as it appends
+//   0x10000..0x2FFFF  the staging RAM, a byte per address
+//   0x60000..0x7FFFF  the program's code, a byte per address, readable and
+//              writable while it runs: a compiler on this machine appends
+//              closures to the program it is itself part of, and reads it
+//              back to find the places it must patch
 //
 // The packet RAM is a true dual-port BRAM: port B belongs to the DMA on
 // eth_clk, port A to the VM on clk_sys; eth_stream_dma's ownership handshake
@@ -138,14 +144,15 @@ module ethmin_vm_core #(
 	// come out of nextpnr miscompiled: the board then runs the loader (whose
 	// code is a x9 ROM) while its heap is corrupt, so the strings are intact
 	// but every pointer into them is wrong.  Vivado is happy either way.
-	// The staging RAM is fully addressed: 64K words (256 KiB).
+	// The staging RAM is fully addressed: 32K words (128 KiB).
 	localparam integer PROG_WORDS  = 32768;   // program code RAM (block RAM)
-	localparam integer STAGE_WORDS = 65536;   // staging RAM: 256 KiB
-	// 128K words, two 64K semi-spaces: a tree-walking interpreter holds
-	// every frame of a recursion live, so the collector has nothing to take
-	// and the old 16K semi-space ran out at a few hundred frames.  Block RAM
-	// is what this part has spare -- 168 RAMB36 of 1030 before this.
-	localparam integer HEAP_AW     = 17;
+	localparam integer STAGE_WORDS = 32768;   // staging RAM: 128 KiB
+	// 32K words, two 16K semi-spaces.  It was briefly four times this, to
+	// give a tree-walking interpreter room for the frames it holds live,
+	// and that cost 0.7 ns and with it 100 MHz.  Compiled code keeps its
+	// frames on the VM's stack instead, so the room is better bought by
+	// compiling than by block RAM.
+	localparam integer HEAP_AW     = 15;
 	localparam integer GLOBALS_AW  = 13;      // see the VM instantiation
 
 	// 36 bits, not 32: at 32 bits yosys slices these ROMs x9, and a RAMB36 in
@@ -188,12 +195,15 @@ module ethmin_vm_core #(
 	reg [HEAP_AW-1:0] load_addr, image_words;
 	reg [31:0] load_data;
 	reg        boot_req;
+	reg        set_pw;            // 0x100c: raise prog_words
+	reg [15:0] set_pw_val;
+	integer    code_lane;
 	reg [1:0]  hdr_i;
 
 	// The word read this cycle, available next cycle in rom_q (the resident
 	// images) or seq_q (the staged one): header words 2-4, then each section.
-	wire [15:0] seq_addr = (seq_state == SEQ_HEADER) ? 16'd2 + hdr_i
-	                     : 16'd8 + seq_i + ((seq_state != SEQ_CODE) ? stage_code : 16'd0)
+	wire [14:0] seq_addr = (seq_state == SEQ_HEADER) ? 15'd2 + hdr_i
+	                     : 15'd8 + seq_i + ((seq_state != SEQ_CODE) ? stage_code : 16'd0)
 	                                     + ((seq_state == SEQ_GLOBALS) ? stage_heap : 16'd0);
 	always @(posedge clk_sys) begin
 		rom_q <= (seq_state == SEQ_GLOBALS) ? globals_rom[seq_i][31:0] : heap_rom[seq_i][31:0];
@@ -202,6 +212,7 @@ module ethmin_vm_core #(
 
 	always @(posedge clk_sys) begin
 		load_we <= 1'b0;
+		if (set_pw) prog_words <= set_pw_val;
 		if (!resetn) begin
 			seq_state <= SEQ_RESIDENT;
 			seq_from_stage <= 1'b0;
@@ -235,7 +246,7 @@ module ethmin_vm_core #(
 			// Each section: read word i, write it the cycle after.
 			SEQ_CODE, SEQ_HEAP, SEQ_GLOBALS: begin
 				if (seq_data_ready) begin
-					if (seq_state == SEQ_CODE) prog_code[seq_i[14:0] - 1] <= seq_q;
+					if (seq_state == SEQ_CODE) ;   // written on the shared port
 					else begin
 						load_we <= 1'b1;
 						load_globals <= seq_state == SEQ_GLOBALS;
@@ -308,7 +319,9 @@ module ethmin_vm_core #(
 		fetch_in_range <= code_bank ? (fetch_pc < {8'd0, prog_words})
 		                            : (fetch_pc < `PROGRAM_WORDS);
 		code_q_pc <= fetch_pc;
-		code_q_valid <= !vm_reset;   // a new program invalidates what was fetched
+		// a new program invalidates what was fetched, and so does writing
+		// over the word that was prefetched
+		code_q_valid <= !vm_reset && !code_wr;
 	end
 
 
@@ -423,7 +436,7 @@ module ethmin_vm_core #(
 	localparam [7:0] TRAP_FP_A = 8'h10, TRAP_FP_B = 8'h11,
 	                 TRAP_FP_EXEC = 8'h12, TRAP_FP_HI = 8'h13;
 	localparam [2:0] IO_IDLE = 3'd0, IO_PKT_READ = 3'd1, IO_UART = 3'd2, IO_DONE = 3'd3,
-	                 IO_STAGE_READ = 3'd4, IO_FP_WAIT = 3'd5;
+	                 IO_STAGE_READ = 3'd4, IO_FP_WAIT = 3'd5, IO_CODE_READ = 3'd6;
 	reg [2:0] io_state;
 	reg [1:0] io_lane;
 	reg [7:0] leds;
@@ -464,12 +477,19 @@ module ethmin_vm_core #(
 	// 128 KiB, which is what STAGE_WORDS has always held: the decode used
 	// to reach only half of it, and a netboot image that outgrew 64 KiB
 	// stopped being acknowledged part way through the transfer.
-	wire io_is_stage  = io_addr >= 32'h10000 && io_addr < 32'h50000;
+	wire io_is_stage  = io_addr >= 32'h10000 && io_addr < 32'h30000;
 
 	// Base-relative: the boot sequencer reads the image from word 0.  The old
 	// [15:2] did that by accident, dropping bit 16 of a window that was one
 	// bit wide; over 128 KiB the offset has to be taken properly.
-	wire [15:0] stage_idx = (io_addr - 32'h10000) >> 2;
+	wire [14:0] stage_idx = (io_addr - 32'h10000) >> 2;
+
+	// Code memory while the VM runs.  The sequencer's write port is idle
+	// then, so the two share it; they cannot collide, because the VM is
+	// held in reset for the whole of a load and io_new needs !vm_reset.
+	wire io_is_code = io_addr >= 32'h60000 && io_addr < 32'h80000;
+	wire [14:0] code_idx = (io_addr - 32'h60000) >> 2;
+	wire code_wr = io_new && io_is_code && io_write;
 
 	always @(*) begin
 		pa_en    = io_new && io_is_packet;
@@ -481,7 +501,26 @@ module ethmin_vm_core #(
 		uf_din   = putc_valid ? putc_char : trap_arg1[7:0];
 	end
 
-	wire [31:0] io_read_word = (io_state == IO_PKT_READ) ? pa_rdata : stage_q;
+	wire [31:0] io_read_word = (io_state == IO_PKT_READ) ? pa_rdata
+	                         : (io_state == IO_CODE_READ) ? code_q : stage_q;
+
+	// prog_code's second port.  The sequencer loads a program through it and
+	// a running program writes and reads its own code through it; the fetch
+	// unit has the other.  One block, one address, byte enables -- which is
+	// the pattern block RAM is inferred from, and mixing a whole-word write
+	// with byte writes over two blocks is not.
+	wire        pc_load  = (seq_state == SEQ_CODE) && seq_data_ready;
+	wire [14:0] pc_paddr = pc_load ? (seq_i[14:0] - 15'd1) : code_idx;
+	wire [31:0] pc_pdata = pc_load ? seq_q : {4{trap_arg1[7:0]}};
+	wire [ 3:0] pc_pbe   = pc_load ? 4'b1111
+	                     : (code_wr ? (4'b0001 << io_addr[1:0]) : 4'b0000);
+	reg [31:0] code_q;
+	always @(posedge clk_sys) begin
+		for (code_lane = 0; code_lane < 4; code_lane = code_lane + 1)
+			if (pc_pbe[code_lane])
+				prog_code[pc_paddr][8*code_lane +: 8] <= pc_pdata[8*code_lane +: 8];
+		code_q <= prog_code[pc_paddr];
+	end
 
 	// The staging RAM's program side: a byte per address, as the packet RAM.
 	reg [31:0] stage_q;
@@ -501,6 +540,7 @@ module ethmin_vm_core #(
 		rx_ack     <= 1'b0;
 		tx_start   <= 1'b0;
 		boot_req   <= 1'b0;
+		set_pw     <= 1'b0;
 		rxf_pop    <= 1'b0;
 		if (!resetn || vm_reset) begin
 			io_state <= IO_IDLE;
@@ -522,7 +562,10 @@ module ethmin_vm_core #(
 				endcase
 			end else if (io_new) begin
 				io_lane <= io_addr[1:0];
-				if (io_is_packet || io_is_stage) begin
+				if (io_is_code) begin
+					if (io_read) io_state <= IO_CODE_READ;   // block RAM data next cycle
+					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
+				end else if (io_is_packet || io_is_stage) begin
 					if (io_read) io_state <= io_is_packet ? IO_PKT_READ : IO_STAGE_READ;  // BRAM data next cycle
 					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
 				end else if (io_write && io_addr == 32'h1005) begin
@@ -548,13 +591,14 @@ module ethmin_vm_core #(
 						32'h1003: begin tx_len <= trap_arg1[10:0]; tx_start <= 1'b1; end
 						32'h1004: leds <= trap_arg1[7:0];
 						32'h1007: boot_req <= 1'b1;                   // boot the staged image
+						32'h100c: begin set_pw <= 1'b1; set_pw_val <= trap_arg1[15:0]; end
 						default: ;
 					endcase
 					trap_ready <= 1'b1;
 					io_state   <= IO_DONE;
 				end
 			end
-			IO_PKT_READ, IO_STAGE_READ: begin
+			IO_PKT_READ, IO_STAGE_READ, IO_CODE_READ: begin
 				trap_result <= {24'd0, io_read_word[8*io_lane +: 8]};
 				trap_ready  <= 1'b1;
 				io_state    <= IO_DONE;

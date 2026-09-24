@@ -3084,7 +3084,7 @@ let packets = ref 0
    the session drop rather than a result. *)
 let boot_reg = 0x1007
 let stage = 0x10000
-let stage_size = 0x40000
+let stage_size = 0x20000
 let tftp_port = 6969
 let tftp_local = 50000
 
