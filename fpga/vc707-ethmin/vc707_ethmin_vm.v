@@ -71,6 +71,7 @@ module vc707_ethmin_vm (
 		else if (!(&button_hold)) button_hold <= button_hold + 16'd1;
 	end
 	wire resetn = rst_sys_n && (&button_hold);
+	wire [7:0] core_led;
 
 	wire eth_clk, rx_clk;
 	wire eth_rst = ~resetn;
@@ -127,6 +128,31 @@ module vc707_ethmin_vm (
 		.tx_axis_tlast(tx_tlast), .tx_axis_tready(tx_tready),
 		.tx_axis_tuser(tx_tuser),
 		.pcspma_status(pcspma_status),
-		.LED(LED), .DIP(GPIO_DIP_SW), .BTN(GPIO_SW), .UART_RX(UART_RX), .UART_TX(UART_TX));
+		.LED(core_led), .DIP(GPIO_DIP_SW), .BTN(GPIO_SW), .UART_RX(UART_RX), .UART_TX(UART_TX));
+
+	// Hardware heartbeat on LED7, independent of the VM.  The LEDs are otherwise
+	// written only by the loader running on the VM, so a dead board shows nothing
+	// whether the clock never started, the reset never released, or the VM is not
+	// executing.  This counter free-runs on clk_sys and is never reset, so:
+	//   no blink            clk_sys is not reaching the fabric
+	//   fast blink (~3 Hz)  the clock runs but resetn is still low
+	//   slow blink (~0.7 Hz) the clock runs and reset has released (at 50 MHz)
+	// It is ORed with the loader's own LED7 (a packet-count bit), and can be left
+	// out with -DNO_HEARTBEAT.  -DDEBUG_LEDS instead shows the reset chain, one
+	// signal per LED: 0 locked, 1 &button_hold, 2 button_sync[1] (CPU_RESET seen
+	// high), 3 resetn, 4 rst_sys_n, 5 the loader's LED0, 6 and 7 two blink rates.
+`ifdef DEBUG_LEDS
+	// Reset-chain probe: every LED shows one signal that decides resetn.
+	reg [25:0] hb_cnt = 26'd0;
+	always @(posedge clk_sys) hb_cnt <= hb_cnt + 26'd1;
+	assign LED = {hb_cnt[25], hb_cnt[22], core_led[0], rst_sys_n, resetn, button_sync[1], &button_hold, locked};
+`elsif NO_HEARTBEAT
+	assign LED = core_led;
+`else
+	reg [25:0] hb_cnt = 26'd0;
+	always @(posedge clk_sys) hb_cnt <= hb_cnt + 26'd1;
+	wire hb = resetn ? hb_cnt[25] : hb_cnt[23];
+	assign LED = {core_led[7] | hb, core_led[6:0]};
+`endif
 endmodule
 `default_nettype wire
