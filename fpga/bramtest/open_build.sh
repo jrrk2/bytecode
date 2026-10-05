@@ -40,7 +40,7 @@ mkdir -p "$WORK"
 # yosys and $readmemh both resolve paths against the working directory, and
 # the program images live beside the RTL, so build from a copy of this
 # directory with the converted VM added.
-cp "$HERE"/*.v "$WORK/"   # no SystemVerilog here, so no sv2v step
+cp "$HERE"/*.v "$HERE"/*.hex "$WORK/"   # no SystemVerilog here, so no sv2v step; the hex files are the 64K ROMs' contents
 
 SRCS="bramtest.v vc707_bramtest.v $ETH/simpleuart.v $ETH/clkgen_vc707.sv"
 

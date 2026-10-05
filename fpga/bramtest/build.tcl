@@ -7,6 +7,8 @@ set part xc7vx485tffg1761-2
 set here [file dirname [file normalize [info script]]]
 set repo [file normalize $here/../..]
 file mkdir out
+# $readmemh in bramtest.v resolves against the working directory: the 64K ROMs' contents
+foreach f {rom64k_w1.hex rom64k_w32.hex} { file copy -force $here/$f . }
 
 read_verilog [list $here/bramtest.v $here/vc707_bramtest.v \
     $repo/fpga/eth-rtl/simpleuart.v]

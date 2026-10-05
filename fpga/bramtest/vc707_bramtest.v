@@ -39,10 +39,11 @@ module vc707_bramtest (
 
 	// The shapes.  Depth is chosen so each is one RAMB36's worth at that
 	// width, which is what makes yosys pick the width mode under test.
-	localparam integer N = 10;
+	localparam integer N = 14;
 	wire [N-1:0] done, ok;
 	wire [8:0]   bad9;      // the x9 case's wrong bit positions
 	wire [31:0]  bad32;
+	wire [31:0]  bad32b;     // the 64K x32 RAM's wrong bit positions: which lane of the cascade failed
 
 	bram_case #(.WIDTH(1),  .AW(15), .ROM(0)) c0 (.clk(clk), .rst(rst), .done(done[0]), .ok(ok[0]), .badbits());
 	bram_case #(.WIDTH(2),  .AW(14), .ROM(0)) c1 (.clk(clk), .rst(rst), .done(done[1]), .ok(ok[1]), .badbits());
@@ -61,7 +62,21 @@ module vc707_bramtest (
 	bram_case #(.WIDTH(9),  .AW(11), .ROM(0)) c8 (.clk(clk), .rst(rst), .done(done[8]), .ok(ok[8]), .badbits());
 	bram_case #(.WIDTH(8),  .AW(11), .ROM(0)) c9 (.clk(clk), .rst(rst), .done(done[9]), .ok(ok[9]), .badbits());
 
-	assign LED = {&done, ok[9:8], ok[4:0]};
+	// 64K words deep: more than one RAMB36 holds at any width below 36, so the
+	// tools must chain RAMB36s through CASCADEOUT/CASCADEIN -- a x1 memory
+	// takes a cascaded PAIR, and the VM's 64K-word code and disk memories are
+	// 32 of those side by side.  c0..c9 each fit one RAMB36, so none of them
+	// ever asks for a cascade.  Rams and ROMs, x1 and the VM's own x32.
+	// The ROM cases load rom64k_w{1,32}.hex ($readmemh): a 64K-word initial loop
+	// takes yosys hours to evaluate.  The files are bram_case's own pattern(),
+	// dumped with $writememh(mem) from a ROM=1 instance in simulation.
+	bram_case #(.WIDTH(1),  .AW(16), .ROM(0)) c10 (.clk(clk), .rst(rst), .done(done[10]), .ok(ok[10]), .badbits());
+	bram_case #(.WIDTH(1),  .AW(16), .ROM(1), .INITFILE("rom64k_w1.hex")) c11 (.clk(clk), .rst(rst), .done(done[11]), .ok(ok[11]), .badbits());
+	bram_case #(.WIDTH(32), .AW(16), .ROM(0)) c12 (.clk(clk), .rst(rst), .done(done[12]), .ok(ok[12]), .badbits(bad32b));
+	bram_case #(.WIDTH(32), .AW(16), .ROM(1), .INITFILE("rom64k_w32.hex")) c13 (.clk(clk), .rst(rst), .done(done[13]), .ok(ok[13]), .badbits());
+
+	// LEDs: all done, the four 64K shapes, then the older groups ANDed
+	assign LED = {&done, ok[13:10], &ok[9:5], &ok[4:2], &ok[1:0]};
 
 	// ─── reporting ────────────────────────────────────────────────────────
 	// A tiny ROM of the text, walked a character at a time once everything
@@ -71,7 +86,7 @@ module vc707_bramtest (
 	initial for (i = 0; i < 256; i = i + 1) msg[i] = 8'h20;
 
 	// the x9 line carries three extra characters of detail
-	wire [5:0] linelen = (shape == 3) ? 6'd31 : 6'd26;
+	wire [5:0] linelen = (shape == 3) ? 6'd31 : (shape == 12) ? 6'd36 : 6'd26;
 	// "bram test: xNNxNNNNN rw ????\r\n" is built from parts below instead of
 	// a character ROM, to keep this readable.
 	reg [7:0] name [0:N*10-1];
@@ -97,6 +112,14 @@ module vc707_bramtest (
 			"x9 x2048  ";
 		{name[90],name[91],name[92],name[93],name[94],name[95],name[96],name[97],name[98],name[99]} =
 			"x8 x2048  ";
+		{name[100],name[101],name[102],name[103],name[104],name[105],name[106],name[107],name[108],name[109]} =
+			"x1 x64K   ";
+		{name[110],name[111],name[112],name[113],name[114],name[115],name[116],name[117],name[118],name[119]} =
+			"x1 rom64K ";
+		{name[120],name[121],name[122],name[123],name[124],name[125],name[126],name[127],name[128],name[129]} =
+			"x32x64K   ";
+		{name[130],name[131],name[132],name[133],name[134],name[135],name[136],name[137],name[138],name[139]} =
+			"x32rom64K ";
 	end
 
 	// One character at a time.  simpleuart's wait line is "strobe AND busy",
@@ -134,12 +157,17 @@ module vc707_bramtest (
 			// the x9 case also says which bit positions were wrong: bit 8
 			// lives in the parity memory, so "8 only" is a different fault
 			// from "all of them"
-			25: char_at = (sh == 3) ? " " : 8'h0d;
-			26: char_at = (sh == 3) ? "b" : 8'h0a;
-			27: char_at = hex({3'b0, bad9[8]});
-			28: char_at = hex(bad9[7:4]);
-			29: char_at = hex(bad9[3:0]);
-			30: char_at = 8'h0d;
+			25: char_at = (sh == 3 || sh == 12) ? " " : 8'h0d;
+			26: char_at = (sh == 3 || sh == 12) ? "b" : 8'h0a;
+			27: char_at = (sh == 12) ? hex(bad32b[31:28]) : hex({3'b0, bad9[8]});
+			28: char_at = (sh == 12) ? hex(bad32b[27:24]) : hex(bad9[7:4]);
+			29: char_at = (sh == 12) ? hex(bad32b[23:20]) : hex(bad9[3:0]);
+			30: char_at = (sh == 12) ? hex(bad32b[19:16]) : 8'h0d;
+			31: char_at = (sh == 12) ? hex(bad32b[15:12]) : 8'h0a;
+			32: char_at = hex(bad32b[11:8]);
+			33: char_at = hex(bad32b[7:4]);
+			34: char_at = hex(bad32b[3:0]);
+			35: char_at = 8'h0d;
 			default: char_at = 8'h0a;
 		endcase
 	endfunction

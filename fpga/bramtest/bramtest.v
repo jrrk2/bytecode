@@ -26,7 +26,9 @@
 module bram_case #(
 	parameter integer WIDTH = 1,       // bits per word
 	parameter integer AW    = 15,      // address bits (depth = 1 << AW)
-	parameter integer ROM   = 0        // 1: initialised, never written
+	parameter integer ROM   = 0,       // 1: initialised, never written
+	parameter INITFILE = ""          // ROM contents from a $readmemh file; a 64K-word
+	                                   // initial loop takes yosys hours to evaluate
 ) (
 	input  wire clk,
 	input  wire rst,
@@ -52,8 +54,10 @@ module bram_case #(
 	(* ram_style = "block" *) reg [WIDTH-1:0] mem [0:DEPTH-1];
 	integer i;
 	initial
-		if (ROM)
-			for (i = 0; i < DEPTH; i = i + 1) mem[i] = pattern(i[AW-1:0]);
+		if (ROM) begin
+			if (INITFILE != "") $readmemh(INITFILE, mem);
+			else for (i = 0; i < DEPTH; i = i + 1) mem[i] = pattern(i[AW-1:0]);
+		end
 
 	// Port A writes (unless this is a ROM), port B reads.  Port A never
 	// reads, so its READ_WIDTH is unset, and port B never writes, so its
