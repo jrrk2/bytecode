@@ -92,11 +92,15 @@ static long uart_rx(void) {
     const char *name = env_file("ETHMODEL_UART_INPUT");
     uart_in = name ? fopen(name, "rb") : NULL;
     uart_in_opened = 1;
+    // after a chain load the new program carries on from where the old one stopped reading
+    const char *skip = getenv("ETHMODEL_UART_SKIP");
+    if (uart_in && skip) fseek(uart_in, atol(skip), SEEK_SET);
   }
   int c = uart_in ? fgetc(uart_in) : EOF;
   if (c == EOF) { uart_in_eof_reads++; return -1; }
   return c;
 }
+long ethmodel_uart_consumed(void) { return uart_in ? ftell(uart_in) : 0; }
 static uint8_t rxbuf[WINDOW], txbuf[WINDOW];
 static char uart_line[256];
 static int uart_len;

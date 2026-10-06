@@ -10,3 +10,4 @@ io_write 0x1005 (48 + fact 4 mod 10)
 io_write 0x1005 10
 image_end 0
 files 0
+boot_file "t.img"

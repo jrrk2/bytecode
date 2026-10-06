@@ -2961,6 +2961,17 @@ let img_end (_n : int) =
 
 let () = img_end_hook := img_end
 
+(* Chain load the image in a file on the RAM disk: the boot sequencer takes the
+   byte offset in the disk where the image's header is (0x100e), replaces the
+   program with it and restarts the machine; the disk is left as it is, so what
+   was compiled is still there to be read.  Returns only if there is no such file. *)
+let boot_disk = 0x100e
+let boot_file (nm : string) =
+  let _ = rfs_ready () in
+  let k = rfs_find nm in
+  if k < 0 then 0 - 1
+  else begin io_write boot_disk (rfs_offset k); 0 end
+
 (* ---- NFS, straight into the RAM disk ----
    ONC RPC over UDP: portmap for mountd, mount for the root handle,
    portmap for nfsd, look the name up in it, then read it in chunks.  Each
@@ -3391,6 +3402,7 @@ let builtins =
     ("nfs_server", 1, TArrow (TString, TInt));
     ("nfs_fetch", 2, TArrow (TString, TArrow (TString, TInt)));
     ("nfs_done", 1, TArrow (TInt, TInt));
+    ("boot_file", 1, TArrow (TString, TInt));
     ("image_begin", 1, TArrow (TString, TInt));
     ("image_end", 1, TArrow (TInt, TInt)) ]
 
@@ -4149,6 +4161,7 @@ let () =
     install_fn "nfs_fetch"
       (magic (fun (e : string) (f : string) -> nfs_start e f));
     install_fn "nfs_done" (magic (fun (_n : int) -> !nfs_result));
+    install_fn "boot_file" (magic (fun (a : string) -> boot_file a));
     install_fn "image_begin" (magic (fun (a : string) -> img_begin a));
     install_fn "image_end" (magic (fun (n : int) -> img_end n))
   end;

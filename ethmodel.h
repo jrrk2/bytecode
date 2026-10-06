@@ -8,6 +8,8 @@ extern "C" {
 #endif
 
 long ethmodel_read(long addr);
+// How many bytes of $ETHMODEL_UART_INPUT the program has read (for a chain load).
+long ethmodel_uart_consumed(void);
 void ethmodel_write(long addr, long data);
 // True once every canned frame has been taken and the program has polled an
 // idle status a few times: ethmin never halts on its own.

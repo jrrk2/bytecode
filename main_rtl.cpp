@@ -1,3 +1,7 @@
+#include <unistd.h>
+#include <sys/stat.h>
+#include <string>
+#include <vector>
 #include "Vocaml4142_vm_rtl.h"
 #include <cmath>
 #include <cstring>
@@ -164,11 +168,97 @@ const char *statenam(int state)
     }
 }
 
+// BOOT from the RAM disk (0x100e, written with the image's byte offset in the disk).  What the
+// hardware does is load the image's code, heap and globals into the machine and restart it, with
+// the RAM disk untouched.  Here the machine is this process, so it does the same by starting
+// itself again: the disk is saved to its backing file, the image is written out as a bytecode
+// file plus heap and globals hex (the form the model runs), and the UART input carries on where
+// this program stopped reading.
+static int g_argc; static char **g_argv;
+
+static uint16_t crc16_ccitt(const uint8_t *p, size_t n) {
+    uint16_t c = 0xFFFF;
+    for (size_t i = 0; i < n; i++) {
+        c ^= (uint16_t)p[i] << 8;
+        for (int b = 0; b < 8; b++) c = (c & 0x8000) ? (uint16_t)((c << 1) ^ 0x1021) : (uint16_t)(c << 1);
+    }
+    return c;
+}
+
+static void put_be32(std::string &s, uint32_t v) { for (int i = 3; i >= 0; i--) s.push_back((char)(v >> (8 * i))); }
+
+static void boot_from_disk(uint32_t off) {
+    if ((size_t)off + 32 > sizeof(disk_ram)) { printf("BOOT: offset %u is off the disk\n", off); return; }
+    const uint8_t *h = disk_ram + off;
+    auto rd32 = [&](uint32_t o) { return (uint32_t)h[o] | (uint32_t)h[o + 1] << 8 | (uint32_t)h[o + 2] << 16 | (uint32_t)h[o + 3] << 24; };
+    if (rd32(0) != 0x4D56434Fu || rd32(4) != 1) { printf("BOOT: no image at %u\n", off); return; }
+    uint32_t cw = rd32(8), hw = rd32(12), gw = rd32(16), crc = rd32(24);
+    size_t body = 4 * ((size_t)cw + hw + gw);
+    if ((size_t)off + 32 + body > sizeof(disk_ram)) { printf("BOOT: the image runs past the disk\n"); return; }
+    if (crc16_ccitt(h + 32, body) != (crc & 0xFFFF)) { printf("BOOT: CRC mismatch\n"); return; }
+    if (!Verilated::commandArgsPlusMatch("notrace")[0]) { printf("BOOT from the disk needs +notrace\n"); return; }
+
+    // the running program's PRIM section: the image's C calls number the same primitives
+    std::string prim;
+    {
+        FILE *f = fopen(g_argv[1], "rb");
+        if (!f) { printf("BOOT: cannot read %s\n", g_argv[1]); return; }
+        std::string d; char buf[65536]; size_t n;
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0) d.append(buf, n);
+        fclose(f);
+        auto be32 = [&](size_t o) { return (uint32_t)(uint8_t)d[o] << 24 | (uint32_t)(uint8_t)d[o + 1] << 16 | (uint32_t)(uint8_t)d[o + 2] << 8 | (uint8_t)d[o + 3]; };
+        size_t len = d.size(); uint32_t ns = be32(len - 16);
+        size_t table = len - 16 - 8 * (size_t)ns, total = 0;
+        for (uint32_t i = 0; i < ns; i++) total += be32(table + 8 * i + 4);
+        size_t pos = table - total; bool found = false;
+        for (uint32_t i = 0; i < ns; i++) {
+            uint32_t sz = be32(table + 8 * i + 4);
+            if (d.compare(table + 8 * i, 4, "PRIM") == 0) { prim = d.substr(pos, sz); found = true; }
+            pos += sz;
+        }
+        if (!found) { printf("BOOT: no PRIM section in %s\n", g_argv[1]); return; }
+    }
+    char dir[64]; snprintf(dir, sizeof dir, "/tmp/ocvm_boot_%d", (int)getpid());
+    mkdir(dir, 0700);
+    std::string dp = std::string(dir) + "/";
+    std::string bc((const char *)(h + 32), 4 * (size_t)cw);
+    std::string trailer = bc + prim + std::string(4, '\0');
+    std::string table;
+    table += "CODE"; put_be32(table, 4 * cw);
+    table += "PRIM"; put_be32(table, (uint32_t)prim.size());
+    table += "DATA"; put_be32(table, 4);
+    std::string file = trailer + table; put_be32(file, 3); file += "Caml1999X031";
+    { FILE *f = fopen((dp + "prog.bc").c_str(), "wb"); fwrite(file.data(), 1, file.size(), f); fclose(f); }
+    auto hex = [&](const char *name, size_t first, uint32_t n) {
+        FILE *f = fopen((dp + name).c_str(), "w");
+        for (uint32_t i = 0; i < n; i++) fprintf(f, "%08x\n", rd32((uint32_t)(32 + 4 * (first + i))));
+        fclose(f);
+    };
+    hex("heap.hex", cw, hw); hex("globals.hex", (size_t)cw + hw, gw);
+    // the disk outlives the chain load
+    std::string diskfile = (disk_path && *disk_path) ? std::string(disk_path) : dp + "disk.bin";
+    { FILE *f = fopen(diskfile.c_str(), "wb"); if (f) { fwrite(disk_ram, 1, sizeof(disk_ram), f); fclose(f); } }
+    setenv("ETHMODEL_UART_SKIP", std::to_string(ethmodel_uart_consumed()).c_str(), 1);
+
+    std::vector<std::string> args = { g_argv[0], dp + "prog.bc", "+notrace", "+heap=" + dp + "heap.hex",
+        "+globals=" + dp + "globals.hex", "+heap_words=" + std::to_string(hw), "+disk=" + diskfile };
+    for (int i = 2; i < g_argc; i++) {          // whatever else was asked for, but not what is being replaced
+        std::string a = g_argv[i];
+        if (a.rfind("+heap=", 0) && a.rfind("+globals=", 0) && a.rfind("+heap_words=", 0) && a.rfind("+disk=", 0) && a != "+notrace" && a[0] == '+') args.push_back(a);
+    }
+    std::vector<char *> av; for (auto &a : args) av.push_back(const_cast<char *>(a.c_str())); av.push_back(nullptr);
+    printf("BOOT from the disk: %u code, %u heap, %u globals words\n", cw, hw, gw);
+    fflush(stdout);
+    execv(g_argv[0], av.data());
+    perror("execv");
+}
+
 typedef char linbuf[256];
 
 linbuf trace[4096];
 
 int main(int argc, char** argv) {
+    g_argc = argc; g_argv = argv;
     Verilated::commandArgs(argc, argv);
 
     // With +notrace there is nothing to diverge from: a program that writes
@@ -273,6 +363,9 @@ int main(int argc, char** argv) {
                 uint32_t off = a - 0x100000;
                 if (top->trap_prim == 2) disk_ram[off] = (uint8_t)top->trap_arg1;
                 else top->trap_result = disk_ram[off];
+            } else if (a == 0x100e) {
+                if (top->trap_prim == 2) boot_from_disk((uint32_t)top->trap_arg1);
+                else top->trap_result = 0;
             } else if (a == 0x100d) {
                 if (top->trap_prim == 1) top->trap_result = sizeof(disk_ram);
             } else if (a == 0x100c) {
