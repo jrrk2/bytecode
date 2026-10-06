@@ -525,7 +525,7 @@ let keyword s = string_equal s "try" || string_equal s "with"
                 || string_equal s "let" || string_equal s "rec" || string_equal s "in"
                 || string_equal s "if" || string_equal s "then" || string_equal s "else"
                 || string_equal s "fun" || string_equal s "true" || string_equal s "false"
-                || string_equal s "mod"
+                || string_equal s "mod" || string_equal s "begin" || string_equal s "end"
 
 let is_sym t s = match t with TSym x -> string_equal x s | _ -> false
 let is_kw t s = match t with TId x -> string_equal x s | _ -> false
@@ -548,9 +548,25 @@ let expect toks s = match toks with
   | t :: rest -> if is_sym t s || is_kw t s then Ok rest else Err ("expected " ^^ s)
   | [] -> Err ("expected " ^^ s)
 
-(* parameters x y z, then a body: fun x -> fun y -> ... *)
+(* skip a type written after a colon, up to the parenthesis that closes
+   its group: "(x : int -> int)" and "(f : (int -> int) list)" *)
+let rec skip_ty toks depth = match toks with
+  | [] -> None
+  | t :: rest ->
+    if is_sym t "(" then skip_ty rest (depth + 1)
+    else if is_sym t ")" then (if depth = 1 then Some rest else skip_ty rest (depth - 1))
+    else skip_ty rest depth
+
+(* parameters x y z, then a body: fun x -> fun y -> ...  A () parameter is a
+   name nothing uses (there is no unit: it is the 0 that a call passes), and
+   a type annotation on a parameter, (x : t), is read and dropped. *)
 let rec params toks acc = match toks with
   | TId x :: rest when not (keyword x) -> params rest (x :: acc)
+  | t :: t2 :: rest when is_sym t "(" && is_sym t2 ")" -> params rest ("_u" :: acc)
+  | t :: TId x :: t3 :: rest when is_sym t "(" && is_sym t3 ":" && not (keyword x) ->
+    (match skip_ty rest 1 with
+     | Some r -> params r (x :: acc)
+     | None -> (acc, toks))
   | _ -> (acc, toks)
 
 let rec wrap_funs ps body = match ps with
@@ -593,6 +609,7 @@ and parse_pat_atom toks = match toks with
   | t :: t2 :: rest when is_sym t "[" && is_sym t2 "]" -> Ok (PCon ("[]", []), rest)
   | t :: rest when is_sym t "[" -> parse_pat_list rest
   | t :: rest when is_sym t "{" -> parse_pat_rec rest []
+  | t :: t2 :: rest when is_sym t "(" && is_sym t2 ")" -> Ok (PWild, rest)
   | t :: rest when is_sym t "(" ->
     (match parse_pat rest with
      | Err e -> Err e
@@ -648,18 +665,19 @@ let rec parse_expr toks = match toks with
          match parse_expr rest with
          | Err e -> Err e
          | Ok (a, rest) ->
-           match expect rest "else" with
-           | Err e -> Err e
-           | Ok rest ->
-             match parse_expr rest with
-             | Err e -> Err e
-             | Ok (b, rest) -> Ok (If (c, a, b), rest))
+           (* "if c then e" with no else is the 0 that stands for unit *)
+           match rest with
+           | t2 :: rest2 when is_kw t2 "else" ->
+             (match parse_expr rest2 with
+              | Err e -> Err e
+              | Ok (b, rest3) -> Ok (If (c, a, b), rest3))
+           | _ -> Ok (If (c, a, Int 0), rest))
   (* try e with _ -> e2, or "with x -> e2" to bind the failure's message:
      an error anywhere in e -- division by zero, an unbound name, a bad
      operand -- gives e2 instead.  The machine's own exceptions are what
      this is built on: see io/exc.ml. *)
   | t :: rest when is_kw t "try" ->
-    (match parse_expr rest with
+    (match parse_seq rest with
      | Err e -> Err e
      | Ok (body, rest) ->
        match expect rest "with" with
@@ -672,7 +690,7 @@ let rec parse_expr toks = match toks with
          match expect rest "->" with
          | Err e -> Err e
          | Ok rest ->
-           match parse_expr rest with
+           match parse_seq rest with
            | Err e -> Err e
            | Ok (handler, rest) -> Ok (Try (body, name, handler), rest))
   | t :: rest when is_kw t "match" ->
@@ -694,10 +712,29 @@ let rec parse_expr toks = match toks with
        match expect rest "->" with
        | Err e -> Err e
        | Ok rest ->
-         match parse_expr rest with
+         match parse_seq rest with
          | Err e -> Err e
          | Ok (body, rest) -> Ok (wrap_funs ps body, rest))
   | _ -> parse_cmp toks
+
+(* e1; e2 -- a sequence is a let whose name nothing uses.  It sits below
+   everything else, as in OCaml: "if c then a; b" is (if c then a); b, while the
+   bodies of let, fun, match arms and try, and what is in parentheses or
+   begin..end, take the whole sequence.  A ; before a closing token is allowed. *)
+and parse_seq toks =
+  match parse_expr toks with
+  | Err e -> Err e
+  | Ok (e, rest) ->
+    match rest with
+    | t :: rest2 when is_sym t ";" ->
+      (match rest2 with
+       | [] -> Ok (e, rest2)
+       | t2 :: _ when is_kw t2 "end" || is_kw t2 "in" || is_sym t2 ")" || is_sym t2 "|" -> Ok (e, rest2)
+       | _ ->
+         match parse_seq rest2 with
+         | Err m -> Err m
+         | Ok (e2, rest3) -> Ok (Let (false, "_", e, e2), rest3))
+    | _ -> Ok (e, rest)
 
 (* let [rec] f x y = e [in e]; with need_in false, "in" is optional (top level) *)
 and parse_let toks need_in =
@@ -710,13 +747,13 @@ and parse_let toks need_in =
     (match expect rest "=" with
      | Err e -> Err e
      | Ok rest ->
-       match parse_expr rest with
+       match parse_seq rest with
        | Err e -> Err e
        | Ok (bound, rest) ->
          let bound = wrap_funs ps bound in
          match rest with
          | t :: rest when is_kw t "in" ->
-           (match parse_expr rest with
+           (match parse_seq rest with
             | Err e -> Err e
             | Ok (body, rest) -> Ok (Let (recursive, name, bound, body), rest))
          | _ -> if need_in then Err "expected in"
@@ -730,7 +767,7 @@ and parse_arms toks acc =
     match expect rest "->" with
     | Err e -> Err e
     | Ok rest ->
-      match parse_expr rest with
+      match parse_seq rest with
       | Err e -> Err e
       | Ok (body, rest) ->
         match rest with
@@ -854,8 +891,15 @@ and parse_atom toks = match toks with
   (* () is the argument of a niladic builtin such as ms (); the language has
      no unit, so it is 0 *)
   | t :: t2 :: rest when is_sym t "(" && is_sym t2 ")" -> Ok (Int 0, rest)
+  | t :: rest when is_kw t "begin" ->
+    (match parse_seq rest with
+     | Err e -> Err e
+     | Ok (e, rest2) ->
+       match rest2 with
+       | t2 :: rest3 when is_kw t2 "end" -> Ok (e, rest3)
+       | _ -> Err "expected end")
   | t :: rest when is_sym t "(" ->
-    (match parse_expr rest with
+    (match parse_seq rest with
      | Err e -> Err e
      | Ok (e, rest) -> parse_tuple_rest [e] rest)
   | _ -> Err "syntax error"
@@ -3069,7 +3113,7 @@ let evaluate_line () =
       let top_let = match toks with t :: _ -> is_kw t "let" | [] -> false in
       let parsed = match toks with
         | t :: rest when is_kw t "let" -> parse_let rest false
-        | _ -> parse_expr toks in
+        | _ -> parse_seq toks in
       match parsed with
       | Err m -> puts "error: "; puts m; newline ()
       | Ok (_, _ :: _) -> puts "error: unexpected input at the end"; newline ()
