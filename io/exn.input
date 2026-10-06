@@ -1,0 +1,17 @@
+external raise : exn -> 'a = "%raise"
+let d a b = try a / b with Division_by_zero -> 0 - 1
+d 10 0
+let nf n = try (if n > 0 then raise Not_found else 5) with Not_found -> 7
+nf 1
+nf 0
+let m n = try (if n = 1 then raise Not_found else 1 / 0) with | Not_found -> 100 | Division_by_zero -> 200
+m 1
+m 2
+let ia n = try (if n = 1 then raise (Invalid_argument "boom") else 3) with Invalid_argument s -> string_length s
+external string_length : string -> int = "%string_length"
+let ia n = try (if n = 1 then raise (Invalid_argument "boom") else 3) with Invalid_argument s -> string_length s
+ia 1
+ia 0
+let st n = try (if n = 1 then raise Stack_overflow else 3) with Stack_overflow -> 8 | Out_of_memory -> 9
+st 1
+st 0

@@ -333,8 +333,32 @@ static void dhcp_server(const uint8_t *b, int len) {
   if (!rx_valid && !frame_mode) load_next_frame();
 }
 
+// The RAM disk at 0x100000, for the host runner: the Verilator model keeps its own in main_rtl.cpp, which
+// answers these addresses before they get here.  $ETHMODEL_DISK names a backing file: read at the first
+// access and written at exit, so what a program leaves on the disk can be looked at, and a program can
+// be given files to read.
+enum { DISK_BASE = 0x100000, DISK_SIZE = 0x80000, DISK_SIZE_REG = 0x100d };
+static uint8_t disk[DISK_SIZE];
+static int disk_ready;
+static void disk_save(void) {
+  const char *p = getenv("ETHMODEL_DISK");
+  if (p && *p) { FILE *f = fopen(p, "wb"); if (f) { fwrite(disk, 1, sizeof disk, f); fclose(f); } }
+}
+static void disk_init(void) {
+  if (disk_ready) return;
+  disk_ready = 1;
+  const char *p = getenv("ETHMODEL_DISK");
+  if (p && *p) {
+    FILE *f = fopen(p, "rb");
+    if (f) { size_t n = fread(disk, 1, sizeof disk, f); (void)n; fclose(f); }
+    atexit(disk_save);
+  }
+}
+
 long ethmodel_read(long a) {
   init();
+  if (a >= DISK_BASE && a < DISK_BASE + DISK_SIZE) { disk_init(); return disk[a - DISK_BASE]; }
+  if (a == DISK_SIZE_REG) return DISK_SIZE;
   if (a >= RX_BASE && a < RX_BASE + WINDOW) return rxbuf[a - RX_BASE];
   if (a >= TX_BASE && a < TX_BASE + WINDOW) return txbuf[a - TX_BASE];
   if (a >= STAGE_BASE && a < STAGE_BASE + STAGE_SIZE) return stage[a - STAGE_BASE];
@@ -354,6 +378,7 @@ long ethmodel_read(long a) {
 
 void ethmodel_write(long a, long d) {
   init();
+  if (a >= DISK_BASE && a < DISK_BASE + DISK_SIZE) { disk_init(); disk[a - DISK_BASE] = (uint8_t)d; return; }
   if (a >= TX_BASE && a < TX_BASE + WINDOW) { txbuf[a - TX_BASE] = (uint8_t)d; return; }
   if (a >= STAGE_BASE && a < STAGE_BASE + STAGE_SIZE) { stage[a - STAGE_BASE] = (uint8_t)d; return; }
   switch (a) {

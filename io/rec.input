@@ -1,0 +1,16 @@
+let rec even n = if n = 0 then true else odd (n - 1) and odd n = if n = 0 then false else even (n - 1)
+even 10
+odd 7
+odd 10
+let loc n = let rec ev i = if i = 0 then true else od (i - 1) and od i = if i = 0 then false else ev (i - 1) in ev n
+loc 8
+loc 7
+let cap k n = let rec ev i = if i = 0 then k else od (i - 1) and od i = if i = 0 then 0 else ev (i - 1) in ev n
+cap 5 4
+cap 5 3
+let fact n = let rec go i acc = if i > n then acc else go (i + 1) (acc * i) in go 1 1
+fact 5
+let sumto n = let rec s i = if i = 0 then 0 else i + s (i - 1) in s n
+sumto 100
+let two a = let rec f i = if i = 0 then a else g (i - 1) and g i = f i + 1 in f 3
+two 10

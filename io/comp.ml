@@ -132,7 +132,8 @@ let uart_ip a =
 
 (* ---- the line being evaluated (the tokenizer reads it) ---- *)
 let line_max = 120
-let line = create_bytes line_max
+(* the line being compiled: 120 bytes from the UART, a larger buffer while a source file is read *)
+let line = ref (create_bytes line_max)
 let line_len = ref 0
 
 (* ---- DHCP state ---- *)
@@ -394,11 +395,11 @@ let is_hex c = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <=
 let hex_val c = if c <= 57 then c - 48 else if c >= 97 then c - 87 else c - 55
 let is_alpha c = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c = 95
 let is_space c = c = 32 || c = 9
-let char_at i = int_of_char (bytes_get line i)
+let char_at i = int_of_char (bytes_get !line i)
 
 let substring from upto =
   let b = create_bytes (upto - from) in
-  for i = from to upto - 1 do bytes_set b (i - from) (bytes_get line i) done;
+  for i = from to upto - 1 do bytes_set b (i - from) (bytes_get !line i) done;
   bytes_to_string b
 
 (* two-character operators first, then one *)
@@ -463,7 +464,7 @@ let tokenize () =
            one stands for itself, which covers the quote and the backslash.
            Escapes change the length, so it is built in a buffer rather
            than cut out of the line. *)
-        let b = create_bytes line_max and n = ref 0 and j = ref (i + 1) in
+        let b = create_bytes (!line_len + 1) and n = ref 0 and j = ref (i + 1) in
         while !j < !line_len && char_at !j <> 34 do
           let ch = char_at !j in
           if ch = 92 && !j + 1 < !line_len then begin
@@ -533,6 +534,11 @@ type expr =
   | While of expr * expr                  (* while c do b done *)
   | ArrLit of expr list                   (* [| a; b; c |] *)
   | Guard of expr * expr                  (* the body of a match arm that has a when: guard, body *)
+  | LetRecs of (string * expr) list * expr   (* let rec f = ... and g = ... in body *)
+  | ExnIs of string * expr                (* is this exception that predefined one: Stack_overflow, Not_found, ... *)
+  | ExnVal of string                      (* a predefined exception as a value: the global that holds it *)
+  | ExnArg of expr                        (* the argument of an exception that carries one *)
+  | Reraise of expr
   | For of string * expr * expr * bool * expr   (* for x = lo to hi do b done: up?, or downto *)
 and pat =
   | PWild
@@ -552,6 +558,17 @@ type tyexp =
   | TEArrow of tyexp * tyexp
   | TETuple of tyexp list
 
+(* how many arguments each constructor takes, kept here as well as in the type tables below
+   because the parser needs it: Ok (a, b, c) is one argument that is a tuple, where a constructor
+   declared with C of a * b * c takes three *)
+let ctor_arities : (string * int) list ref = ref [("[]", 0); ("::", 2); ("None", 0); ("Some", 1)]
+
+let rec early_arity c l = match l with
+  | [] -> 0 - 1
+  | (n, a) :: r -> if string_equal n c then a else early_arity c r
+
+let rec wilds n = if n <= 0 then [] else PWild :: wilds (n - 1)
+
 let keyword s = string_equal s "try" || string_equal s "with"
                 || string_equal s "match" || string_equal s "type" || string_equal s "of"
                 || string_equal s "let" || string_equal s "rec" || string_equal s "in"
@@ -568,6 +585,7 @@ let is_sym t s = match t with TSym x -> string_equal x s | _ -> false
 let is_kw t s = match t with TId x -> string_equal x s | _ -> false
 
 let rec rev_acc l acc = match l with [] -> acc | x :: r -> rev_acc r (x :: acc)
+let rec count_list l = match l with [] -> 0 | _ :: r -> 1 + count_list r
 let rec apps f l = match l with [] -> f | a :: r -> apps (App (f, a)) r
 (* a constructor starts with a capital, a type variable with a quote *)
 let is_ctor s =
@@ -590,7 +608,12 @@ let tok_str t = match t with
   | TSym x -> x
 
 let found toks = match toks with
-  | t :: _ -> " but found " ^^ tok_str t
+  | t :: r ->
+    (* the token it stopped at, and the next few, so a long phrase can be located *)
+    let rec more l n = match l with
+      | x :: rest when n > 0 -> " " ^^ tok_str x ^^ more rest (n - 1)
+      | _ -> "" in
+    " but found " ^^ tok_str t ^^ more r 4
   | [] -> " but the line ended"
 
 let expect toks s = match toks with
@@ -602,6 +625,10 @@ let user_cmp_op op =
   string_length op > 1
   && (let c = int_of_char (string_get op 0) in c = 60 || c = 62 || c = 61)
   && not (string_equal op "<>" || string_equal op "<=" || string_equal op ">=" || string_equal op "<-")
+
+let is_op_name toks = match toks with
+  | t :: TSym _ :: t2 :: _ -> is_sym t "(" && is_sym t2 ")"
+  | _ -> false
 
 (* skip a type written after a colon, up to the parenthesis that closes
    its group: "(x : int -> int)" and "(f : (int -> int) list)" *)
@@ -644,7 +671,11 @@ and parse_pat_app toks = match toks with
     if starts_pat rest then
       (match parse_pat_atom rest with
        | Err e -> Err e
-       | Ok (a, rest2) -> Ok (PCon (c, (match a with PTuple l -> l | _ -> [a])), rest2))
+       | Ok (a, rest2) ->
+         Ok (PCon (c, (match a with
+                       | PTuple l when early_arity c !ctor_arities <> 1 -> l
+                       | PWild when early_arity c !ctor_arities > 1 -> wilds (early_arity c !ctor_arities)
+                       | _ -> [a])), rest2))
     else Ok (PCon (c, []), rest)
   | _ -> parse_pat_atom toks
 
@@ -738,6 +769,15 @@ let rec parse_expr toks = match toks with
        match expect rest "with" with
        | Err e -> Err e
        | Ok rest ->
+         let rest = match rest with t2 :: r when is_sym t2 "|" -> r | _ -> rest in
+         match rest with
+         | TId c :: _ when is_ctor c ->
+           (* try e with | Not_found -> a | Invalid_argument _ -> b: the handler tests the
+              exception against the predefined ones in turn and raises it again if none is it *)
+           (match parse_exn_arms rest with
+            | Err e -> Err e
+            | Ok (chain, rest) -> Ok (Try (body, "_exn", chain), rest))
+         | _ ->
          let (name, rest) = match rest with
            | TId x :: r when not (keyword x) -> (x, r)
            | TSym x :: r when string_equal x "_" -> ("_", r)
@@ -749,7 +789,7 @@ let rec parse_expr toks = match toks with
            | Err e -> Err e
            | Ok (handler, rest) -> Ok (Try (body, name, handler), rest))
   | t :: rest when is_kw t "match" ->
-    (match parse_expr rest with
+    (match parse_scrut rest with
      | Err e -> Err e
      | Ok (scrut, rest) ->
        match expect rest "with" with
@@ -845,6 +885,25 @@ and parse_let toks need_in =
   let (recursive, toks) = match toks with
     | t :: rest when is_kw t "rec" -> (true, rest)
     | _ -> (false, toks) in
+  match toks with
+  | t :: _ when is_sym t "(" && not (is_op_name toks) ->
+    (* let (a, b) = e in body: a match with the one arm.  let () = e at the top level is e. *)
+    (match parse_pat toks with
+     | Err e -> Err e
+     | Ok (pat, rest) ->
+       match expect rest "=" with
+       | Err e -> Err e
+       | Ok rest ->
+         match parse_seq rest with
+         | Err e -> Err e
+         | Ok (e1, rest) ->
+           match rest with
+           | t2 :: r when is_kw t2 "in" ->
+             (match parse_seq r with
+              | Err e -> Err e
+              | Ok (body, rest) -> Ok (Match (e1, [(pat, body)]), rest))
+           | _ -> if need_in then Err ("expected in" ^^ found rest) else Ok (e1, rest))
+  | _ ->
   match parse_binding toks with
   | Err e -> Err e
   | Ok (name, bound, rest) ->
@@ -852,7 +911,17 @@ and parse_let toks need_in =
     | t :: rest2 when is_kw t "and" ->
       (* let a = e1 and b = e2 in body: the bindings do not see each other, so these are
          taken in turn; a mutually recursive let rec is not compiled yet *)
-      if recursive then Err "let rec ... and is not compiled yet"
+      if recursive then
+        (match parse_and_bindings rest2 [] with
+         | Err e -> Err e
+         | Ok (more, rest3) ->
+           let group = (name, bound) :: more in
+           match rest3 with
+           | t3 :: rest4 when is_kw t3 "in" ->
+             (match parse_seq rest4 with
+              | Err e -> Err e
+              | Ok (body, rest5) -> Ok (LetRecs (group, body), rest5))
+           | _ -> if need_in then Err ("expected in" ^^ found rest3) else Ok (LetRecs (group, Var name), rest3))
       else
         (match parse_and_bindings rest2 [] with
          | Err e -> Err e
@@ -910,8 +979,67 @@ and parse_and_bindings toks acc =
     | t :: rest2 when is_kw t "and" -> parse_and_bindings rest2 ((n, b) :: acc)
     | _ -> Ok (rev_acc ((n, b) :: acc) [], rest)
 
-and parse_arms toks acc =
+and parse_exn_arms toks =
+  match toks with
+  | TId c :: rest when is_ctor c ->
+    let (arg, rest) = match rest with
+      | TId a :: r when not (keyword a) && not (is_ctor a) -> (Some a, r)
+      | TSym a :: r when string_equal a "_" -> (None, r)
+      | _ -> (None, rest) in
+    (match expect rest "->" with
+     | Err e -> Err e
+     | Ok rest ->
+       match parse_seq rest with
+       | Err e -> Err e
+       | Ok (h, rest) ->
+         let h = match arg with Some v -> Let (false, v, ExnArg (Var "_exn"), h) | None -> h in
+         match rest with
+         | t :: more when is_sym t "|" ->
+           (match parse_exn_arms more with
+            | Err e -> Err e
+            | Ok (tail, rest2) -> Ok (If (ExnIs (c, Var "_exn"), h, tail), rest2))
+         | _ -> Ok (If (ExnIs (c, Var "_exn"), h, Reraise (Var "_exn")), rest))
+  | _ ->
+    (* a last arm that takes anything: _ -> e, or a name -> e *)
+    (match toks with
+     | TId _ :: r -> (match expect r "->" with Err e -> Err e | Ok rest -> parse_seq rest)
+     | TSym _ :: r -> (match expect r "->" with Err e -> Err e | Ok rest -> parse_seq rest)
+     | _ -> Err ("expected an exception pattern" ^^ found toks))
+
+(* match a, b with: the scrutinee is a tuple without its parentheses *)
+and parse_scrut toks =
+  match parse_expr toks with
+  | Err e -> Err e
+  | Ok (e, rest) ->
+    match rest with
+    | t :: _ when is_sym t "," ->
+      let rec more acc r = match r with
+        | t2 :: r2 when is_sym t2 "," ->
+          (match parse_expr r2 with
+           | Err m -> Err m
+           | Ok (e2, r3) -> more (e2 :: acc) r3)
+        | _ -> Ok (Tuple (rev_acc acc []), r) in
+      more [e] rest
+    | _ -> Ok (e, rest)
+
+(* a pattern, and any , patterns after it: | Ok a, Err b -> ... *)
+and parse_pat_tup toks =
   match parse_pat toks with
+  | Err e -> Err e
+  | Ok (q, rest) ->
+    match rest with
+    | t :: _ when is_sym t "," ->
+      let rec more acc r = match r with
+        | t2 :: r2 when is_sym t2 "," ->
+          (match parse_pat r2 with
+           | Err m -> Err m
+           | Ok (q2, r3) -> more (q2 :: acc) r3)
+        | _ -> Ok (PTuple (rev_acc acc []), r) in
+      more [q] rest
+    | _ -> Ok (q, rest)
+
+and parse_arms toks acc =
+  match parse_pat_tup toks with
   | Err e -> Err e
   | Ok (q, rest) ->
     (* A | B -> e: alternatives that share a body are one arm each, with the body repeated *)
@@ -1073,7 +1201,9 @@ and app_more f toks =
     | Err e -> Err e
     | Ok (a, rest) ->
       let applied = match f with
-        | Con (c, []) -> Con (c, (match a with Tuple l -> l | _ -> [a]))
+        | Con (c, []) -> Con (c, (match a with
+                                  | Tuple l when early_arity c !ctor_arities <> 1 -> l
+                                  | _ -> [a]))
         | _ -> App (f, a) in
       app_more applied rest
   else Ok (f, toks)
@@ -1119,6 +1249,14 @@ and parse_atom toks = match toks with
            match r with
            | Record fs -> Ok (With (base, fs), rest4)
            | _ -> Err "expected fields after with")
+  | TSym x :: rest when string_equal x "~-." ->
+    (match parse_atom rest with
+     | Err e -> Err e
+     | Ok (a, rest) -> Ok (Binop ("-.", Float 0.0, a), rest))
+  | TSym x :: rest when string_equal x "~-" ->
+    (match parse_atom rest with
+     | Err e -> Err e
+     | Ok (a, rest) -> Ok (Binop ("-", Int 0, a), rest))
   | TSym s :: TFloat f :: rest when string_equal s "-" -> Ok (Float (~-. f), rest)
   | TSym s :: rest when string_equal s "-" ->
     (match parse_atom rest with
@@ -1243,6 +1381,9 @@ and ty_paren acc toks = match toks with
 
 (* type 'a option = None | Some of 'a  -- the name, its parameters, and a
    constructor list, each with the types of its arguments *)
+(* type t = <a type expression>: an abbreviation, which is expanded where it is used *)
+let aliases : (string * (string list * tyexp)) list ref = ref []
+
 let parse_typedecl toks =
   let (ps, toks) = match toks with
     | TId v :: rest when is_tyvar v -> ([v], rest)
@@ -1259,6 +1400,19 @@ let parse_typedecl toks =
      | Err e -> Err e
      | Ok rest ->
        match rest with
+       | TId first :: _ when not (is_ctor first) && not (keyword first) ->
+         (* an abbreviation, type t = int list *)
+         (match parse_tyexp rest with
+          | Err e -> Err e
+          | Ok (te, rest2) ->
+            aliases := (name, (ps, te)) :: !aliases;
+            Ok (name, ps, [], [], rest2))
+       | t0 :: _ when is_sym t0 "(" ->
+         (match parse_tyexp rest with
+          | Err e -> Err e
+          | Ok (te, rest2) ->
+            aliases := (name, (ps, te)) :: !aliases;
+            Ok (name, ps, [], [], rest2))
        | t :: rest1 when is_sym t "{" ->
          (* a record: fields and their types, rather than constructors *)
          let rec flds toks acc =
@@ -1554,7 +1708,9 @@ let rec lookup_scheme env x = match env with
    declared here rather than built into the checker. *)
 let constructors : (string * (string * string list * tyexp list)) list ref =
   ref [ ("[]", ("list", ["'a"], []));
-        ("::", ("list", ["'a"], [TEVar "'a"; TECon ("list", [TEVar "'a"])])) ]
+        ("::", ("list", ["'a"], [TEVar "'a"; TECon ("list", [TEVar "'a"])]));
+        ("None", ("option", ["'a"], []));
+        ("Some", ("option", ["'a"], [TEVar "'a"])) ]
 
 (* field name -> the record type it belongs to, that type's parameters, and
    the field's own type.  A field is looked up by name alone, so the last
@@ -1565,7 +1721,7 @@ let rec_order : (string * string list) list ref = ref [("ref", ["contents"])]
 (* a type's constructors in the order they were declared, which is what
    decides their tags: the constant ones are numbered among themselves and
    the others among themselves *)
-let type_ctors : (string * string list) list ref = ref [("list", ["[]"; "::"])]
+let type_ctors : (string * string list) list ref = ref [("list", ["[]"; "::"]); ("option", ["None"; "Some"])]
 
 let rec find_rec_order l n = match l with
   | [] -> Err ("unknown record type " ^^ n)
@@ -1587,6 +1743,14 @@ let rec find_ctor l c = match l with
   | [] -> Err ("unbound constructor " ^^ c)
   | (n, d) :: r -> if string_equal n c then Ok d else find_ctor r c
 
+let rec find_alias n l = match l with
+  | [] -> None
+  | (m, d) :: r -> if string_equal m n then Some d else find_alias n r
+
+let rec bind_params ps tys = match ps, tys with
+  | p :: pr, t :: tr -> (p, t) :: bind_params pr tr
+  | _, _ -> []
+
 let rec lookup_sub sub v = match sub with
   | [] -> fresh_tv ()
   | (n, t) :: r -> if string_equal n v then t else lookup_sub r v
@@ -1597,7 +1761,10 @@ let rec ty_of_texp sub te = match te with
   | TECon (n, []) when string_equal n "bool" -> TBool
   | TECon (n, []) when string_equal n "float" -> TFloat
   | TECon (n, []) when string_equal n "string" -> TString
-  | TECon (n, l) -> TCon (n, ty_of_texps sub l)
+  | TECon (n, l) ->
+    (match find_alias n !aliases with
+     | Some (ps, body) -> ty_of_texp (bind_params ps (ty_of_texps sub l)) body
+     | None -> TCon (n, ty_of_texps sub l))
   | TEArrow (a, b) -> TArrow (ty_of_texp sub a, ty_of_texp sub b)
   | TETuple l -> TTuple (ty_of_texps sub l)
 and ty_of_texps sub l = match l with
@@ -1625,6 +1792,21 @@ let field_types f = match find_field !fields f with
   | Ok (tname, ps, te) ->
     let sub = fresh_sub ps in
     Ok (TCon (tname, sub_tys sub ps), ty_of_texp sub te)
+
+(* the predefined exceptions: the global slot each has in every image (runtime/caml/fail.h), and
+   whether it carries an argument, so that its identity is the first field of the value *)
+let exn_slot c =
+  if string_equal c "Out_of_memory" then 0 else if string_equal c "Sys_error" then 1
+  else if string_equal c "Failure" then 2 else if string_equal c "Invalid_argument" then 3
+  else if string_equal c "End_of_file" then 4 else if string_equal c "Division_by_zero" then 5
+  else if string_equal c "Not_found" then 6 else if string_equal c "Match_failure" then 7
+  else if string_equal c "Stack_overflow" then 8 else if string_equal c "Sys_blocked_io" then 9
+  else if string_equal c "Assert_failure" then 10 else if string_equal c "Undefined_recursive_module" then 11
+  else 0 - 1
+
+let exn_has_arg c =
+  string_equal c "Sys_error" || string_equal c "Failure" || string_equal c "Invalid_argument"
+  || string_equal c "Match_failure" || string_equal c "Assert_failure"
 
 let int_op op =
   string_equal op "+" || string_equal op "-" || string_equal op "*"
@@ -1717,6 +1899,30 @@ let rec infer env e = match e with
        | Err m -> Err m
        | Ok te -> match unify rt te with Err m -> Err m | Ok () -> Ok ft)
   | Prim (_, _, _) -> Err "a primitive call has no type of its own"
+  | ExnIs (_, _) -> Ok TBool
+  | ExnVal _ -> Ok (TCon ("exn", []))
+  | ExnArg _ -> Ok TString
+  | Reraise _ -> Ok (fresh_tv ())
+  | LetRecs (bs, body) ->
+    (* the group is monomorphic while it is being checked, and every body sees every name *)
+    let rec fresh l = match l with
+      | [] -> []
+      | (n, _) :: r -> (n, fresh_tv ()) :: fresh r in
+    let tvs = fresh bs in
+    let rec extend l e = match l with
+      | [] -> e
+      | (n, t) :: r -> (n, Forall ([], t)) :: extend r e in
+    let inner = extend tvs env in
+    let rec tv_of n l = match l with
+      | [] -> fresh_tv ()
+      | (m, t) :: r -> if string_equal m n then t else tv_of n r in
+    let rec go l = match l with
+      | [] -> infer inner body
+      | (n, b) :: r ->
+        (match infer inner b with
+         | Err m -> Err m
+         | Ok tb -> match unify (tv_of n tvs) tb with Err m -> Err m | Ok () -> go r) in
+    go bs
   | Guard (g, b) ->
     (match infer env g with
      | Err m -> Err m
@@ -1805,6 +2011,12 @@ let rec infer env e = match e with
   | Con (c, args) when (match find_ctor !constructors c with Err _ -> true | Ok _ -> false)
                        && (match lookup_scheme env c with Ok _ -> true | Err _ -> false) ->
     infer env (apps (Var c) args)
+  | Con (c, args) when exn_slot c >= 0 ->
+    (* Not_found, Failure "x", ...: a value of type exn *)
+    let rec go l = match l with
+      | [] -> Ok (TCon ("exn", []))
+      | a :: r -> (match infer env a with Err m -> Err m | Ok _ -> go r) in
+    go args
   | Con (c, args) ->
     (match ctor_types c with
      | Err m -> Err m
@@ -2083,6 +2295,9 @@ let prim_desc p =
 
 let externals : (string * (int * int * int)) list ref = ref []
 
+(* the variables the closure just compiled captured, in field order from 2: what let rec patches *)
+let last_caps : string list ref = ref []
+
 let rec find_ext x l = match l with
   | [] -> None
   | (n, d) :: r -> if string_equal n x then Some d else find_ext x r
@@ -2182,6 +2397,15 @@ let rec free_in e bound acc = match e with
   | While (c, b) -> free_in b bound (free_in c bound acc)
   | ArrLit l -> free_in_list l bound acc
   | Guard (g, b) -> free_in b bound (free_in g bound acc)
+  | ExnVal _ -> acc
+  | ExnIs (_, e1) -> free_in e1 bound acc
+  | ExnArg e1 -> free_in e1 bound acc
+  | Reraise e1 -> free_in e1 bound acc
+  | LetRecs (bs, body) ->
+    let rec names l = match l with [] -> bound | (n, _) :: r -> n :: names r in
+    let b2 = names bs in
+    let rec each l a = match l with [] -> a | (_, e1) :: r -> each r (free_in e1 b2 a) in
+    free_in body b2 (each bs acc)
   | For (x, lo, hi, _, b) -> free_in b (x :: bound) (free_in hi bound (free_in lo bound acc))
 and free_in_list l bound acc = match l with
   | [] -> acc
@@ -2228,6 +2452,13 @@ let rec strs_in e acc = match e with
   | While (c, b) -> strs_in b (strs_in c acc)
   | ArrLit l -> strs_in_list l acc
   | Guard (g, b) -> strs_in b (strs_in g acc)
+  | ExnVal _ -> acc
+  | ExnIs (_, e1) -> strs_in e1 acc
+  | ExnArg e1 -> strs_in e1 acc
+  | Reraise e1 -> strs_in e1 acc
+  | LetRecs (bs, body) ->
+    let rec each l a = match l with [] -> a | (_, e1) :: r -> each r (strs_in e1 a) in
+    strs_in body (each bs acc)
   | For (_, lo, hi, _, b) -> strs_in b (strs_in hi (strs_in lo acc))
   | _ -> acc
 and strs_in_list l acc = match l with
@@ -2298,6 +2529,13 @@ let rec floats_in e acc = match e with
   | While (c, b) -> floats_in b (floats_in c acc)
   | ArrLit l -> floats_in_list l acc
   | Guard (g, b) -> floats_in b (floats_in g acc)
+  | ExnVal _ -> acc
+  | ExnIs (_, e1) -> floats_in e1 acc
+  | ExnArg e1 -> floats_in e1 acc
+  | Reraise e1 -> floats_in e1 acc
+  | LetRecs (bs, body) ->
+    let rec each l a = match l with [] -> a | (_, e1) :: r -> each r (floats_in e1 a) in
+    floats_in body (each bs acc)
   | For (_, lo, hi, _, b) -> floats_in b (floats_in hi (floats_in lo acc))
   | _ -> acc
 and floats_in_list l acc = match l with
@@ -2359,6 +2597,8 @@ let rec comp env e = match e with
         else begin patch_branch p2 (here ()); true end
       end
     end
+  | Let (true, x, bound, body) -> comp env (LetRecs ([(x, bound)], body))
+  | LetRecs (bs, body) -> comp_letrecs env bs body
   | Let (_, x, bound, body) ->
     if not_b (comp env bound) then false
     else begin
@@ -2423,6 +2663,7 @@ let rec comp env e = match e with
       else begin
         emit op_return; emit n;
         patch_branch skip (here ());
+        last_caps := caps;
         true
       end
     end
@@ -2479,6 +2720,12 @@ let rec comp env e = match e with
       if big then patch_branch !ra (here ());
       true
     end
+  | Con (c, args) when exn_slot c >= 0 ->
+    (* a predefined exception: its global, or a block of that and the argument *)
+    (match args with
+     | [] -> emit op_getglobal; emit (exn_slot c); true
+     | _ -> comp_block env 0 (ExnVal c :: args))
+  | ExnVal c -> emit op_getglobal; emit (exn_slot c); true
   | Con (c, args) -> comp_con env c args
   | Tuple es -> comp_block env 0 es
   | ArrLit es -> comp_block env 0 es
@@ -2488,6 +2735,21 @@ let rec comp env e = match e with
     if idx < 0 then begin comp_err := "unknown field " ^^ f; false end
     else if not_b (comp env b) then false
     else begin emit op_getfield; emit idx; true end
+  | ExnIs (c, e1) ->
+    let k = exn_slot c in
+    if k < 0 then begin comp_err := "unknown exception " ^^ c; false end
+    else if not_b (comp env e1) then false
+    else begin
+      (if exn_has_arg c then begin emit op_getfield; emit 0 end);
+      emit op_push; emit op_getglobal; emit k; emit op_eq;
+      true
+    end
+  | ExnArg e1 ->
+    if not_b (comp env e1) then false
+    else begin emit op_getfield; emit 1; true end
+  | Reraise e1 ->
+    if not_b (comp env e1) then false
+    else begin emit 91; true end
   | While (c, b) ->
     (* a backward branch, not a recursive call: there are no tail calls here, and a loop
        of a hundred thousand turns would be a hundred thousand frames *)
@@ -2843,6 +3105,57 @@ and comp_prim env k c args =
          true
        end)
 
+(* let rec f = ... and g = ... in body.  A slot on the stack for each function holds 0 until its
+   closure exists; each closure is built capturing those slots (and what else it uses), then each
+   slot a closure captured is patched, in the closure, to the closure it stands for.  The names
+   are then ordinary locals of the body. *)
+and comp_letrecs env bs body =
+  let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
+  let n = count bs in
+  let rec dummies l e = match l with
+    | [] -> e
+    | (nm, _) :: r -> emit op_constint; emit 0; emit op_push; dummies r (nm :: e) in
+  let env2 = dummies bs env in
+  let rec names l = match l with [] -> [] | (nm, _) :: r -> nm :: names r in
+  let group = names bs in
+  let ok = ref true in
+  let made : (string * string list) list ref = ref [] in
+  let rec build l = match l with
+    | [] -> ()
+    | (nm, b) :: r ->
+      if !ok then begin
+        (match b with
+         | Fun (_, _) ->
+           if not_b (comp env2 b) then ok := false
+           else begin
+             made := (nm, !last_caps) :: !made;
+             emit op_assign; emit (stack_idx env2 nm 0);
+             build r
+           end
+         | _ -> comp_err := "let rec needs a function"; ok := false)
+      end in
+  build bs;
+  if not_b !ok then false
+  else begin
+    let rec patch_fns l = match l with
+      | [] -> ()
+      | (fname, caps) :: r ->
+        let rec go cs p = match cs with
+          | [] -> ()
+          | c :: cr ->
+            (if mem_name c group then begin
+               emit op_acc; emit (stack_idx env2 c 0); emit op_push;
+               emit op_acc; emit (stack_idx ("" :: env2) fname 0);
+               emit op_setfield; emit (2 + p)
+             end);
+            go cr (p + 1) in
+        go caps 0;
+        patch_fns r in
+    patch_fns !made;
+    if not_b (comp env2 body) then false
+    else begin emit op_pop; emit n; true end
+  end
+
 and comp_con env c args =
   match ctor_layout c with
   | Err m -> comp_err := m; false
@@ -3005,6 +3318,19 @@ let run_phrase_body e name =
   install_floats (floats_in e []);
   let start = here () in
   let ok = match e with
+    | LetRecs (bs, Var _) ->
+      (* a top-level group: every name has its global slot before any body is compiled, so
+         each can reach the others, and each closure is stored in its slot *)
+      let rec reserve l = match l with
+        | [] -> true
+        | (n, _) :: r -> if slot_for n < 0 then false else reserve r in
+      let rec each l = match l with
+        | [] -> true
+        | (n, b) :: r ->
+          if not_b (comp [] b) then false
+          else begin emit op_setglobal; emit (slot_for n); each r end in
+      if reserve bs && each bs then begin emit op_constint; emit 0; emit op_return; emit 1; true end
+      else false
     | Let (recursive, n, bound, Var v) when string_equal v n ->
       let slot = if recursive then slot_for n else (0 - 1) in
       if comp [] bound then begin
@@ -3209,7 +3535,7 @@ let img_begin (nm : string) =
   img_at := rfs_free ();
   sv_cp := !cp; sv_next := !next_global; sv_globals := !globals;
   sv_lits := !literals; sv_flts := !float_lits;
-  globals := []; literals := []; float_lits := []; next_global := 0;
+  globals := []; literals := []; float_lits := []; next_global := 12;   (* 0..11 are the predefined exceptions *)
   img_frags := []; img_strs := []; img_flts := [];
   img_mode := true;
   cp := 0;
@@ -3246,24 +3572,43 @@ let img_end (_n : int) =
   let ptrs : (int * int) list ref = ref [] in
   (* each string: a header, then its bytes four to a word, the last byte of the
      last word saying how much of it is padding, as OCaml lays them out *)
+  let put_string t =
+    let len = string_length t in
+    let nw = len / 4 + 1 in
+    let at = !hw in
+    img_wr32 (hbase + 4 * at) ((nw lsl 16) lor 252);
+    hw := at + 1;
+    for w = 0 to nw - 1 do
+      let byte i =
+        if i < len then int_of_char (string_get t i)
+        else if i = 4 * nw - 1 then 4 * nw - 1 - len
+        else 0 in
+      img_put4 (hbase + 4 * !hw) (byte (4 * w)) (byte (4 * w + 1)) (byte (4 * w + 2)) (byte (4 * w + 3));
+      hw := !hw + 1
+    done;
+    at in
   let rec heap l = match l with
     | [] -> ()
     | (t, slot) :: r ->
-      let len = string_length t in
-      let nw = len / 4 + 1 in
-      let at = !hw in
-      img_wr32 (hbase + 4 * at) ((nw lsl 16) lor 252);
-      hw := at + 1;
-      for w = 0 to nw - 1 do
-        let byte i =
-          if i < len then int_of_char (string_get t i)
-          else if i = 4 * nw - 1 then 4 * nw - 1 - len
-          else 0 in
-        img_put4 (hbase + 4 * !hw) (byte (4 * w)) (byte (4 * w + 1)) (byte (4 * w + 2)) (byte (4 * w + 3));
-        hw := !hw + 1
-      done;
+      let at = put_string t in
       ptrs := (slot, at lsl 2) :: !ptrs;
       heap r in
+  (* the predefined exceptions, globals 0..11, which is where the machine looks for the ones it
+     raises itself: a block of tag 248 holding the name and an id, -1, -2, ... as ocamlc's are *)
+  let rec exns l k = match l with
+    | [] -> ()
+    | nm :: r ->
+      let s_at = put_string nm in
+      let at = !hw in
+      img_wr32 (hbase + 4 * at) ((2 lsl 16) lor 248);
+      img_wr32 (hbase + 4 * (at + 1)) (s_at lsl 2);
+      img_wr32 (hbase + 4 * (at + 2)) (2 * (0 - (k + 1)) + 1);
+      hw := at + 3;
+      ptrs := (k, at lsl 2) :: !ptrs;
+      exns r (k + 1) in
+  exns ["Out_of_memory"; "Sys_error"; "Failure"; "Invalid_argument"; "End_of_file"; "Division_by_zero";
+        "Not_found"; "Match_failure"; "Stack_overflow"; "Sys_blocked_io"; "Assert_failure";
+        "Undefined_recursive_module"] 0;
   heap !img_strs;
   let nglob = !next_global in
   let gbase = hbase + 4 * !hw in
@@ -3772,6 +4117,33 @@ let session = ref (builtin_values builtins)
 let type_session : (string * scheme) list ref = ref (builtin_types builtins)
 
 let infer_line e = match e with
+  | LetRecs (bs, Var first) ->
+    let rec fresh l = match l with
+      | [] -> []
+      | (n, _) :: r -> (n, fresh_tv ()) :: fresh r in
+    let tvs = fresh bs in
+    let rec extend l e = match l with
+      | [] -> e
+      | (n, t) :: r -> (n, Forall ([], t)) :: extend r e in
+    let inner = extend tvs !type_session in
+    let rec tv_of n l = match l with
+      | [] -> fresh_tv ()
+      | (m, t) :: r -> if string_equal m n then t else tv_of n r in
+    let rec go l = match l with
+      | [] -> Ok ()
+      | (n, b) :: r ->
+        (match infer inner b with
+         | Err m -> Err m
+         | Ok tb -> match unify (tv_of n tvs) tb with Err m -> Err m | Ok () -> go r) in
+    (match go bs with
+     | Err m -> Err m
+     | Ok () ->
+       (* every name of the group is known to the session from now on *)
+       let rec reg l = match l with
+         | [] -> ()
+         | (n, _) :: r -> type_session := (n, generalize !type_session (tv_of n tvs)) :: !type_session; reg r in
+       reg bs;
+       Ok (first, generalize !type_session (tv_of first tvs), tv_of first tvs))
   | Let (recursive, name, bound, Var v) when string_equal v name ->
     let self = fresh_tv () in
     let inner = if recursive then (name, Forall ([], self)) :: !type_session
@@ -3787,8 +4159,41 @@ let infer_line e = match e with
           | Err m -> Err m
           | Ok t -> Ok ("", Forall ([], t), t))
 
+(* a line that starts with # is a directive, not a phrase:
+     #image out.img src.ml    compile src.ml to an image on the RAM disk named out.img
+   It is read here, so it works wherever the compiler runs -- on the host, where there is no doorway,
+   as well as on the machine -- and the work is the same as image_begin, run_file and image_end. *)
+let src_echo = ref false          (* name each phrase before it is compiled: for a long source *)
+
+let words_of_line () =
+  let acc = ref [] and i = ref 1 in
+  while !i < !line_len do
+    if char_at !i = 32 then i := !i + 1
+    else begin
+      let j = ref !i in
+      while !j < !line_len && char_at !j <> 32 do j := !j + 1 done;
+      acc := substring !i !j :: !acc;
+      i := !j
+    end
+  done;
+  rev_acc !acc []
+
+let directive () =
+  match words_of_line () with
+  | [w; out; src] when string_equal w "image" ->
+    let _ = img_begin out in
+    src_echo := true;
+    let n = !fs_run src in
+    src_echo := false;
+    let size = img_end 0 in
+    puts "image "; puts out; puts ": "; put_int n; puts " phrases, ";
+    (if size < 0 then puts "not written (too big, or it has float literals)" else begin put_int size; puts " bytes" end);
+    newline ()
+  | _ -> puts "error: unknown directive"; newline ()
+
 let evaluate_line () =
-  if !line_len > 0 then begin
+  if !line_len > 0 && char_at 0 = 35 then directive ()
+  else if !line_len > 0 then begin
     match tokenize () with
     | Err m -> puts "error: "; puts m; newline ()
     | Ok toks when (match toks with t :: _ -> is_kw t "external" | [] -> false) ->
@@ -3810,36 +4215,41 @@ let evaluate_line () =
                puts "external "; puts name; newline ())
     | Ok toks when (match toks with t :: _ -> is_kw t "type" | [] -> false) ->
       (* a declaration, not an expression: it binds constructors and has no
-         value to print *)
-      (match parse_typedecl (match toks with _ :: r -> r | [] -> []) with
-       | Err m -> puts "error: "; puts m; newline ()
-       | Ok (name, ps, arms, flds, rest) ->
-         match rest with
-         | t :: _ ->
-           puts "error: unexpected input at the end";
-           if is_kw t "or" then puts " (constructors are separated by |)";
-           newline ()
-         | [] ->
-           let rec add l = match l with
-             | [] -> ()
-             | (c, args) :: r ->
-               constructors := (c, (name, ps, args)) :: !constructors; add r in
-           add arms;
-           let rec names_of l = match l with
-             | [] -> []
-             | (c, _) :: r -> c :: names_of r in
-           (match arms with
+         value to print.  type a = ... and b = ... declares each in turn. *)
+      let rec decls toks =
+        match parse_typedecl toks with
+        | Err m -> puts "error: "; puts m; newline ()
+        | Ok (name, ps, arms, flds, rest) ->
+          let rec add l = match l with
             | [] -> ()
-            | _ -> type_ctors := (name, names_of arms) :: !type_ctors);
-           let rec addf l names = match l with
-             | [] -> rev_acc names []
-             | (f, te) :: r ->
-               fields := (f, (name, ps, te)) :: !fields;
-               addf r (f :: names) in
-           (match flds with
-            | [] -> ()
-            | _ -> rec_order := (name, addf flds []) :: !rec_order);
-           puts "type "; puts name; newline ())
+            | (c, args) :: r ->
+              constructors := (c, (name, ps, args)) :: !constructors;
+              ctor_arities := (c, count_list args) :: !ctor_arities;
+              add r in
+          add arms;
+          let rec names_of l = match l with
+            | [] -> []
+            | (c, _) :: r -> c :: names_of r in
+          (match arms with
+           | [] -> ()
+           | _ -> type_ctors := (name, names_of arms) :: !type_ctors);
+          let rec addf l names = match l with
+            | [] -> rev_acc names []
+            | (f, te) :: r ->
+              fields := (f, (name, ps, te)) :: !fields;
+              addf r (f :: names) in
+          (match flds with
+           | [] -> ()
+           | _ -> rec_order := (name, addf flds []) :: !rec_order);
+          puts "type "; puts name; newline ();
+          match rest with
+          | [] -> ()
+          | t :: more when is_kw t "and" -> decls more
+          | t :: _ ->
+            puts "error: unexpected input at the end";
+            if is_kw t "or" then puts " (constructors are separated by |)";
+            newline () in
+      decls (match toks with _ :: r -> r | [] -> [])
     | Ok toks ->
       let top_let = match toks with t :: _ -> is_kw t "let" | [] -> false in
       let parsed = match toks with
@@ -3876,7 +4286,7 @@ let evaluate_line () =
               type_session := (bound_name, sc) :: !type_session;
               puts "val "; puts name; puts " : "; puts (type_name ty); puts " = "
             | _ -> puts "- : "; puts (type_name ty); puts " = ");
-           print_compiled ty v;
+           (if !img_mode then puts "<in the image>" else print_compiled ty v);   (* nothing was run: there is no value *)
            if elapsed > 0 then begin puts "   ("; put_int elapsed; puts " ms)" end;
            newline ())
   end
@@ -3898,29 +4308,92 @@ let () = fs_ls := (fun (_ : int) ->
   done;
   n)
 
-(* a file run as though it had been typed *)
+(* A source file, a phrase at a time.  Comments are skipped (they nest, and a string or a
+   character literal inside one is read as such, so "*)" in a string does not end it); a
+   newline is a space; and a line that starts in column 0 with let, type, external,
+   exception, open or module begins the next phrase.  Each phrase is compiled as though it
+   had been typed, from a buffer big enough for it. *)
+let starts_phrase (text : string) i =
+  let n = string_length text in
+  let at w =
+    let m = string_length w in
+    i + m < n && (let ok = ref true and j = ref 0 in
+                  while !ok && !j < m do
+                    (if string_get text (i + !j) <> string_get w !j then ok := false);
+                    j := !j + 1
+                  done;
+                  !ok && string_get text (i + m) = ' ') in
+  at "let" || at "type" || at "external" || at "exception" || at "open" || at "module"
+
+let run_source (text : string) =
+  let n = string_length text in
+  let small = !line in
+  let big = create_bytes (n + 2) in
+  line := big;
+  let i = ref 0 and count = ref 0 and depth = ref 0 in
+  let put c = bytes_set big !line_len c; line_len := !line_len + 1 in
+  let flush () =
+    (* a phrase that is only blanks is nothing *)
+    let blank = ref true in
+    for k = 0 to !line_len - 1 do if bytes_get big k <> ' ' then blank := false done;
+    (if not_b !blank then begin
+       (if !src_echo then begin
+          puts "@ ";
+          for k = 0 to (if !line_len < 70 then !line_len else 70) - 1 do putc (bytes_get big k) done;
+          newline ()
+        end);
+       evaluate_line (); count := !count + 1
+     end);
+    line_len := 0 in
+  line_len := 0;
+  while !i < n do
+    let c = string_get text !i in
+    if !depth > 0 then begin
+      (if c = '(' && !i + 1 < n && string_get text (!i + 1) = '*' then begin depth := !depth + 1; i := !i + 2 end
+       else if c = '*' && !i + 1 < n && string_get text (!i + 1) = ')' then begin depth := !depth - 1; i := !i + 2 end
+       else if c = '"' then begin
+         (* a string inside a comment *)
+         i := !i + 1;
+         while !i < n && string_get text !i <> '"' do
+           (if string_get text !i = '\\' then i := !i + 1);
+           i := !i + 1
+         done;
+         i := !i + 1
+       end
+       else if c = '\'' && !i + 2 < n && string_get text (!i + 2) = '\'' then i := !i + 3
+       else i := !i + 1)
+    end
+    else if c = '(' && !i + 1 < n && string_get text (!i + 1) = '*' then begin depth := 1; put ' '; i := !i + 2 end
+    else if c = '"' then begin
+      (* a string literal, copied as it stands *)
+      put c; i := !i + 1;
+      while !i < n && string_get text !i <> '"' do
+        (if string_get text !i = '\\' && !i + 1 < n then begin put (string_get text !i); i := !i + 1 end);
+        put (string_get text !i); i := !i + 1
+      done;
+      (if !i < n then begin put '"'; i := !i + 1 end)
+    end
+    else if c = '\'' && !i + 2 < n && string_get text (!i + 2) = '\'' then begin
+      put c; put (string_get text (!i + 1)); put c; i := !i + 3
+    end
+    else if c = '\'' && !i + 3 < n && string_get text (!i + 1) = '\\' && string_get text (!i + 3) = '\'' then begin
+      put c; put (string_get text (!i + 1)); put (string_get text (!i + 2)); put c; i := !i + 4
+    end
+    else if c = '\n' then begin
+      put ' '; i := !i + 1;
+      (if !i < n && starts_phrase text !i then flush ())
+    end
+    else begin put c; i := !i + 1 end
+  done;
+  flush ();
+  line := small;
+  line_len := 0;
+  !count
+
 let () = fs_run := (fun nm ->
   match rfs_get nm with
   | Err m -> puts m; newline (); 0
-  | Ok text ->
-    let n = string_length text in
-    let i = ref 0 and count = ref 0 in
-    while !i < n do
-      line_len := 0;
-      while !i < n && string_get text !i <> '\n' do
-        (if !line_len < line_max then begin
-           bytes_set line !line_len (string_get text !i);
-           line_len := !line_len + 1
-         end);
-        i := !i + 1
-      done;
-      i := !i + 1;
-      if !line_len > 0 && not_b (bytes_get line 0 = '(') then begin
-        evaluate_line (); count := !count + 1
-      end
-    done;
-    line_len := 0;
-    !count)
+  | Ok text -> run_source text)
 
 (* ---- the UART: a line collected a byte at a time, echoed ---- *)
 (* ---- 32-bit sequence numbers as two 16-bit halves ---- *)
@@ -4117,7 +4590,7 @@ let app_byte c =
     prompt ()
   end else if v >= 32 && v < 127 then begin
     if !line_len < line_max then begin
-      bytes_set line !line_len c;
+      bytes_set !line !line_len c;
       line_len := !line_len + 1;
       out_char c
     end
@@ -4359,7 +4832,7 @@ let uart_poll () =
   if c >= 0 then begin
     if c = 13 || c = 10 then begin
       newline ();
-      for i = 0 to !uart_len - 1 do bytes_set line i (bytes_get uart_line i) done;
+      for i = 0 to !uart_len - 1 do bytes_set !line i (bytes_get uart_line i) done;
       line_len := !uart_len;
       uart_len := 0;
       evaluate_line ();
@@ -4413,7 +4886,7 @@ let handle_repl len ihl =
       let c = rx (udp + 8 + i) in
       if c = 10 then begin evaluate_line (); line_len := 0 end
       else if c >= 32 && !line_len < line_max then begin
-        bytes_set line !line_len (char_of_int c);
+        bytes_set !line !line_len (char_of_int c);
         line_len := !line_len + 1
       end
     done;

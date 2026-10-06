@@ -27,6 +27,12 @@ done.
 io/image2.input checks that the booted program sees the RAM disk (a file the compiling session wrote with write_file, read through the
 directory at 0x100000) and the UART input the compiling session had not yet read.
 
+Globals 0..11 of an image are the predefined exceptions (a block of tag 248, name and id), as in an ocamlc image: the machine
+reads Division_by_zero from slot 5, Stack_overflow from 8 and Out_of_memory from 0 to raise them, so image_begin starts the
+program's own globals at 12 and image_end puts the blocks in the heap.  `#image out.img src.ml` compiles a source file (multi-line
+phrases, nested comments, strings and character literals in them) to an image; it works on the host runner too, which has a model of
+the RAM disk (tools/mkdisk.py makes a disk with files on it; $ETHMODEL_DISK names it).
+
 Not yet: float literals (image_end refuses), and everything comp.ml needs of the language to compile itself.
 
 Testing in the simulator: run comp.ml's bytecode with `+disk=disk.bin` and `io/image.input` as the UART input, find
