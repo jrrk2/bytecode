@@ -408,7 +408,7 @@ let symbol_len i =
      || (c = 58 && d = 58) || (c = 58 && d = 61) || (c = 60 && d = 45)
      || ((c = 43 || c = 45 || c = 42 || c = 47) && d = 46) then 2
   else if c = 43 || c = 45 || c = 42 || c = 47 || c = 61 || c = 60 || c = 62
-       || c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 124 || c = 59 || c = 33
+       || c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 124 || c = 59 || c = 33 || c = 38 || c = 126 || c = 94
        (* { } . : for records; a float literal and +. -. *. /. are taken
           before this, so a lone point can only be a field selection *)
        || c = 123 || c = 125 || c = 46 || c = 58 then 1
@@ -503,6 +503,7 @@ type expr =
   | With of expr * (string * expr) list   (* { e with f = v } *)
   | Field of expr * string
   | SetField of expr * string * expr      (* e.f <- v, and r := v is r.contents <- v *)
+  | Prim of int * int * expr list         (* an external, applied to all its arguments: kind, code, arguments *)
 and pat =
   | PWild
   | PVar of string
@@ -1076,6 +1077,34 @@ let parse_typedecl toks =
        arms rest [])
   | _ -> Err "expected a type name"
 
+(* external name : type = "primitive" ["native name"]; name may be an operator in
+   parentheses, which is skipped to the closing one and answered with "" *)
+let rec skip_strs l = match l with TStr _ :: r -> skip_strs r | _ -> l
+
+let parse_external toks =
+  let (name, rest) = match toks with
+    | t :: rest when is_sym t "(" ->
+      let rec skip r = match r with
+        | [] -> ("", [])
+        | t2 :: r2 -> if is_sym t2 ")" then ("", r2) else skip r2 in
+      skip rest
+    | TId x :: rest when not (keyword x) -> (x, rest)
+    | _ -> ("?", toks) in
+  if string_equal name "?" then Err "expected a name after external"
+  else
+    match expect rest ":" with
+    | Err e -> Err e
+    | Ok rest ->
+      match parse_tyexp rest with
+      | Err e -> Err e
+      | Ok (te, rest) ->
+        match expect rest "=" with
+        | Err e -> Err e
+        | Ok rest ->
+          match rest with
+          | TStr p :: more -> Ok (name, te, p, skip_strs more)
+          | _ -> Err "expected the primitive's name in quotes"
+
 let not_b (a : bool) = if a then false else true
 
 (* ---- evaluation ---- *)
@@ -1465,6 +1494,7 @@ let rec infer env e = match e with
        match infer env e with
        | Err m -> Err m
        | Ok te -> match unify rt te with Err m -> Err m | Ok () -> Ok ft)
+  | Prim (_, _, _) -> Err "a primitive call has no type of its own"
   | SetField (e, f, v) ->
     (match field_types f with
      | Err m -> Err m
@@ -1728,6 +1758,50 @@ let cp = ref 0
    been compiled before it, which reads like anything but a numbering bug.
    Start above what an image uses -- comp itself has some 530 -- and refuse
    rather than wrap at the top. *)
+(* ---- externals ----
+   external name : type = "primitive" makes the primitive a name.  What is kept
+   for it is (kind, code, arity): kind 0 is no code at all (%identity), 1 is one
+   opcode, 2 is a C call and code is the VM's number for the primitive.  The
+   operators, ref, ! and := are the compiler's own and need no declaration, and
+   neither do the float functions it already has; "" is how an operator
+   comes back from parse_external.  The numbers are positions in the VM's
+   primitive table (ocamlrun -p, then vm_io_read and vm_io_write). *)
+let prim_desc p =
+  if string_equal p "%identity" || string_equal p "%bytes_to_string" then Some (0, 0, 1)
+  else if string_equal p "%boolnot" then Some (1, 88, 1)
+  else if string_equal p "%raise" then Some (1, 91, 1)
+  else if string_equal p "%bytes_unsafe_get" then Some (1, 82, 2)
+  else if string_equal p "%bytes_unsafe_set" then Some (1, 83, 3)
+  else if string_equal p "%string_length" then Some (2, 278, 1)
+  else if string_equal p "%string_safe_get" then Some (2, 347, 2)
+  else if string_equal p "%array_safe_get" then Some (2, 13, 2)
+  else if string_equal p "%array_safe_set" then Some (2, 15, 3)
+  else if string_equal p "caml_create_bytes" then Some (2, 82, 1)
+  else if string_equal p "caml_string_equal" then Some (2, 346, 2)
+  else if string_equal p "vm_io_read" then Some (2, 403, 1)
+  else if string_equal p "vm_io_write" then Some (2, 404, 2)
+  else if string_equal p "caml_lt_float" then Some (2, 238, 2)
+  else if string_equal p "caml_le_float" then Some (2, 230, 2)
+  else if string_equal p "caml_eq_float" then Some (2, 104, 2)
+  else None
+
+let externals : (string * (int * int * int)) list ref = ref []
+
+let rec find_ext x l = match l with
+  | [] -> None
+  | (n, d) :: r -> if string_equal n x then Some d else find_ext x r
+
+let rec mem_name (x : string) l = match l with
+  | [] -> false
+  | y :: r -> string_equal x y || mem_name x r
+
+let rec tyvars_of te acc = match te with
+  | TEVar v -> if mem_name v acc then acc else v :: acc
+  | TECon (_, l) -> tyvars_list l acc
+  | TEArrow (a, b) -> tyvars_of b (tyvars_of a acc)
+  | TETuple l -> tyvars_list l acc
+and tyvars_list l acc = match l with [] -> acc | t :: r -> tyvars_list r (tyvars_of t acc)
+
 let globals_max = 4096
 let next_global = ref 1024
 let doorway = ref (0 - 1)
@@ -1808,6 +1882,7 @@ let rec free_in e bound acc = match e with
   | With (b, fs) -> free_in_fields fs bound (free_in b bound acc)
   | Field (b, _) -> free_in b bound acc
   | SetField (b, _, v) -> free_in v bound (free_in b bound acc)
+  | Prim (_, _, l) -> free_in_list l bound acc
 and free_in_list l bound acc = match l with
   | [] -> acc
   | x :: r -> free_in_list r bound (free_in x bound acc)
@@ -1849,6 +1924,7 @@ let rec strs_in e acc = match e with
   | With (b, fs) -> strs_in_fields fs (strs_in b acc)
   | Field (b, _) -> strs_in b acc
   | SetField (b, _, v) -> strs_in v (strs_in b acc)
+  | Prim (_, _, l) -> strs_in_list l acc
   | _ -> acc
 and strs_in_list l acc = match l with
   | [] -> acc
@@ -1914,6 +1990,7 @@ let rec floats_in e acc = match e with
   | With (b, fs) -> floats_in_fields fs (floats_in b acc)
   | Field (b, _) -> floats_in b acc
   | SetField (b, _, v) -> floats_in v (floats_in b acc)
+  | Prim (_, _, l) -> floats_in_list l acc
   | _ -> acc
 and floats_in_list l acc = match l with
   | [] -> acc
@@ -1949,7 +2026,16 @@ let rec comp env e = match e with
       else begin
         let g = glob_slot !globals x in
         if g >= 0 then begin emit op_getglobal; emit g; true end
-        else begin comp_err := "unbound " ^^ x; false end
+        else match find_ext x !externals with
+          | Some (k, c, n) ->
+            (* a primitive used as a value: a closure around it *)
+            let names = ["_p1"; "_p2"; "_p3"] in
+            let rec take l m = if m = 0 then [] else (match l with [] -> [] | a :: r -> a :: take r (m - 1)) in
+            let ps = take names n in
+            let rec vars l = match l with [] -> [] | a :: r -> Var a :: vars r in
+            let rec wrap l body = match l with [] -> body | a :: r -> Fun (a, wrap r body) in
+            comp env (wrap ps (Prim (k, c, vars ps)))
+          | None -> begin comp_err := "unbound " ^^ x; false end
       end
     end
   | Binop (op, a, b) -> comp_binop env op a b
@@ -2032,6 +2118,20 @@ let rec comp env e = match e with
         true
       end
     end
+  | Prim (k, c, args) -> comp_prim env k c args
+  | App (_, _) when ext_arity env e >= 0 ->
+    let rec spine t acc = match t with
+      | App (f, a) -> spine f (a :: acc)
+      | _ -> (t, acc) in
+    let (f, args) = spine e [] in
+    let n = ext_arity env e in
+    let (k, c) = (match f with
+      | Var x -> (match find_ext x !externals with Some (k, c, _) -> (k, c) | None -> (0, 0))
+      | _ -> (0, 0)) in
+    let rec split l m acc = if m = 0 then (rev_acc acc [], l) else
+      (match l with [] -> (rev_acc acc [], []) | a :: r -> split r (m - 1) (a :: acc)) in
+    let (first, rest) = split args n [] in
+    comp env (apps (Prim (k, c, first)) rest)
   | App (Var f, a) when float_prim1 f >= 0 ->
     if not_b (comp env a) then false
     else begin emit op_c_call1; emit (float_prim1 f); true end
@@ -2336,6 +2436,40 @@ and comp_match env scrut arms =
       true
     end
   end
+
+(* how many arguments the external at the head of this application takes, if the
+   head is one and not shadowed, and the call has that many; else -1 *)
+and ext_arity env e =
+  let rec head t n = match t with
+    | App (f, _) -> head f (n + 1)
+    | Var x -> (x, n)
+    | _ -> ("", n) in
+  let (x, nargs) = head e 0 in
+  if string_equal x "" then 0 - 1
+  else if stack_idx env x 0 >= 0 || stack_idx !cap x 0 >= 0 || glob_slot !globals x >= 0 then 0 - 1
+  else match find_ext x !externals with
+    | Some (_, _, n) -> if nargs >= n then n else 0 - 1
+    | None -> 0 - 1
+
+(* the first argument goes in the accumulator and the others on the stack, the last
+   pushed first, which is how C_CALLn and the opcodes with operands read them *)
+and comp_prim env k c args =
+  match args with
+  | [] -> false
+  | a1 :: rest ->
+    let rec push_all l e = match l with
+      | [] -> Some e
+      | a :: r -> if not_b (comp e a) then None else begin emit op_push; push_all r ("" :: e) end in
+    let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
+    (match push_all (rev_acc rest []) env with
+     | None -> false
+     | Some e2 ->
+       if not_b (comp e2 a1) then false
+       else begin
+         (if k = 2 then begin emit (93 + count rest); emit c end
+          else if k = 1 then emit c);
+         true
+       end)
 
 and comp_con env c args =
   match ctor_layout c with
@@ -3097,6 +3231,10 @@ let rec builtin_types l = match l with
   | [] -> []
   | (n, _, t) :: rest -> (n, Forall ([], t)) :: builtin_types rest
 
+let rec builtin_types_names l = match l with
+  | [] -> []
+  | (n, _, _) :: rest -> (n, (0, 0, 0)) :: builtin_types_names rest
+
 let session = ref (builtin_values builtins)
 
 
@@ -3131,6 +3269,23 @@ let evaluate_line () =
   if !line_len > 0 then begin
     match tokenize () with
     | Err m -> puts "error: "; puts m; newline ()
+    | Ok toks when (match toks with t :: _ -> is_kw t "external" | [] -> false) ->
+      (match parse_external (match toks with _ :: r -> r | [] -> []) with
+       | Err m -> puts "error: "; puts m; newline ()
+       | Ok (name, te, p, rest) ->
+         match rest with
+         | _ :: _ -> puts "error: unexpected input at the end"; newline ()
+         | [] ->
+           let known = string_equal name "" || string_equal name "ref"
+                       || (match find_ext name (builtin_types_names builtins) with Some _ -> true | None -> false) in
+           if known then ()
+           else match prim_desc p with
+             | None -> puts "error: unknown primitive "; puts p; newline ()
+             | Some d ->
+               let ty = ty_of_texp (fresh_sub (tyvars_of te [])) te in
+               externals := (name, d) :: !externals;
+               type_session := (name, generalize !type_session ty) :: !type_session;
+               puts "external "; puts name; newline ())
     | Ok toks when (match toks with t :: _ -> is_kw t "type" | [] -> false) ->
       (* a declaration, not an expression: it binds constructors and has no
          value to print *)
