@@ -390,6 +390,8 @@ type token = TInt of int | TFloat of float | TId of string | TSym of string
             | TStr of string
 
 let is_digit c = c >= 48 && c <= 57
+let is_hex c = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+let hex_val c = if c <= 57 then c - 48 else if c >= 97 then c - 87 else c - 55
 let is_alpha c = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c = 95
 let is_space c = c = 32 || c = 9
 let char_at i = int_of_char (bytes_get line i)
@@ -422,6 +424,14 @@ let tokenize () =
     else begin
       let c = char_at i in
       if is_space c then go (i + 1) acc
+      (* 0x1F: hexadecimal *)
+      else if c = 48 && i + 2 < !line_len && char_at (i + 1) = 120 && is_hex (char_at (i + 2)) then begin
+        let j = ref (i + 2) and n = ref 0 in
+        while !j < !line_len && is_hex (char_at !j) do
+          n := !n * 16 + hex_val (char_at !j); j := !j + 1
+        done;
+        go !j (TInt !n :: acc)
+      end
       else if is_digit c then begin
         let j = ref i and n = ref 0 in
         while !j < !line_len && is_digit (char_at !j) do
@@ -1373,7 +1383,7 @@ let rec lookup_sub sub v = match sub with
 
 let rec ty_of_texp sub te = match te with
   | TEVar v -> lookup_sub sub v
-  | TECon (n, []) when string_equal n "int" -> TInt
+  | TECon (n, []) when string_equal n "int" || string_equal n "unit" -> TInt
   | TECon (n, []) when string_equal n "bool" -> TBool
   | TECon (n, []) when string_equal n "float" -> TFloat
   | TECon (n, []) when string_equal n "string" -> TString
@@ -1650,6 +1660,7 @@ let op_acc = 8
 let op_push = 9
 let op_pop = 19
 let op_constint = 103
+let op_stop = 143
 let op_addint = 110
 let op_subint = 111
 let op_mulint = 112
@@ -1733,16 +1744,43 @@ let ctor_layout c = match find_ctor !constructors c with
       if !mine < 0 then Err ("unknown constructor " ^^ c)
       else Ok (!nc, !nb, !mine, ctor_arity c)
 
+(* ---- images ----
+   Compiling for a chain load rather than for this session: the code goes
+   into a file on the RAM disk, in the format of tools/mkvmimage.py, instead of
+   the code RAM, and nothing is run.  While img_mode is set, code_wr and code_rd
+   address the image: word w is the four bytes at img_at + 4 * w.  The disk is
+   at 0x100000 (bytes), and a 32-bit word is written a byte at a time since an
+   int here has only 31 bits. *)
+let img_mode = ref false
+let img_at = ref 0
+
+let img_put4 off b0 b1 b2 b3 =
+  io_write (0x100000 + off) b0; io_write (0x100000 + off + 1) b1;
+  io_write (0x100000 + off + 2) b2; io_write (0x100000 + off + 3) b3
+
+(* a word as the VM would hold it: two's complement in 32 bits *)
+let img_wr32 off v =
+  img_put4 off (v land 0xFF) ((v lsr 8) land 0xFF) ((v lsr 16) land 0xFF)
+    (((v lsr 24) land 0x7F) lor (if v < 0 then 0x80 else 0))
+
 let code_rd w =
-  let a = code_win + w * 4 in
-  io_read a lor (io_read (a + 1) lsl 8) lor (io_read (a + 2) lsl 16)
+  if !img_mode then begin
+    let a = 0x100000 + !img_at + 32 + w * 4 in
+    io_read a lor (io_read (a + 1) lsl 8) lor (io_read (a + 2) lsl 16)
+  end else begin
+    let a = code_win + w * 4 in
+    io_read a lor (io_read (a + 1) lsl 8) lor (io_read (a + 2) lsl 16)
+  end
 
 let code_wr w v =
-  let a = code_win + w * 4 in
-  io_write a (v land 0xFF);
-  io_write (a + 1) ((v lsr 8) land 0xFF);
-  io_write (a + 2) ((v lsr 16) land 0xFF);
-  io_write (a + 3) 0
+  if !img_mode then img_wr32 (!img_at + 32 + w * 4) v
+  else begin
+    let a = code_win + w * 4 in
+    io_write a (v land 0xFF);
+    io_write (a + 1) ((v lsr 8) land 0xFF);
+    io_write (a + 2) ((v lsr 16) land 0xFF);
+    io_write (a + 3) 0
+  end
 
 (* where the next phrase goes, and the first free global slot *)
 (* Set at startup from prog_words, which says where this program's own code
@@ -2544,6 +2582,15 @@ let slot_for name =
     end
   end
 
+(* what an image in progress has collected: where each phrase's code starts
+   (latest first), and the literals, which become heap blocks at the end *)
+let img_frags : int list ref = ref []
+let img_strs : (string * int) list ref = ref []
+let img_flts : (float * int) list ref = ref []
+(* image_end is typed into a session that is compiling for an image, so it
+   cannot be compiled into it: run_phrase answers it itself, through this *)
+let img_end_hook = ref (fun (_ : int) -> 0)
+
 (* A literal cannot be written into the heap from here, but it can be
    handed through the doorway: a phrase of four instructions puts the
    argument into a global, and from then on the text is fetched with
@@ -2577,7 +2624,7 @@ let rec install_floats l = match l with
        let k = !next_global in
        next_global := k + 1;
        float_lits := (v, k) :: !float_lits;
-       install_float k v
+       if !img_mode then img_flts := (v, k) :: !img_flts else install_float k v
      end);
     install_floats r
 
@@ -2607,11 +2654,11 @@ let rec install_all l = match l with
        let k = !next_global in
        next_global := k + 1;
        literals := (t, k) :: !literals;
-       install_literal k t
+       if !img_mode then img_strs := (t, k) :: !img_strs else install_literal k t
      end);
     install_all r
 
-let run_phrase e name =
+let run_phrase_body e name =
   comp_err := "";
   (* the literals first, each into a global of its own, before anything
      that refers to them is compiled *)
@@ -2646,6 +2693,11 @@ let run_phrase e name =
      uart_putc '\n'
    end);
   if not_b ok then Err !comp_err
+  else if !img_mode then begin
+    (* for an image: remember where this phrase's code starts, and do not run it *)
+    img_frags := start :: !img_frags;
+    Ok 0
+  end
   else if !doorway < 0 then Err "the doorway was not found"
   else begin
     io_write prog_words_reg (here ());
@@ -2653,6 +2705,13 @@ let run_phrase e name =
     patch_branch (!doorway + 1) start;
     Ok (dispatch 0)
   end
+
+(* image_end is typed into a session that is compiling for an image, so it
+   cannot be compiled into it: it is answered here, before anything is compiled *)
+let run_phrase e name =
+  match e with
+  | App (Var f, _) when !img_mode && string_equal f "image_end" -> Ok (!img_end_hook 0)
+  | _ -> run_phrase_body e name
 
 (* what came back is the accumulator, which for an int or a bool is the
    value itself; a function stays in its global and is not brought out *)
@@ -2791,6 +2850,116 @@ let rfs_get nm =
     for i = 0 to n - 1 do bytes_set b i (char_of_int (db (at + i))) done;
     Ok (bytes_to_string b)
   end
+
+(* ---- building an image ----
+   image_begin "name" starts one: phrases compiled from then on go into it and
+   are not run.  image_end () finishes: a main that calls each phrase's code in
+   turn, the string literals as heap blocks, the globals, the header with its
+   CRC, and the directory entry that makes it a file.  What it writes is the
+   layout of tools/mkvmimage.py, which the boot sequencer loads. *)
+let img_name = ref ""
+let sv_cp = ref 0
+let sv_next = ref 0
+let sv_globals : (string * int) list ref = ref []
+let sv_lits : (string * int) list ref = ref []
+let sv_flts : (float * int) list ref = ref []
+
+let img_begin (nm : string) =
+  let _ = rfs_ready () in
+  img_name := nm;
+  img_at := rfs_free ();
+  sv_cp := !cp; sv_next := !next_global; sv_globals := !globals;
+  sv_lits := !literals; sv_flts := !float_lits;
+  globals := []; literals := []; float_lits := []; next_global := 0;
+  img_frags := []; img_strs := []; img_flts := [];
+  img_mode := true;
+  cp := 0;
+  emit op_branch; emit 0;                       (* word 0 jumps to main, which comes last *)
+  0
+
+(* CRC-16-CCITT (0x1021, from 0xFFFF), a byte at a time: 16 bits fit an int *)
+let crc16_byte crc b =
+  let c = ref (crc lxor (b lsl 8)) in
+  for _i = 0 to 7 do
+    c := (if !c land 0x8000 <> 0 then ((!c lsl 1) lxor 0x1021) land 0xFFFF else (!c lsl 1) land 0xFFFF)
+  done;
+  !c
+
+let img_end (_n : int) =
+  let main = here () in
+  code_wr 0 op_branch; patch_branch 1 main;
+  (* the oldest phrase first: the list is latest first *)
+  let rec calls l = match l with
+    | [] -> ()
+    | start :: r ->
+      calls r;
+      emit op_constint; emit 0; emit op_push;
+      emit op_closure; emit 0;
+      let p = here () in emit 0;
+      patch_branch p start;
+      emit op_apply1 in
+  calls !img_frags;
+  emit op_stop;
+  let code_words = here () in
+  let base = !img_at + 32 in
+  let hbase = base + 4 * code_words in
+  let hw = ref 0 in
+  let ptrs : (int * int) list ref = ref [] in
+  (* each string: a header, then its bytes four to a word, the last byte of the
+     last word saying how much of it is padding, as OCaml lays them out *)
+  let rec heap l = match l with
+    | [] -> ()
+    | (t, slot) :: r ->
+      let len = string_length t in
+      let nw = len / 4 + 1 in
+      let at = !hw in
+      img_wr32 (hbase + 4 * at) ((nw lsl 16) lor 252);
+      hw := at + 1;
+      for w = 0 to nw - 1 do
+        let byte i =
+          if i < len then int_of_char (string_get t i)
+          else if i = 4 * nw - 1 then 4 * nw - 1 - len
+          else 0 in
+        img_put4 (hbase + 4 * !hw) (byte (4 * w)) (byte (4 * w + 1)) (byte (4 * w + 2)) (byte (4 * w + 3));
+        hw := !hw + 1
+      done;
+      ptrs := (slot, at lsl 2) :: !ptrs;
+      heap r in
+  heap !img_strs;
+  let nglob = !next_global in
+  let gbase = hbase + 4 * !hw in
+  let total = gbase + 4 * nglob - !img_at in
+  if !img_at + total > io_read disk_size_reg || !img_flts <> [] then begin
+    img_mode := false;
+    cp := !sv_cp; next_global := !sv_next; globals := !sv_globals;
+    literals := !sv_lits; float_lits := !sv_flts;
+    0 - 1
+  end else begin
+    for g = 0 to nglob - 1 do img_wr32 (gbase + 4 * g) 1 done;       (* int 0 *)
+    let rec place l = match l with
+      | [] -> ()
+      | (slot, p) :: r -> img_wr32 (gbase + 4 * slot) p; place r in
+    place !ptrs;
+    (* the CRC covers every byte after the header *)
+    let crc = ref 0xFFFF in
+    for i = base to gbase + 4 * nglob - 1 do crc := crc16_byte !crc (io_read (0x100000 + i)) done;
+    let h = !img_at in
+    img_put4 h 0x4F 0x43 0x56 0x4D;                                  (* "OCVM" *)
+    img_wr32 (h + 4) 1;
+    img_wr32 (h + 8) code_words;
+    img_wr32 (h + 12) !hw;
+    img_wr32 (h + 16) nglob;
+    img_wr32 (h + 20) 0;                                             (* primitive digest: the runtime's own *)
+    img_wr32 (h + 24) !crc;
+    img_wr32 (h + 28) 0;
+    img_mode := false;
+    cp := !sv_cp; next_global := !sv_next; globals := !sv_globals;
+    literals := !sv_lits; float_lits := !sv_flts;
+    let _ = rfs_commit !img_name !img_at total in
+    total
+  end
+
+let () = img_end_hook := img_end
 
 (* ---- NFS, straight into the RAM disk ----
    ONC RPC over UDP: portmap for mountd, mount for the root handle,
@@ -3221,7 +3390,9 @@ let builtins =
     ("files", 1, TArrow (TInt, TInt));
     ("nfs_server", 1, TArrow (TString, TInt));
     ("nfs_fetch", 2, TArrow (TString, TArrow (TString, TInt)));
-    ("nfs_done", 1, TArrow (TInt, TInt)) ]
+    ("nfs_done", 1, TArrow (TInt, TInt));
+    ("image_begin", 1, TArrow (TString, TInt));
+    ("image_end", 1, TArrow (TInt, TInt)) ]
 
 let rec builtin_values l = match l with
   | [] -> []
@@ -3977,7 +4148,9 @@ let () =
     install_fn "nfs_server" (magic (fun (a : string) -> nfs_set_server a));
     install_fn "nfs_fetch"
       (magic (fun (e : string) (f : string) -> nfs_start e f));
-    install_fn "nfs_done" (magic (fun (_n : int) -> !nfs_result))
+    install_fn "nfs_done" (magic (fun (_n : int) -> !nfs_result));
+    install_fn "image_begin" (magic (fun (a : string) -> img_begin a));
+    install_fn "image_end" (magic (fun (n : int) -> img_end n))
   end;
   puts "OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build ";
   uart_build ();

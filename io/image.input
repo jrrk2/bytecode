@@ -1,0 +1,12 @@
+image_begin "t.img"
+external io_write : int -> int -> unit = "vm_io_write"
+external string_length : string -> int = "%string_length"
+external string_get : string -> int -> char = "%string_safe_get"
+external int_of_char : char -> int = "%identity"
+let rec puts s i = if i < string_length s then begin io_write 0x1005 (int_of_char (string_get s i)); puts s (i + 1) end
+puts "hello from the image" 0
+let rec fact n = if n = 0 then 1 else n * fact (n - 1)
+io_write 0x1005 (48 + fact 4 mod 10)
+io_write 0x1005 10
+image_end 0
+files 0
