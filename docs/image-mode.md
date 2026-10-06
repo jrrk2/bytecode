@@ -24,6 +24,9 @@ $ETHMODEL_UART_SKIP carries the UART input on from where the old program stopped
 first and needs +notrace.  The hardware's side, ethmin_vm_core.v's sequencer reading its image from the RAM disk, is not
 done.
 
+io/image2.input checks that the booted program sees the RAM disk (a file the compiling session wrote with write_file, read through the
+directory at 0x100000) and the UART input the compiling session had not yet read.
+
 Not yet: float literals (image_end refuses), and everything comp.ml needs of the language to compile itself.
 
 Testing in the simulator: run comp.ml's bytecode with `+disk=disk.bin` and `io/image.input` as the UART input, find

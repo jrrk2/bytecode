@@ -1,0 +1,12 @@
+write_file "msg.txt" "kept across the chain load\n"
+image_begin "t2.img"
+external io_read : int -> int = "vm_io_read"
+external io_write : int -> int -> unit = "vm_io_write"
+let d32 i = io_read (0x100000 + i) + io_read (0x100000 + i + 1) * 256 + io_read (0x100000 + i + 2) * 65536
+let rec dump off n i = if i < n then begin io_write 0x1005 (io_read (0x100000 + off + i)); dump off n (i + 1) end
+let rec echo () = let c = io_read 0x1008 in if c >= 0 then begin io_write 0x1005 c; echo () end
+dump (d32 40) (d32 44) 0
+echo ()
+image_end 0
+boot_file "t2.img"
+abc
