@@ -408,6 +408,7 @@ let symbol_len i =
   (* +. -. *. /. are two characters, as are <= <> >= -> :: *)
   if (c = 60 && (d = 61 || d = 62)) || (c = 62 && d = 61) || (c = 45 && d = 62)
      || (c = 58 && d = 58) || (c = 58 && d = 61) || (c = 60 && d = 45)
+     || (c = 38 && d = 38) || (c = 124 && d = 124)
      || ((c = 43 || c = 45 || c = 42 || c = 47) && d = 46) then 2
   else if c = 43 || c = 45 || c = 42 || c = 47 || c = 61 || c = 60 || c = 62
        || c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 124 || c = 59 || c = 33 || c = 38 || c = 126 || c = 94
@@ -514,6 +515,8 @@ type expr =
   | Field of expr * string
   | SetField of expr * string * expr      (* e.f <- v, and r := v is r.contents <- v *)
   | Prim of int * int * expr list         (* an external, applied to all its arguments: kind, code, arguments *)
+  | While of expr * expr                  (* while c do b done *)
+  | For of string * expr * expr * bool * expr   (* for x = lo to hi do b done: up?, or downto *)
 and pat =
   | PWild
   | PVar of string
@@ -538,6 +541,10 @@ let keyword s = string_equal s "try" || string_equal s "with"
                 || string_equal s "if" || string_equal s "then" || string_equal s "else"
                 || string_equal s "fun" || string_equal s "true" || string_equal s "false"
                 || string_equal s "mod" || string_equal s "begin" || string_equal s "end"
+                || string_equal s "land" || string_equal s "lor" || string_equal s "lxor"
+                || string_equal s "lsl" || string_equal s "lsr"
+                || string_equal s "while" || string_equal s "do" || string_equal s "done"
+                || string_equal s "for" || string_equal s "to" || string_equal s "downto"
 
 let is_sym t s = match t with TSym x -> string_equal x s | _ -> false
 let is_kw t s = match t with TId x -> string_equal x s | _ -> false
@@ -716,6 +723,39 @@ let rec parse_expr toks = match toks with
          match parse_arms rest [] with
          | Err e -> Err e
          | Ok (arms, rest) -> Ok (Match (scrut, arms), rest))
+  | t :: rest when is_kw t "while" ->
+    (match parse_expr rest with
+     | Err e -> Err e
+     | Ok (c, rest) ->
+       match expect rest "do" with
+       | Err e -> Err e
+       | Ok rest ->
+         match parse_seq rest with
+         | Err e -> Err e
+         | Ok (b, rest) ->
+           match expect rest "done" with
+           | Err e -> Err e
+           | Ok rest -> Ok (While (c, b), rest))
+  | t :: TId x :: t2 :: rest when is_kw t "for" && not (keyword x) && is_sym t2 "=" ->
+    (match parse_expr rest with
+     | Err e -> Err e
+     | Ok (lo, rest) ->
+       let (up, rest) = match rest with
+         | d :: r when is_kw d "downto" -> (false, r)
+         | d :: r when is_kw d "to" -> (true, r)
+         | _ -> (true, []) in
+       match parse_expr rest with
+       | Err e -> Err e
+       | Ok (hi, rest) ->
+         match expect rest "do" with
+         | Err e -> Err e
+         | Ok rest ->
+           match parse_seq rest with
+           | Err e -> Err e
+           | Ok (b, rest) ->
+             match expect rest "done" with
+             | Err e -> Err e
+             | Ok rest -> Ok (For (x, lo, hi, up, b), rest))
   | t :: rest when is_kw t "fun" ->
     let (ps, rest) = params rest [] in
     (match ps with
@@ -728,7 +768,7 @@ let rec parse_expr toks = match toks with
          | Err e -> Err e
          | Ok (body, rest) -> Ok (wrap_funs ps body, rest))
   | _ ->
-    match parse_cmp toks with
+    match parse_or toks with
     | Err e -> Err e
     | Ok (lhs, rest) ->
       match rest with
@@ -802,6 +842,29 @@ and parse_arms toks acc =
         | t :: rest2 when is_sym t "|" -> parse_arms rest2 ((q, body) :: acc)
         | _ -> Ok (rev_acc ((q, body) :: acc) [], rest)
 
+(* a && b and a || b are if a then b else false and if a then true else b *)
+and parse_or toks =
+  match parse_and toks with
+  | Err e -> Err e
+  | Ok (a, rest) ->
+    match rest with
+    | t :: rest2 when is_sym t "||" ->
+      (match parse_or rest2 with
+       | Err e -> Err e
+       | Ok (b, rest3) -> Ok (If (a, Bool true, b), rest3))
+    | _ -> Ok (a, rest)
+
+and parse_and toks =
+  match parse_cmp toks with
+  | Err e -> Err e
+  | Ok (a, rest) ->
+    match rest with
+    | t :: rest2 when is_sym t "&&" ->
+      (match parse_and rest2 with
+       | Err e -> Err e
+       | Ok (b, rest3) -> Ok (If (a, b, Bool false), rest3))
+    | _ -> Ok (a, rest)
+
 and parse_cmp toks =
   match parse_cons toks with
   | Err e -> Err e
@@ -840,17 +903,31 @@ and arith_more a toks = match toks with
   | _ -> Ok (a, toks)
 
 and parse_term toks =
-  match parse_app toks with
+  match parse_shift toks with
   | Err e -> Err e
   | Ok (a, rest) -> term_more a rest
 and term_more a toks = match toks with
   | t :: rest when is_sym t "*" || is_sym t "/" || is_kw t "mod"
-                   || is_sym t "*." || is_sym t "/." ->
-    let op = match t with TSym s -> s | _ -> "mod" in
-    (match parse_app rest with
+                   || is_sym t "*." || is_sym t "/."
+                   || is_kw t "land" || is_kw t "lor" || is_kw t "lxor" ->
+    let op = match t with TSym s -> s | TId s -> s | _ -> "mod" in
+    (match parse_shift rest with
      | Err e -> Err e
      | Ok (b, rest) -> term_more (Binop (op, a, b)) rest)
   | _ -> Ok (a, toks)
+
+(* lsl and lsr bind tighter than * and associate to the right *)
+and parse_shift toks =
+  match parse_app toks with
+  | Err e -> Err e
+  | Ok (a, rest) ->
+    match rest with
+    | t :: rest2 when is_kw t "lsl" || is_kw t "lsr" ->
+      let op = match t with TId s -> s | _ -> "lsl" in
+      (match parse_shift rest2 with
+       | Err e -> Err e
+       | Ok (b, rest3) -> Ok (Binop (op, a, b), rest3))
+    | _ -> Ok (a, rest)
 
 and parse_app toks =
   match parse_sel toks with
@@ -1419,6 +1496,8 @@ let field_types f = match find_field !fields f with
 let int_op op =
   string_equal op "+" || string_equal op "-" || string_equal op "*"
   || string_equal op "/" || string_equal op "mod"
+  || string_equal op "land" || string_equal op "lor" || string_equal op "lxor"
+  || string_equal op "lsl" || string_equal op "lsr"
 
 let rec infer env e = match e with
   | Int _ -> Ok TInt
@@ -1505,6 +1584,29 @@ let rec infer env e = match e with
        | Err m -> Err m
        | Ok te -> match unify rt te with Err m -> Err m | Ok () -> Ok ft)
   | Prim (_, _, _) -> Err "a primitive call has no type of its own"
+  | While (c, b) ->
+    (match infer env c with
+     | Err m -> Err m
+     | Ok tc ->
+       match unify tc TBool with
+       | Err _ -> Err "the condition of a while must be a bool"
+       | Ok () -> (match infer env b with Err m -> Err m | Ok _ -> Ok TInt))
+  | For (x, lo, hi, _, b) ->
+    (match infer env lo with
+     | Err m -> Err m
+     | Ok tl ->
+       match unify tl TInt with
+       | Err _ -> Err "the bounds of a for must be ints"
+       | Ok () ->
+         match infer env hi with
+         | Err m -> Err m
+         | Ok th ->
+           match unify th TInt with
+           | Err _ -> Err "the bounds of a for must be ints"
+           | Ok () ->
+             match infer ((x, Forall ([], TInt)) :: env) b with
+             | Err m -> Err m
+             | Ok _ -> Ok TInt)
   | SetField (e, f, v) ->
     (match field_types f with
      | Err m -> Err m
@@ -1661,6 +1763,13 @@ let op_push = 9
 let op_pop = 19
 let op_constint = 103
 let op_stop = 143
+let op_assign = 20
+let op_offsetint = 127
+let op_andint = 115
+let op_orint = 116
+let op_xorint = 117
+let op_lslint = 118
+let op_lsrint = 119
 let op_addint = 110
 let op_subint = 111
 let op_mulint = 112
@@ -1779,7 +1888,7 @@ let code_wr w v =
     io_write a (v land 0xFF);
     io_write (a + 1) ((v lsr 8) land 0xFF);
     io_write (a + 2) ((v lsr 16) land 0xFF);
-    io_write (a + 3) 0
+    io_write (a + 3) (((v lsr 24) land 0x7F) lor (if v < 0 then 0x80 else 0))
   end
 
 (* where the next phrase goes, and the first free global slot *)
@@ -1921,6 +2030,8 @@ let rec free_in e bound acc = match e with
   | Field (b, _) -> free_in b bound acc
   | SetField (b, _, v) -> free_in v bound (free_in b bound acc)
   | Prim (_, _, l) -> free_in_list l bound acc
+  | While (c, b) -> free_in b bound (free_in c bound acc)
+  | For (x, lo, hi, _, b) -> free_in b (x :: bound) (free_in hi bound (free_in lo bound acc))
 and free_in_list l bound acc = match l with
   | [] -> acc
   | x :: r -> free_in_list r bound (free_in x bound acc)
@@ -1963,6 +2074,8 @@ let rec strs_in e acc = match e with
   | Field (b, _) -> strs_in b acc
   | SetField (b, _, v) -> strs_in v (strs_in b acc)
   | Prim (_, _, l) -> strs_in_list l acc
+  | While (c, b) -> strs_in b (strs_in c acc)
+  | For (_, lo, hi, _, b) -> strs_in b (strs_in hi (strs_in lo acc))
   | _ -> acc
 and strs_in_list l acc = match l with
   | [] -> acc
@@ -2029,6 +2142,8 @@ let rec floats_in e acc = match e with
   | Field (b, _) -> floats_in b acc
   | SetField (b, _, v) -> floats_in v (floats_in b acc)
   | Prim (_, _, l) -> floats_in_list l acc
+  | While (c, b) -> floats_in b (floats_in c acc)
+  | For (_, lo, hi, _, b) -> floats_in b (floats_in hi (floats_in lo acc))
   | _ -> acc
 and floats_in_list l acc = match l with
   | [] -> acc
@@ -2217,6 +2332,53 @@ let rec comp env e = match e with
     if idx < 0 then begin comp_err := "unknown field " ^^ f; false end
     else if not_b (comp env b) then false
     else begin emit op_getfield; emit idx; true end
+  | While (c, b) ->
+    (* a backward branch, not a recursive call: there are no tail calls here, and a loop
+       of a hundred thousand turns would be a hundred thousand frames *)
+    let top = here () in
+    if not_b (comp env c) then false
+    else begin
+      emit op_branchifnot; let exit_at = here () in emit 0;
+      if not_b (comp env b) then false
+      else begin
+        emit op_branch; let back = here () in emit 0;
+        patch_branch back top;
+        patch_branch exit_at (here ());
+        emit op_constint; emit 0;
+        true
+      end
+    end
+  | For (x, lo, hi, up, b) ->
+    (* the variable and the (once-evaluated) limit are two stack slots; the variable is
+       compared with the limit, the body runs with the variable in scope, and the variable
+       is stepped in place with ASSIGN *)
+    if not_b (comp env lo) then false
+    else begin
+      emit op_push;
+      let e1 = x :: env in
+      if not_b (comp e1 hi) then false
+      else begin
+        emit op_push;
+        let e2 = "" :: e1 in
+        let top = here () in
+        emit op_acc; emit 0; emit op_push;                  (* the limit, copied *)
+        emit op_acc; emit 2;                                (* the variable *)
+        emit (if up then op_leint else op_geint);
+        emit op_branchifnot; let exit_at = here () in emit 0;
+        if not_b (comp e2 b) then false
+        else begin
+          emit op_acc; emit 1;
+          emit op_offsetint; emit (if up then 1 else 0 - 1);
+          emit op_assign; emit 1;
+          emit op_branch; let back = here () in emit 0;
+          patch_branch back top;
+          patch_branch exit_at (here ());
+          emit op_pop; emit 2;
+          emit op_constint; emit 0;
+          true
+        end
+      end
+    end
   | SetField (b, f, v) ->
     (* the value goes on the stack, the record into the accumulator, and
        SETFIELD takes the one and stores it in the other *)
@@ -2551,6 +2713,11 @@ and comp_binop env op a b =
         else if string_equal op "*" then op_mulint
         else if string_equal op "/" then op_divint
         else if string_equal op "mod" then op_modint
+        else if string_equal op "land" then op_andint
+        else if string_equal op "lor" then op_orint
+        else if string_equal op "lxor" then op_xorint
+        else if string_equal op "lsl" then op_lslint
+        else if string_equal op "lsr" then op_lsrint
         else if string_equal op "=" then op_eq
         else if string_equal op "<>" then op_neq
         else if string_equal op "<" then op_ltint

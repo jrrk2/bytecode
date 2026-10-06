@@ -1,0 +1,17 @@
+let sum n = let s = ref 0 in for i = 1 to n do s := !s + i done; !s
+sum 10
+sum 0
+let w n = let i = ref 0 in let s = ref 0 in while !i < n do s := !s + !i; i := !i + 1 done; !s
+w 5
+let big n = let s = ref 0 in for i = 1 to n do s := !s + 1 done; !s
+big 100000
+let nest n = let s = ref 0 in for i = 1 to n do for j = 1 to i do s := !s + 1 done done; !s
+nest 4
+let cl n = let r = ref 0 in for i = 1 to n do r := !r + (fun x -> x * 2) i done; !r
+cl 3
+let dn n = let s = ref 0 in for i = n downto 1 do s := !s * 10 + i done; !s
+dn 3
+let wb n = let c = ref 0 in while true && !c < n do c := !c + 2 done; !c
+wb 7
+let both n = let k = ref 0 in for i = 1 to n do let j = ref i in while !j > 0 do k := !k + 1; j := !j - 1 done done; !k
+both 5
