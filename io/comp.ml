@@ -402,19 +402,21 @@ let substring from upto =
   bytes_to_string b
 
 (* two-character operators first, then one *)
+(* An operator is a run of operator characters, as in OCaml: <=. and ^^ and :=
+   are each one token, and a user may define any of them.  A lone . is field
+   selection, so a point cannot start one; ( ) , [ ] ; { } stand alone. *)
+let is_opchar c =
+  c = 33 || c = 36 || c = 37 || c = 38 || c = 42 || c = 43 || c = 45 || c = 46 || c = 47
+  || c = 58 || c = 60 || c = 61 || c = 62 || c = 63 || c = 64 || c = 94 || c = 124 || c = 126
+
 let symbol_len i =
   let c = char_at i in
-  let d = if i + 1 < !line_len then char_at (i + 1) else 0 in
-  (* +. -. *. /. are two characters, as are <= <> >= -> :: *)
-  if (c = 60 && (d = 61 || d = 62)) || (c = 62 && d = 61) || (c = 45 && d = 62)
-     || (c = 58 && d = 58) || (c = 58 && d = 61) || (c = 60 && d = 45)
-     || (c = 38 && d = 38) || (c = 124 && d = 124)
-     || ((c = 43 || c = 45 || c = 42 || c = 47) && d = 46) then 2
-  else if c = 43 || c = 45 || c = 42 || c = 47 || c = 61 || c = 60 || c = 62
-       || c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 124 || c = 59 || c = 33 || c = 38 || c = 126 || c = 94
-       (* { } . : for records; a float literal and +. -. *. /. are taken
-          before this, so a lone point can only be a field selection *)
-       || c = 123 || c = 125 || c = 46 || c = 58 then 1
+  if is_opchar c && c <> 46 then begin
+    let j = ref (i + 1) in
+    while !j < !line_len && is_opchar (char_at !j) do j := !j + 1 done;
+    !j - i
+  end
+  else if c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 59 || c = 123 || c = 125 || c = 46 then 1
   else 0
 
 type 'a result = Ok of 'a | Err of string
@@ -466,9 +468,15 @@ let tokenize () =
           let ch = char_at !j in
           if ch = 92 && !j + 1 < !line_len then begin
             let e = char_at (!j + 1) in
-            let v = if e = 110 then 10 else if e = 114 then 13
-                    else if e = 116 then 9 else e in
-            bytes_set b !n (char_of_int v); n := !n + 1; j := !j + 2
+            if e = 120 && !j + 3 < !line_len && is_hex (char_at (!j + 2)) && is_hex (char_at (!j + 3)) then begin
+              (* \xHH *)
+              bytes_set b !n (char_of_int (hex_val (char_at (!j + 2)) * 16 + hex_val (char_at (!j + 3))));
+              n := !n + 1; j := !j + 4
+            end else begin
+              let v = if e = 110 then 10 else if e = 114 then 13
+                      else if e = 116 then 9 else e in
+              bytes_set b !n (char_of_int v); n := !n + 1; j := !j + 2
+            end
           end else begin
             bytes_set b !n (char_of_int ch); n := !n + 1; j := !j + 1
           end
@@ -479,6 +487,13 @@ let tokenize () =
           for k = 0 to !n - 1 do bytes_set r k (bytes_get b k) done;
           go (!j + 1) (TStr (bytes_to_string r) :: acc)
         end
+      end else if c = 39 && i + 2 < !line_len && char_at (i + 1) <> 92 && char_at (i + 2) = 39 then begin
+        go (i + 3) (TInt (char_at (i + 1)) :: acc)
+      end else if c = 39 && i + 3 < !line_len && char_at (i + 1) = 92 && char_at (i + 3) = 39 then begin
+        let e = char_at (i + 2) in
+        let v = if e = 110 then 10 else if e = 114 then 13 else if e = 116 then 9
+                else if e = 48 then 0 else e in
+        go (i + 4) (TInt v :: acc)
       end else if c = 39 && i + 1 < !line_len && is_alpha (char_at (i + 1)) then begin
         let j = ref (i + 1) in
         while !j < !line_len && (is_alpha (char_at !j) || is_digit (char_at !j)) do j := !j + 1 done;
@@ -516,6 +531,8 @@ type expr =
   | SetField of expr * string * expr      (* e.f <- v, and r := v is r.contents <- v *)
   | Prim of int * int * expr list         (* an external, applied to all its arguments: kind, code, arguments *)
   | While of expr * expr                  (* while c do b done *)
+  | ArrLit of expr list                   (* [| a; b; c |] *)
+  | Guard of expr * expr                  (* the body of a match arm that has a when: guard, body *)
   | For of string * expr * expr * bool * expr   (* for x = lo to hi do b done: up?, or downto *)
 and pat =
   | PWild
@@ -545,6 +562,7 @@ let keyword s = string_equal s "try" || string_equal s "with"
                 || string_equal s "lsl" || string_equal s "lsr"
                 || string_equal s "while" || string_equal s "do" || string_equal s "done"
                 || string_equal s "for" || string_equal s "to" || string_equal s "downto"
+                || string_equal s "and" || string_equal s "when"
 
 let is_sym t s = match t with TSym x -> string_equal x s | _ -> false
 let is_kw t s = match t with TId x -> string_equal x s | _ -> false
@@ -563,9 +581,27 @@ let ( ^^ ) a b =
   for i = 0 to m - 1 do bytes_set r (n + i) (string_get b i) done;
   bytes_to_string r
 
+(* what the parser is looking at, for a message: "expected ) but found then" *)
+let tok_str t = match t with
+  | TInt _ -> "a number"
+  | TFloat _ -> "a number"
+  | TStr _ -> "a string"
+  | TId x -> x
+  | TSym x -> x
+
+let found toks = match toks with
+  | t :: _ -> " but found " ^^ tok_str t
+  | [] -> " but the line ended"
+
 let expect toks s = match toks with
-  | t :: rest -> if is_sym t s || is_kw t s then Ok rest else Err ("expected " ^^ s)
-  | [] -> Err ("expected " ^^ s)
+  | t :: rest -> if is_sym t s || is_kw t s then Ok rest else Err ("expected " ^^ s ^^ found toks)
+  | [] -> Err ("expected " ^^ s ^^ found toks)
+
+(* an operator that parses as a comparison but is not one of the six built in *)
+let user_cmp_op op =
+  string_length op > 1
+  && (let c = int_of_char (string_get op 0) in c = 60 || c = 62 || c = 61)
+  && not (string_equal op "<>" || string_equal op "<=" || string_equal op ">=" || string_equal op "<-")
 
 (* skip a type written after a colon, up to the parenthesis that closes
    its group: "(x : int -> int)" and "(f : (int -> int) list)" *)
@@ -809,38 +845,107 @@ and parse_let toks need_in =
   let (recursive, toks) = match toks with
     | t :: rest when is_kw t "rec" -> (true, rest)
     | _ -> (false, toks) in
-  match toks with
-  | TId name :: rest when not (keyword name) ->
-    let (ps, rest) = params rest [] in
-    (match expect rest "=" with
-     | Err e -> Err e
-     | Ok rest ->
-       match parse_seq rest with
+  match parse_binding toks with
+  | Err e -> Err e
+  | Ok (name, bound, rest) ->
+    match rest with
+    | t :: rest2 when is_kw t "and" ->
+      (* let a = e1 and b = e2 in body: the bindings do not see each other, so these are
+         taken in turn; a mutually recursive let rec is not compiled yet *)
+      if recursive then Err "let rec ... and is not compiled yet"
+      else
+        (match parse_and_bindings rest2 [] with
+         | Err e -> Err e
+         | Ok (more, rest3) ->
+           match rest3 with
+           | t3 :: rest4 when is_kw t3 "in" ->
+             (match parse_seq rest4 with
+              | Err e -> Err e
+              | Ok (body, rest5) ->
+                let rec nest l = match l with
+                  | [] -> body
+                  | (n, b) :: r -> Let (false, n, b, nest r) in
+                Ok (nest ((name, bound) :: more), rest5))
+           | _ -> Err "expected in after let ... and")
+    | t :: rest when is_kw t "in" ->
+      (match parse_seq rest with
        | Err e -> Err e
-       | Ok (bound, rest) ->
-         let bound = wrap_funs ps bound in
-         match rest with
-         | t :: rest when is_kw t "in" ->
-           (match parse_seq rest with
-            | Err e -> Err e
-            | Ok (body, rest) -> Ok (Let (recursive, name, bound, body), rest))
-         | _ -> if need_in then Err "expected in"
-           else Ok (Let (recursive, name, bound, Var name), rest))
-  | _ -> Err "expected a name after let"
+       | Ok (body, rest) -> Ok (Let (recursive, name, bound, body), rest))
+    | _ -> if need_in then Err ("expected in" ^^ found rest)
+      else Ok (Let (recursive, name, bound, Var name), rest)
+
+(* name params [: type] = expression.  The name may be an operator in parentheses. *)
+and parse_binding toks =
+  let (name, rest) = match toks with
+    | t :: TSym op :: t2 :: rest when is_sym t "(" && is_sym t2 ")" -> (op, rest)
+    | TId n :: rest when not (keyword n) -> (n, rest)
+    | _ -> ("", toks) in
+  if string_equal name "" then Err ("expected a name after let" ^^ found toks)
+  else begin
+    let (ps, rest) = params rest [] in
+    (* a type after the parameters, let x : t = e, is read and dropped *)
+    let rec skip_to_eq r depth = match r with
+      | [] -> []
+      | t :: rest2 ->
+        if is_sym t "(" then skip_to_eq rest2 (depth + 1)
+        else if is_sym t ")" then skip_to_eq rest2 (depth - 1)
+        else if depth = 0 && is_sym t "=" then r
+        else skip_to_eq rest2 depth in
+    let rest = match rest with
+      | t :: r when is_sym t ":" -> skip_to_eq r 0
+      | _ -> rest in
+    match expect rest "=" with
+    | Err e -> Err e
+    | Ok rest ->
+      match parse_seq rest with
+      | Err e -> Err e
+      | Ok (bound, rest) -> Ok (name, wrap_funs ps bound, rest)
+  end
+
+and parse_and_bindings toks acc =
+  match parse_binding toks with
+  | Err e -> Err e
+  | Ok (n, b, rest) ->
+    match rest with
+    | t :: rest2 when is_kw t "and" -> parse_and_bindings rest2 ((n, b) :: acc)
+    | _ -> Ok (rev_acc ((n, b) :: acc) [], rest)
 
 and parse_arms toks acc =
   match parse_pat toks with
   | Err e -> Err e
   | Ok (q, rest) ->
-    match expect rest "->" with
+    (* A | B -> e: alternatives that share a body are one arm each, with the body repeated *)
+    let rec alts rest ps = match rest with
+      | t :: more when is_sym t "|" ->
+        (match parse_pat more with
+         | Err e -> Err e
+         | Ok (q2, r2) -> alts r2 (q2 :: ps))
+      | _ -> Ok (ps, rest) in
+    match alts rest [q] with
     | Err e -> Err e
-    | Ok rest ->
-      match parse_seq rest with
+    | Ok (ps, rest) ->
+      (* p when guard -> e *)
+      let guarded = match rest with
+        | t :: g when is_kw t "when" ->
+          (match parse_expr g with
+           | Err e -> Err e
+           | Ok (ge, r) -> Ok (Some ge, r))
+        | _ -> Ok (None, rest) in
+      match guarded with
       | Err e -> Err e
-      | Ok (body, rest) ->
-        match rest with
-        | t :: rest2 when is_sym t "|" -> parse_arms rest2 ((q, body) :: acc)
-        | _ -> Ok (rev_acc ((q, body) :: acc) [], rest)
+      | Ok (guard, rest) ->
+        match expect rest "->" with
+        | Err e -> Err e
+        | Ok rest ->
+          match parse_seq rest with
+          | Err e -> Err e
+          | Ok (body, rest) ->
+            let body = match guard with Some g -> Guard (g, body) | None -> body in
+            let rec add l acc = match l with [] -> acc | p :: r -> add r ((p, body) :: acc) in
+            let acc = add (rev_acc ps []) acc in
+            match rest with
+            | t :: rest2 when is_sym t "|" -> parse_arms rest2 acc
+            | _ -> Ok (rev_acc acc [], rest)
 
 (* a && b and a || b are if a then b else false and if a then true else b *)
 and parse_or toks =
@@ -866,15 +971,33 @@ and parse_and toks =
     | _ -> Ok (a, rest)
 
 and parse_cmp toks =
-  match parse_cons toks with
+  match parse_concat toks with
   | Err e -> Err e
   | Ok (a, rest) ->
     match rest with
     | TSym op :: rest2 when string_equal op "=" || string_equal op "<>" || string_equal op "<"
                            || string_equal op ">" || string_equal op "<=" || string_equal op ">=" ->
-      (match parse_cons rest2 with
+      (match parse_concat rest2 with
        | Err e -> Err e
        | Ok (b, rest3) -> Ok (Binop (op, a, b), rest3))
+    (* an operator of the program's own that starts like a comparison: <. <=. =. *)
+    | TSym op :: rest2 when user_cmp_op op ->
+      (match parse_concat rest2 with
+       | Err e -> Err e
+       | Ok (b, rest3) -> Ok (App (App (Var op, a), b), rest3))
+    | _ -> Ok (a, rest)
+
+(* @ and ^ and what starts with them: right-associative, looser than ::, tighter
+   than a comparison.  The operator is a function the program defines. *)
+and parse_concat toks =
+  match parse_cons toks with
+  | Err e -> Err e
+  | Ok (a, rest) ->
+    match rest with
+    | TSym op :: rest2 when string_length op > 0 && (string_get op 0 = '@' || string_get op 0 = '^') ->
+      (match parse_concat rest2 with
+       | Err e -> Err e
+       | Ok (b, rest3) -> Ok (App (App (Var op, a), b), rest3))
     | _ -> Ok (a, rest)
 
 (* :: binds tighter than a comparison and looser than +, and associates to
@@ -959,7 +1082,7 @@ and starts_atom toks = match toks with
   | TFloat _ :: _ -> true
   | TStr _ :: _ -> true
   | TId x :: _ -> not (keyword x) || string_equal x "true" || string_equal x "false"
-  | t :: _ -> is_sym t "(" || is_sym t "[" || is_sym t "{"
+  | t :: _ -> is_sym t "(" || is_sym t "[" || is_sym t "{" || is_sym t "!"
   | [] -> false
 
 and parse_atom toks = match toks with
@@ -977,6 +1100,7 @@ and parse_atom toks = match toks with
      | Err e -> Err e
      | Ok (a, rest) -> Ok (Field (a, "contents"), rest))
   | TId x :: rest when not (keyword x) -> Ok (Var x, rest)
+  | t :: t2 :: rest when is_sym t "[" && is_sym t2 "|" -> parse_arr_lit rest []
   | t :: t2 :: rest when is_sym t "[" && is_sym t2 "]" -> Ok (Con ("[]", []), rest)
   | t :: rest when is_sym t "[" -> parse_list_lit rest
   (* a field list starts "name =", anything else is the record to update *)
@@ -1014,7 +1138,7 @@ and parse_atom toks = match toks with
     (match parse_seq rest with
      | Err e -> Err e
      | Ok (e, rest) -> parse_tuple_rest [e] rest)
-  | _ -> Err "syntax error"
+  | _ -> Err ("syntax error" ^^ found toks)
 
 and parse_tuple_rest acc toks = match toks with
   | t :: rest when is_sym t "," ->
@@ -1023,7 +1147,7 @@ and parse_tuple_rest acc toks = match toks with
      | Ok (e, rest) -> parse_tuple_rest (e :: acc) rest)
   | t :: rest when is_sym t ")" ->
     Ok ((match acc with [e] -> e | _ -> Tuple (rev_acc acc [])), rest)
-  | _ -> Err "expected , or ) "
+  | _ -> Err ("expected , or )" ^^ found toks)
 
 and parse_rec_lit toks acc = match toks with
   | TId f :: (t :: rest) when not (keyword f) && is_sym t "=" ->
@@ -1039,6 +1163,15 @@ and parse_rec_lit toks acc = match toks with
   | TId f :: (t :: rest) when not (keyword f) && is_sym t "}" ->
     Ok (Record (rev_acc ((f, Var f) :: acc) []), rest)
   | _ -> Err "expected a field name in a record"
+
+and parse_arr_lit toks acc =
+  match parse_expr toks with
+  | Err e -> Err e
+  | Ok (e, rest) ->
+    match rest with
+    | t :: rest2 when is_sym t ";" -> parse_arr_lit rest2 (e :: acc)
+    | t :: t2 :: rest2 when is_sym t "|" && is_sym t2 "]" -> Ok (ArrLit (rev_acc (e :: acc) []), rest2)
+    | _ -> Err ("expected ; or |] in an array" ^^ found rest)
 
 and parse_list_lit toks =
   match parse_expr toks with
@@ -1460,7 +1593,7 @@ let rec lookup_sub sub v = match sub with
 
 let rec ty_of_texp sub te = match te with
   | TEVar v -> lookup_sub sub v
-  | TECon (n, []) when string_equal n "int" || string_equal n "unit" -> TInt
+  | TECon (n, []) when string_equal n "int" || string_equal n "unit" || string_equal n "char" -> TInt
   | TECon (n, []) when string_equal n "bool" -> TBool
   | TECon (n, []) when string_equal n "float" -> TFloat
   | TECon (n, []) when string_equal n "string" -> TString
@@ -1584,6 +1717,22 @@ let rec infer env e = match e with
        | Err m -> Err m
        | Ok te -> match unify rt te with Err m -> Err m | Ok () -> Ok ft)
   | Prim (_, _, _) -> Err "a primitive call has no type of its own"
+  | Guard (g, b) ->
+    (match infer env g with
+     | Err m -> Err m
+     | Ok tg ->
+       match unify tg TBool with
+       | Err _ -> Err "a when guard must be a bool"
+       | Ok () -> infer env b)
+  | ArrLit es ->
+    let a = fresh_tv () in
+    let rec go l = match l with
+      | [] -> Ok (TCon ("array", [a]))
+      | e :: r ->
+        (match infer env e with
+         | Err m -> Err m
+         | Ok te -> match unify a te with Err m -> Err m | Ok () -> go r) in
+    go es
   | While (c, b) ->
     (match infer env c with
      | Err m -> Err m
@@ -2031,6 +2180,8 @@ let rec free_in e bound acc = match e with
   | SetField (b, _, v) -> free_in v bound (free_in b bound acc)
   | Prim (_, _, l) -> free_in_list l bound acc
   | While (c, b) -> free_in b bound (free_in c bound acc)
+  | ArrLit l -> free_in_list l bound acc
+  | Guard (g, b) -> free_in b bound (free_in g bound acc)
   | For (x, lo, hi, _, b) -> free_in b (x :: bound) (free_in hi bound (free_in lo bound acc))
 and free_in_list l bound acc = match l with
   | [] -> acc
@@ -2075,6 +2226,8 @@ let rec strs_in e acc = match e with
   | SetField (b, _, v) -> strs_in v (strs_in b acc)
   | Prim (_, _, l) -> strs_in_list l acc
   | While (c, b) -> strs_in b (strs_in c acc)
+  | ArrLit l -> strs_in_list l acc
+  | Guard (g, b) -> strs_in b (strs_in g acc)
   | For (_, lo, hi, _, b) -> strs_in b (strs_in hi (strs_in lo acc))
   | _ -> acc
 and strs_in_list l acc = match l with
@@ -2143,6 +2296,8 @@ let rec floats_in e acc = match e with
   | SetField (b, _, v) -> floats_in v (floats_in b acc)
   | Prim (_, _, l) -> floats_in_list l acc
   | While (c, b) -> floats_in b (floats_in c acc)
+  | ArrLit l -> floats_in_list l acc
+  | Guard (g, b) -> floats_in b (floats_in g acc)
   | For (_, lo, hi, _, b) -> floats_in b (floats_in hi (floats_in lo acc))
   | _ -> acc
 and floats_in_list l acc = match l with
@@ -2326,6 +2481,7 @@ let rec comp env e = match e with
     end
   | Con (c, args) -> comp_con env c args
   | Tuple es -> comp_block env 0 es
+  | ArrLit es -> comp_block env 0 es
   | Match (scrut, arms) -> comp_match env scrut arms
   | Field (b, f) ->
     let idx = field_index (rec_field_names (rec_type_of_field f)) f 0 in
@@ -2466,7 +2622,6 @@ and comp_block env tag es =
   let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
   let n = count es in
   if n = 0 then begin emit op_constint; emit 0; true end
-  else if n > 3 then begin comp_err := "more than three fields is not compiled yet"; false end
   else begin
     let rec rev l acc = match l with [] -> acc | x :: r -> rev r (x :: acc) in
     let rec push_rest l e = match l with
@@ -2486,8 +2641,11 @@ and comp_block env tag es =
       | first :: _ ->
         if not_b (comp e2 first) then false
         else begin
-          emit (if n = 1 then op_makeblock1 else if n = 2 then op_makeblock2 else op_makeblock3);
-          emit tag; true
+          (if n <= 3 then begin
+             emit (if n = 1 then op_makeblock1 else if n = 2 then op_makeblock2 else op_makeblock3);
+             emit tag
+           end else begin emit op_makeblock; emit n; emit tag end);
+          true
         end
     end
   end
@@ -2612,10 +2770,24 @@ and comp_match env scrut arms =
           match comp_bind env depth [] pat 0 with
           | Err m -> comp_err := m; ok := false
           | Ok (env2, pushed) ->
-            if not_b (comp env2 body) then ok := false
+            (* a when guard is tested with the variables bound; if it fails they are
+               popped and the next arm is tried, as if the pattern had not matched *)
+            let (guard, body) = match body with Guard (g, b) -> (Some g, b) | _ -> (None, body) in
+            let gfail = ref 0 in
+            let guard_ok = match guard with
+              | None -> true
+              | Some g ->
+                if not_b (comp env2 g) then false
+                else begin emit op_branchifnot; gfail := here (); emit 0; true end in
+            if not_b guard_ok then ok := false
+            else if not_b (comp env2 body) then ok := false
             else begin
               (if pushed > 0 then begin emit op_pop; emit pushed end);
               emit op_branch; ends := here () :: !ends; emit 0;
+              (if !gfail > 0 then begin
+                 code_wr !gfail (here () - !gfail);
+                 (if pushed > 0 then begin emit op_pop; emit pushed end)
+               end);
               let next = here () in
               let rec patch l = match l with
                 | [] -> ()

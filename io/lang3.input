@@ -1,0 +1,27 @@
+let a = [| 10; 20; 30; 40; 50 |]
+array_get a 3
+external array_get : 'a array -> int -> 'a = "%array_safe_get"
+external array_set : 'a array -> int -> 'a -> unit = "%array_safe_set"
+array_get a 4
+array_set a 0 99
+array_get a 0
+type big = { a1 : int; a2 : int; a3 : int; a4 : int; a5 : int }
+let b = { a1 = 1; a2 = 2; a3 = 3; a4 = 4; a5 = 50 }
+b.a5 + b.a1
+let x : int = 5
+let f (y : int) : int = y + 1
+f x
+let p = 1 and q = 2 in p + q
+let d = 'a'
+d + 1
+'\n'
+let ( ^^ ) a b = a + b * 10
+1 ^^ 2
+let ( <. ) a b = a < b
+1 <. 2
+let m x = match x with 1 | 2 -> 10 | n when n > 5 -> 20 | _ -> 30
+m 2
+m 7
+m 4
+let s = "\x41B"
+s
