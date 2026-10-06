@@ -337,7 +337,7 @@ static void dhcp_server(const uint8_t *b, int len) {
 // answers these addresses before they get here.  $ETHMODEL_DISK names a backing file: read at the first
 // access and written at exit, so what a program leaves on the disk can be looked at, and a program can
 // be given files to read.
-enum { DISK_BASE = 0x100000, DISK_SIZE = 0x80000, DISK_SIZE_REG = 0x100d };
+enum { DISK_BASE = 0x100000, DISK_SIZE = 0x400000, DISK_SIZE_REG = 0x100d };   // 4 MiB here: the Verilator model has 512 KiB
 static uint8_t disk[DISK_SIZE];
 static int disk_ready;
 static void disk_save(void) {

@@ -3,7 +3,7 @@
 Layout: 16-byte superblock (magic "RFS", file count, first free byte), 64 entries of 32 bytes (name[24], offset,
 length), data from byte 2064.  For +disk= in the simulator or $ETHMODEL_DISK on the host."""
 import struct, sys
-SIZE, DIR, ENT, DATA = 512 * 1024, 16, 32, 16 + 64 * 32
+SIZE, DIR, ENT, DATA = int(__import__("os").environ.get("DISK_KIB", "512")) * 1024, 16, 32, 16 + 64 * 32
 disk = bytearray(SIZE); free = DATA; files = sys.argv[2:]
 for k, spec in enumerate(files):
     name, path = spec.split('=', 1); d = open(path, 'rb').read()

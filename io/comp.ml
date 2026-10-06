@@ -442,18 +442,31 @@ let tokenize () =
           n := !n * 10 + (char_at !j - 48); j := !j + 1
         done;
         (* a point with a digit after it, or a point at the end as OCaml
-           allows in "1.", makes this a float rather than an int *)
-        if !j < !line_len && char_at !j = 46 then begin
-          let whole = float_of_int !n in
-          j := !j + 1;
-          let frac = ref 0.0 and scale = ref 1.0 in
-          while !j < !line_len && is_digit (char_at !j) do
-            scale := !scale *. 10.0;
-            frac := !frac *. 10.0 +. float_of_int (char_at !j - 48);
-            j := !j + 1
-          done;
-          go !j (TFloat (whole +. (if flt_eq !scale 1.0 then 0.0 else !frac /. !scale)) :: acc)
-        end else go !j (TInt !n :: acc)
+           allows in "1.", makes this a float rather than an int; so does an exponent, 1e18 *)
+        let is_float = ref false and mant = ref (float_of_int !n) in
+        (if !j < !line_len && char_at !j = 46 then begin
+           is_float := true;
+           j := !j + 1;
+           let frac = ref 0.0 and scale = ref 1.0 in
+           while !j < !line_len && is_digit (char_at !j) do
+             scale := !scale *. 10.0;
+             frac := !frac *. 10.0 +. float_of_int (char_at !j - 48);
+             j := !j + 1
+           done;
+           mant := !mant +. (if flt_eq !scale 1.0 then 0.0 else !frac /. !scale)
+         end);
+        (if !j + 1 < !line_len && (char_at !j = 101 || char_at !j = 69)
+            && (is_digit (char_at (!j + 1))
+                || ((char_at (!j + 1) = 45 || char_at (!j + 1) = 43) && !j + 2 < !line_len && is_digit (char_at (!j + 2)))) then begin
+           is_float := true;
+           j := !j + 1;
+           let neg = char_at !j = 45 in
+           (if char_at !j = 45 || char_at !j = 43 then j := !j + 1);
+           let ex = ref 0 in
+           while !j < !line_len && is_digit (char_at !j) do ex := !ex * 10 + (char_at !j - 48); j := !j + 1 done;
+           for _i = 1 to !ex do mant := (if neg then !mant /. 10.0 else !mant *. 10.0) done
+         end);
+        if !is_float then go !j (TFloat !mant :: acc) else go !j (TInt !n :: acc)
       end else if is_alpha c then begin
         let j = ref i in
         while !j < !line_len && (is_alpha (char_at !j) || is_digit (char_at !j)) do j := !j + 1 done;
@@ -3522,6 +3535,31 @@ let rfs_get nm =
    turn, the string literals as heap blocks, the globals, the header with its
    CRC, and the directory entry that makes it a file.  What it writes is the
    layout of tools/mkvmimage.py, which the boot sequencer loads. *)
+(* the eight bytes of an IEEE double, low word first and little-endian, worked out by arithmetic:
+   the bits cannot be read from a float here, which is one machine word on the host that runs
+   this and two on the processor.  Zero is eight zero bytes; infinities and NaNs do not come up. *)
+let float_bytes (f : float) =
+  let b = [| 0; 0; 0; 0; 0; 0; 0; 0 |] in
+  (if not_b (flt_eq f 0.0) then begin
+     let neg = flt_lt f 0.0 in
+     let a = if neg then ~-. f else f in
+     let e = ref 0 and m = ref a in
+     while flt_le 2.0 !m do m := !m /. 2.0; e := !e + 1 done;
+     while flt_lt !m 1.0 do m := !m *. 2.0; e := !e - 1 done;
+     let frac = (!m -. 1.0) *. 4503599627370496.0 in                  (* the 52 bits of the fraction *)
+     let hi20 = int_of_float (frac /. 4294967296.0) in
+     let lo = frac -. float_of_int hi20 *. 4294967296.0 in
+     let lo_hi = int_of_float (lo /. 65536.0) in
+     let lo_lo = int_of_float (lo -. float_of_int lo_hi *. 65536.0) in
+     let biased = !e + 1023 in
+     array_set b 0 (lo_lo land 255); array_set b 1 (lo_lo lsr 8);
+     array_set b 2 (lo_hi land 255); array_set b 3 (lo_hi lsr 8);
+     array_set b 4 (hi20 land 255); array_set b 5 ((hi20 lsr 8) land 255);
+     array_set b 6 (((biased land 15) lsl 4) lor ((hi20 lsr 16) land 15));
+     array_set b 7 ((if neg then 128 else 0) lor (biased lsr 4))
+   end);
+  b
+
 let img_name = ref ""
 let sv_cp = ref 0
 let sv_next = ref 0
@@ -3610,10 +3648,25 @@ let img_end (_n : int) =
         "Not_found"; "Match_failure"; "Stack_overflow"; "Sys_blocked_io"; "Assert_failure";
         "Undefined_recursive_module"] 0;
   heap !img_strs;
+  (* a float is a block of tag 253 with its two words, low first *)
+  let rec floats l = match l with
+    | [] -> ()
+    | (v, slot) :: r ->
+      let b = float_bytes v in
+      let at = !hw in
+      img_wr32 (hbase + 4 * at) ((2 lsl 16) lor 253);
+      img_put4 (hbase + 4 * (at + 1)) (array_get b 0) (array_get b 1) (array_get b 2) (array_get b 3);
+      img_put4 (hbase + 4 * (at + 2)) (array_get b 4) (array_get b 5) (array_get b 6) (array_get b 7);
+      hw := at + 3;
+      ptrs := (slot, at lsl 2) :: !ptrs;
+      floats r in
+  floats !img_flts;
   let nglob = !next_global in
   let gbase = hbase + 4 * !hw in
   let total = gbase + 4 * nglob - !img_at in
-  if !img_at + total > io_read disk_size_reg || !img_flts <> [] then begin
+  if !img_at + total > io_read disk_size_reg then begin
+    puts "image too big: "; put_int code_words; puts " code words, "; put_int !hw; puts " heap words, ";
+    put_int nglob; puts " globals; "; put_int (!img_at + total); puts " bytes against a disk of "; put_int (io_read disk_size_reg); newline ();
     img_mode := false;
     cp := !sv_cp; next_global := !sv_next; globals := !sv_globals;
     literals := !sv_lits; float_lits := !sv_flts;
@@ -4187,7 +4240,7 @@ let directive () =
     src_echo := false;
     let size = img_end 0 in
     puts "image "; puts out; puts ": "; put_int n; puts " phrases, ";
-    (if size < 0 then puts "not written (too big, or it has float literals)" else begin put_int size; puts " bytes" end);
+    (if size < 0 then puts "not written" else begin put_int size; puts " bytes" end);
     newline ()
   | _ -> puts "error: unknown directive"; newline ()
 
