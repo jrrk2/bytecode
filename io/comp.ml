@@ -405,10 +405,10 @@ let symbol_len i =
   let d = if i + 1 < !line_len then char_at (i + 1) else 0 in
   (* +. -. *. /. are two characters, as are <= <> >= -> :: *)
   if (c = 60 && (d = 61 || d = 62)) || (c = 62 && d = 61) || (c = 45 && d = 62)
-     || (c = 58 && d = 58)
+     || (c = 58 && d = 58) || (c = 58 && d = 61) || (c = 60 && d = 45)
      || ((c = 43 || c = 45 || c = 42 || c = 47) && d = 46) then 2
   else if c = 43 || c = 45 || c = 42 || c = 47 || c = 61 || c = 60 || c = 62
-       || c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 124 || c = 59
+       || c = 40 || c = 41 || c = 44 || c = 91 || c = 93 || c = 124 || c = 59 || c = 33
        (* { } . : for records; a float literal and +. -. *. /. are taken
           before this, so a lone point can only be a field selection *)
        || c = 123 || c = 125 || c = 46 || c = 58 then 1
@@ -502,6 +502,7 @@ type expr =
   | Record of (string * expr) list
   | With of expr * (string * expr) list   (* { e with f = v } *)
   | Field of expr * string
+  | SetField of expr * string * expr      (* e.f <- v, and r := v is r.contents <- v *)
 and pat =
   | PWild
   | PVar of string
@@ -715,7 +716,23 @@ let rec parse_expr toks = match toks with
          match parse_seq rest with
          | Err e -> Err e
          | Ok (body, rest) -> Ok (wrap_funs ps body, rest))
-  | _ -> parse_cmp toks
+  | _ ->
+    match parse_cmp toks with
+    | Err e -> Err e
+    | Ok (lhs, rest) ->
+      match rest with
+      | t :: rest2 when is_sym t ":=" ->
+        (match parse_expr rest2 with
+         | Err e -> Err e
+         | Ok (rhs, rest3) -> Ok (SetField (lhs, "contents", rhs), rest3))
+      | t :: rest2 when is_sym t "<-" ->
+        (match lhs with
+         | Field (b, f) ->
+           (match parse_expr rest2 with
+            | Err e -> Err e
+            | Ok (rhs, rest3) -> Ok (SetField (b, f, rhs), rest3))
+         | _ -> Err "the left of <- must be a field")
+      | _ -> Ok (lhs, rest)
 
 (* e1; e2 -- a sequence is a let whose name nothing uses.  It sits below
    everything else, as in OCaml: "if c then a; b" is (if c then a); b, while the
@@ -864,6 +881,13 @@ and parse_atom toks = match toks with
   | TId x :: rest when string_equal x "true" -> Ok (Bool true, rest)
   | TId x :: rest when string_equal x "false" -> Ok (Bool false, rest)
   | TId c :: rest when is_ctor c -> Ok (Con (c, []), rest)
+  (* ref e is { contents = e }, !r is r.contents and r := e is r.contents <- e:
+     the references of OCaml are a one-field record, and so they are here *)
+  | TId x :: rest when string_equal x "ref" -> Ok (Fun ("_r", Record [("contents", Var "_r")]), rest)
+  | TSym x :: rest when string_equal x "!" ->
+    (match parse_atom rest with
+     | Err e -> Err e
+     | Ok (a, rest) -> Ok (Field (a, "contents"), rest))
   | TId x :: rest when not (keyword x) -> Ok (Var x, rest)
   | t :: t2 :: rest when is_sym t "[" && is_sym t2 "]" -> Ok (Con ("[]", []), rest)
   | t :: rest when is_sym t "[" -> parse_list_lit rest
@@ -1016,7 +1040,9 @@ let parse_typedecl toks =
        match rest with
        | t :: rest1 when is_sym t "{" ->
          (* a record: fields and their types, rather than constructors *)
-         let rec flds toks acc = match toks with
+         let rec flds toks acc =
+           let toks = match toks with TId m :: r when string_equal m "mutable" -> r | _ -> toks in
+           match toks with
            | TId f :: (t2 :: rest2) when not (keyword f) && is_sym t2 ":" ->
              (match parse_tyexp rest2 with
               | Err e -> Err e
@@ -1284,9 +1310,9 @@ let constructors : (string * (string * string list * tyexp list)) list ref =
 (* field name -> the record type it belongs to, that type's parameters, and
    the field's own type.  A field is looked up by name alone, so the last
    declaration of a name wins, as it does in OCaml. *)
-let fields : (string * (string * string list * tyexp)) list ref = ref []
+let fields : (string * (string * string list * tyexp)) list ref = ref [("contents", ("ref", ["'a"], TEVar "'a"))]
 (* record type name -> its fields in declaration order, for printing *)
-let rec_order : (string * string list) list ref = ref []
+let rec_order : (string * string list) list ref = ref [("ref", ["contents"])]
 (* a type's constructors in the order they were declared, which is what
    decides their tags: the constant ones are numbered among themselves and
    the others among themselves *)
@@ -1439,6 +1465,19 @@ let rec infer env e = match e with
        match infer env e with
        | Err m -> Err m
        | Ok te -> match unify rt te with Err m -> Err m | Ok () -> Ok ft)
+  | SetField (e, f, v) ->
+    (match field_types f with
+     | Err m -> Err m
+     | Ok (rt, ft) ->
+       match infer env e with
+       | Err m -> Err m
+       | Ok te ->
+         match unify rt te with
+         | Err m -> Err m
+         | Ok () ->
+           match infer env v with
+           | Err m -> Err m
+           | Ok tv -> match unify ft tv with Err m -> Err m | Ok () -> Ok TInt)
   | Record fs ->
     (match fs with
      | [] -> Err "a record needs at least one field"
@@ -1628,6 +1667,7 @@ let op_setglobal = 57
 
 let op_switch = 87
 let op_getfield = 71
+let op_setfield = 77
 let op_makeblock = 62
 let op_makeblock1 = 63
 let op_makeblock2 = 64
@@ -1767,6 +1807,7 @@ let rec free_in e bound acc = match e with
   | Record fs -> free_in_fields fs bound acc
   | With (b, fs) -> free_in_fields fs bound (free_in b bound acc)
   | Field (b, _) -> free_in b bound acc
+  | SetField (b, _, v) -> free_in v bound (free_in b bound acc)
 and free_in_list l bound acc = match l with
   | [] -> acc
   | x :: r -> free_in_list r bound (free_in x bound acc)
@@ -1807,6 +1848,7 @@ let rec strs_in e acc = match e with
   | Record fs -> strs_in_fields fs acc
   | With (b, fs) -> strs_in_fields fs (strs_in b acc)
   | Field (b, _) -> strs_in b acc
+  | SetField (b, _, v) -> strs_in v (strs_in b acc)
   | _ -> acc
 and strs_in_list l acc = match l with
   | [] -> acc
@@ -1871,6 +1913,7 @@ let rec floats_in e acc = match e with
   | Record fs -> floats_in_fields fs acc
   | With (b, fs) -> floats_in_fields fs (floats_in b acc)
   | Field (b, _) -> floats_in b acc
+  | SetField (b, _, v) -> floats_in v (floats_in b acc)
   | _ -> acc
 and floats_in_list l acc = match l with
   | [] -> acc
@@ -2036,6 +2079,17 @@ let rec comp env e = match e with
     if idx < 0 then begin comp_err := "unknown field " ^^ f; false end
     else if not_b (comp env b) then false
     else begin emit op_getfield; emit idx; true end
+  | SetField (b, f, v) ->
+    (* the value goes on the stack, the record into the accumulator, and
+       SETFIELD takes the one and stores it in the other *)
+    let idx = field_index (rec_field_names (rec_type_of_field f)) f 0 in
+    if idx < 0 then begin comp_err := "unknown field " ^^ f; false end
+    else if not_b (comp env v) then false
+    else begin
+      emit op_push;
+      if not_b (comp ("" :: env) b) then false
+      else begin emit op_setfield; emit idx; true end
+    end
   | Record fs ->
     let names = rec_field_names (match fs with (f, _) :: _ -> rec_type_of_field f | [] -> "") in
     let bad = ref false in
