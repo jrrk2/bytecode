@@ -2443,6 +2443,14 @@ let emit w =
   end
 let here () = em_barrier := !cp; !cp
 
+(* raise Match_failure: the exception value is a block of the predefined constructor (global 7) and its
+   argument, which is the location in OCaml and here is 0 *)
+let emit_match_failure () =
+  emit 103; emit 0; emit 9;            (* CONSTINT 0; PUSH *)
+  emit 53; emit 7;                     (* GETGLOBAL 7 *)
+  emit 64; emit 0;                     (* MAKEBLOCK2, tag 0 *)
+  emit 91                              (* RAISE *)
+
 (* a branch's operand is relative to itself *)
 let patch_branch at target = code_wr at (target - at)
 
@@ -3232,20 +3240,23 @@ and comp_match_switch env scrut arms nc nb =
     go 0 arms;
     if not_b !ok then false
     else begin
+      let rec first_arm slot k l = match l with
+        | [] -> 0 - 1
+        | (pat, _) :: r ->
+          let sl = arm_slot pat in
+          if sl = slot || sl = 0 - 1 then k else first_arm slot (k + 1) r in
+      (* Match_failure, predefined global 7, raised -- but only if some path can get there: a slot no
+         arm takes, or a nested pattern or guard with no later arm to fall to *)
+      let rec open_slot s = s < total && (first_arm s 0 arms < 0 || open_slot (s + 1)) in
+      let rec open_pend l = match l with [] -> false | (t, _) :: r -> t < 0 || open_pend r in
       let nomatch = here () in
-      emit op_constint; emit 0;
+      (if open_slot 0 || open_pend !pend then emit_match_failure ());
       let fin = here () in
       let rec resolve l = match l with
         | [] -> ()
         | (t, p) :: r ->
           code_wr p ((if t < 0 then nomatch else label_of t !labels) - p); resolve r in
       resolve !pend;
-      (* the table: each slot to the first arm that takes it, else to no match *)
-      let rec first_arm slot k l = match l with
-        | [] -> 0 - 1
-        | (pat, _) :: r ->
-          let sl = arm_slot pat in
-          if sl = slot || sl = 0 - 1 then k else first_arm slot (k + 1) r in
       let rec fill s =
         if s < total then begin
           let a = first_arm s 0 arms in
@@ -3272,8 +3283,8 @@ and comp_match_chain env scrut arms =
     let ok = ref true in
     let rec go l = match l with
       | [] ->
-        (* nothing matched: the value is left alone and 0 comes back *)
-        emit op_constint; emit 0
+        (* nothing matched: Match_failure, predefined global 7, raised *)
+        emit_match_failure ()
       | (pat, body) :: r ->
         let fails = ref [] in
         let depth = stack_idx env scrut_name 0 in
@@ -3709,6 +3720,9 @@ let d32_set i v =
 
 let rfs_count () = d32 4
 let rfs_free () = d32 8
+(* where the next file may start after one at a, n long: on a word boundary, so that an image in the
+   disk is read a word at a time by the boot sequencer *)
+let rfs_next at n = (at + n + 3) land (0 - 4)
 
 let rfs_format () =
   d32_set 0 rfs_magic; d32_set 4 0; d32_set 8 rfs_data
@@ -3758,7 +3772,7 @@ let rfs_commit nm at len =
     d32_set (base + rfs_name_max) at;
     d32_set (base + rfs_name_max + 4) len;
     d32_set 4 (k + 1);
-    d32_set 8 (at + len);
+    d32_set 8 (rfs_next at len);
     at
   end
 
@@ -3865,7 +3879,7 @@ let open_out (nm : string) =
   else if n = 0 || n > rfs_name_max then raise (Sys_error (nm ^^ ": Invalid argument"))
   else begin
     let k = rfs_find nm and cnt = rfs_count () in
-    (if k >= 0 && k = cnt - 1 && rfs_offset k + rfs_length k = rfs_free () then begin
+    (if k >= 0 && k = cnt - 1 && rfs_next (rfs_offset k) (rfs_length k) = rfs_free () then begin
        out_ent := k; out_at := rfs_offset k;
        d32_set (rfs_dir + k * rfs_ent + rfs_name_max + 4) 0;
        d32_set 8 !out_at
@@ -3900,7 +3914,7 @@ let output_string (h : int) (s : string) =
 let flush (h : int) =
   out_chk h;
   d32_set (rfs_dir + !out_ent * rfs_ent + rfs_name_max + 4) !out_len;
-  d32_set 8 (!out_at + !out_len)
+  d32_set 8 (rfs_next !out_at !out_len)
 
 let close_out (h : int) = flush h; out_live := false
 
@@ -4130,11 +4144,27 @@ let () = img_end_hook := img_end
    program with it and restarts the machine; the disk is left as it is, so what
    was compiled is still there to be read.  Returns only if there is no such file. *)
 let boot_disk = 0x100e
+(* Chain load a file on the RAM disk.  Its header (tools/mkvmimage.py's layout) is checked and the
+   sequencer is told where the code, heap and globals are, in words from the start of the disk; then 0x100e
+   asks it to load them, replace this program and start the machine again.  The disk stays as it is. *)
 let boot_file (nm : string) =
   let _ = rfs_ready () in
   let k = rfs_find nm in
   if k < 0 then 0 - 1
-  else begin io_write boot_disk (rfs_offset k); 0 end
+  else begin
+    let o = rfs_offset k in
+    let code = d32 (o + 8) and heap = d32 (o + 12) and globals = d32 (o + 16) in
+    if rfs_length k < 32 || o land 3 <> 0 || db o <> 0x4F || db (o + 1) <> 0x43 || db (o + 2) <> 0x56 || db (o + 3) <> 0x4D
+       || code > 65535 || heap > 24576 || globals > 8192
+       || 32 + 4 * (code + heap + globals) > rfs_length k then 0 - 2
+    else begin
+      let w = (o + 32) / 4 in
+      io_write 0x1010 code; io_write 0x1011 heap; io_write 0x1012 globals;
+      io_write 0x1013 w; io_write 0x1014 (w + code); io_write 0x1015 (w + code + heap);
+      io_write boot_disk o;
+      0
+    end
+  end
 
 (* ---- NFS, straight into the RAM disk ----
    ONC RPC over UDP: portmap for mountd, mount for the root handle,
@@ -4780,7 +4810,14 @@ let evaluate_line () =
         (match (try run_phrase e bound_name with
                 | Stack_overflow -> Err "stack overflow"
                 | Out_of_memory -> Err "out of memory"
-                | Invalid_argument _ -> Err "index out of bounds") with
+                | Invalid_argument _ -> Err "index out of bounds"
+                | Match_failure _ -> Err "exception Match_failure"
+                | Not_found -> Err "exception Not_found"
+                | Division_by_zero -> Err "exception Division_by_zero"
+                | End_of_file -> Err "exception End_of_file"
+                | Failure m -> Err ("exception Failure \"" ^^ m ^^ "\"")
+                | Sys_error m -> Err ("exception Sys_error \"" ^^ m ^^ "\"")
+                | _ -> Err "uncaught exception") with
          | Err m -> puts "error: "; puts m; newline ()
          | Ok v ->
            let elapsed = now () - t0 in

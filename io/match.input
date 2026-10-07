@@ -1,0 +1,21 @@
+let f x = match x with 1 -> 10 | 2 -> 20
+f 1
+f 3
+let g x = try f x with _ -> 0 - 1
+g 3
+g 2
+type t = A | B | C
+let h x = match x with A -> 1 | B -> 2
+h B
+let h2 x = try h x with _ -> 99
+h2 C
+let k x = match x with Some y when y > 0 -> y
+let k2 x = try k x with _ -> 77
+k2 (Some 5)
+k2 (Some 0)
+k2 None
+let m x = match x with (1, _) -> 1 | (_, 2) -> 2
+let m2 x = try m x with _ -> 55
+m2 (1, 1)
+m2 (3, 2)
+m2 (3, 3)
