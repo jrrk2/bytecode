@@ -2447,7 +2447,9 @@ let here () = em_barrier := !cp; !cp
 let patch_branch at target = code_wr at (target - at)
 
 (* the doorway: its body is one constant, which is what makes it findable,
-   and a branch written over that constant is how a phrase is entered *)
+   and a branch written over that constant is how a phrase is entered.  The constant is followed
+   by RETURN: in an image the global that holds the marker has the same CONSTINT, followed by
+   something else. *)
 let marker = 0x5EED5E
 let dispatch (_x : int) = 0x5EED5E
 
@@ -2458,7 +2460,7 @@ let find_doorway () =
   cp := last;
   let p = ref 1 and f = ref (0 - 1) in
   while !f < 0 && !p < last do
-    if code_rd !p = marker && code_rd (!p - 1) = op_constint then f := !p - 1;
+    if code_rd !p = marker && code_rd (!p - 1) = op_constint && code_rd (!p + 1) = op_return then f := !p - 1;
     p := !p + 1
   done;
   doorway := !f;
