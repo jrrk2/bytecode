@@ -582,17 +582,13 @@ let rec early_arity c l = match l with
 
 let rec wilds n = if n <= 0 then [] else PWild :: wilds (n - 1)
 
-let keyword s = string_equal s "try" || string_equal s "with"
-                || string_equal s "match" || string_equal s "type" || string_equal s "of"
-                || string_equal s "let" || string_equal s "rec" || string_equal s "in"
-                || string_equal s "if" || string_equal s "then" || string_equal s "else"
-                || string_equal s "fun" || string_equal s "true" || string_equal s "false"
-                || string_equal s "mod" || string_equal s "begin" || string_equal s "end"
-                || string_equal s "land" || string_equal s "lor" || string_equal s "lxor"
-                || string_equal s "lsl" || string_equal s "lsr"
-                || string_equal s "while" || string_equal s "do" || string_equal s "done"
-                || string_equal s "for" || string_equal s "to" || string_equal s "downto"
-                || string_equal s "and" || string_equal s "when"
+let rec mem_name (x : string) l = match l with
+  | [] -> false
+  | y :: r -> string_equal x y || mem_name x r
+
+let keywords = ["try"; "with"; "match"; "type"; "of"; "let"; "rec"; "in"; "if"; "then"; "else"; "fun"; "true"; "false"; "mod"; "begin"; "end"; "land"; "lor"; "lxor"; "lsl"; "lsr"; "while"; "do"; "done"; "for"; "to"; "downto"; "and"; "when"]
+
+let keyword s = mem_name s keywords
 
 let is_sym t s = match t with TSym x -> string_equal x s | _ -> false
 let is_kw t s = match t with TId x -> string_equal x s | _ -> false
@@ -2287,37 +2283,35 @@ let cp = ref 0
    neither do the float functions it already has; "" is how an operator
    comes back from parse_external.  The numbers are positions in the VM's
    primitive table (ocamlrun -p, then vm_io_read and vm_io_write). *)
-let prim_desc p =
-  if string_equal p "%identity" || string_equal p "%bytes_to_string" then Some (0, 0, 1)
-  else if string_equal p "%boolnot" then Some (1, 88, 1)
-  else if string_equal p "%raise" then Some (1, 91, 1)
-  else if string_equal p "%bytes_unsafe_get" then Some (1, 82, 2)
-  else if string_equal p "%bytes_unsafe_set" then Some (1, 83, 3)
-  else if string_equal p "%string_length" then Some (2, 278, 1)
-  else if string_equal p "%string_safe_get" then Some (2, 347, 2)
-  else if string_equal p "%array_safe_get" then Some (2, 13, 2)
-  else if string_equal p "%array_safe_set" then Some (2, 15, 3)
-  else if string_equal p "caml_create_bytes" then Some (2, 82, 1)
-  else if string_equal p "caml_string_equal" then Some (2, 346, 2)
-  else if string_equal p "vm_io_read" then Some (2, 403, 1)
-  else if string_equal p "vm_io_write" then Some (2, 404, 2)
-  else if string_equal p "caml_lt_float" then Some (2, 238, 2)
-  else if string_equal p "caml_le_float" then Some (2, 230, 2)
-  else if string_equal p "caml_eq_float" then Some (2, 104, 2)
-  else None
-
-let externals : (string * (int * int * int)) list ref = ref []
-
-(* the variables the closure just compiled captured, in field order from 2: what let rec patches *)
-let last_caps : string list ref = ref []
+let prim_table = [
+  ("%identity", (0, 0, 1));
+  ("%bytes_to_string", (0, 0, 1));
+  ("%boolnot", (1, 88, 1));
+  ("%raise", (1, 91, 1));
+  ("%bytes_unsafe_get", (1, 82, 2));
+  ("%bytes_unsafe_set", (1, 83, 3));
+  ("%string_length", (2, 278, 1));
+  ("%string_safe_get", (2, 347, 2));
+  ("%array_safe_get", (2, 13, 2));
+  ("%array_safe_set", (2, 15, 3));
+  ("caml_create_bytes", (2, 82, 1));
+  ("caml_string_equal", (2, 346, 2));
+  ("vm_io_read", (2, 403, 1));
+  ("vm_io_write", (2, 404, 2));
+  ("caml_lt_float", (2, 238, 2));
+  ("caml_le_float", (2, 230, 2));
+  ("caml_eq_float", (2, 104, 2))]
 
 let rec find_ext x l = match l with
   | [] -> None
   | (n, d) :: r -> if string_equal n x then Some d else find_ext x r
 
-let rec mem_name (x : string) l = match l with
-  | [] -> false
-  | y :: r -> string_equal x y || mem_name x r
+let prim_desc p = find_ext p prim_table
+
+let externals : (string * (int * int * int)) list ref = ref []
+
+(* the variables the closure just compiled captured, in field order from 2: what let rec patches *)
+let last_caps : string list ref = ref []
 
 let rec tyvars_of te acc = match te with
   | TEVar v -> if mem_name v acc then acc else v :: acc
