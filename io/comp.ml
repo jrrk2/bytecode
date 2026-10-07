@@ -2484,6 +2484,9 @@ let scrut_name = " scrut"
 (* what a closure being compiled has captured, in field order; saved and
    restored around each function so that nesting works *)
 let cap : string list ref = ref []
+(* closure bodies not yet emitted: the CLOSURE operand to patch, the parameters, the body and what
+   it captures.  They go after the code that made them, so nothing has to branch over them. *)
+let pending_bodies : (int * (string list * expr * string list)) list ref = ref []
 (* a literal's global slot, so the same text is installed once *)
 let literals : (string * int) list ref = ref []
 (* boxed, so a float literal is installed the same way a string is *)
@@ -2738,7 +2741,6 @@ let rec comp env e = match e with
       | _ -> (rev_acc acc [], t) in
     let (ps, body) = params e [] in
     let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
-    let n = count ps in
     (* whatever the body uses from out here has to travel with it; a global
        is reachable from anywhere and so is left alone *)
     let fv = free_in body ps [] in
@@ -2770,25 +2772,9 @@ let rec comp env e = match e with
     else begin
       emit op_closure; emit nc;
       let p = here () in emit 0;
-      emit op_branch; let skip = here () in emit 0;
-      (* GRAB's partial application returns a closure pointing one word
-         before the GRAB, where RESTART has to be waiting to unpack what was
-         saved.  Without it the second call lands on whatever preceded the
-         function and takes the machine with it. *)
-      (if n > 1 then emit op_restart);
-      patch_branch p (here ());
-      (if n > 1 then begin emit op_grab; emit (n - 1) end);
-      let saved = !cap in
-      cap := caps;
-      let r = comp ps body in
-      cap := saved;
-      if not_b r then false
-      else begin
-        emit op_return; emit n;
-        patch_branch skip (here ());
-        last_caps := caps;
-        true
-      end
+      pending_bodies := (p, (ps, body, caps)) :: !pending_bodies;
+      last_caps := caps;
+      true
     end
   | Prim (k, c, args) -> comp_prim env k c args
   | App (_, _) when ext_arity env e >= 0 ->
@@ -3367,6 +3353,28 @@ and comp_prim env k c args =
          true
        end)
 
+(* emit the closure bodies that were set aside, each where the code is up to; a body may set more
+   aside.  GRAB's partial application returns a closure pointing one word before the GRAB, where
+   RESTART has to be waiting to unpack what was saved; without it the second call lands on whatever
+   preceded the function and takes the machine with it. *)
+and comp_pending () =
+  match !pending_bodies with
+  | [] -> true
+  | (p, (ps, body, caps)) :: rest ->
+    pending_bodies := rest;
+    let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
+    let n = count ps in
+    em_reset ();
+    (if n > 1 then emit op_restart);
+    patch_branch p (here ());
+    (if n > 1 then begin emit op_grab; emit (n - 1) end);
+    let saved = !cap in
+    cap := caps;
+    let r = comp ps body in
+    cap := saved;
+    if not_b r then begin pending_bodies := []; false end
+    else begin emit op_return; emit n; comp_pending () end
+
 (* let rec f = ... and g = ... in body.  A slot on the stack for each function holds 0 until its
    closure exists; each closure is built capturing those slots (and what else it uses), then each
    slot a closure captured is patched, in the closure, to the closure it stands for.  The names
@@ -3611,6 +3619,7 @@ let run_phrase_body e name =
         end
       end else false
     | _ -> if comp [] e then begin emit op_return; emit 1; true end else false in
+  let ok = if ok then comp_pending () else begin pending_bodies := []; false end in
   (* what was emitted, on the console: there is no other way to look at it *)
   (if !dump_code && ok then begin
      uart_puts "emit ["; uart_dec start; uart_puts ".."; uart_dec (here ()); uart_puts "]:";
