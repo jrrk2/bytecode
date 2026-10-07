@@ -2330,8 +2330,124 @@ let globals_max = 4096
 let next_global = ref 1024
 let doorway = ref (0 - 1)
 
-let emit w = code_wr !cp w; cp := !cp + 1
-let here () = !cp
+(* ---- the emitter ----
+   Code is written a word at a time, and what makes it small is done here, once, not at each of
+   the places that emit: emit knows how many operand words each opcode takes, so it can tell when an
+   instruction is complete and
+     - use the one-word form where there is one (ACC0-7, ENVACC1-4, CONST0-3, GETFIELD0-3, SETFIELD0-3);
+     - fold a PUSH into the instruction before it (PUSHACC, PUSHCONST, PUSHGETGLOBAL, PUSHENVACC);
+     - add two POPs together, and fold POP k into a RETURN that follows it.
+   Nothing is merged across a place a branch may land: here () is how the code asks where it is,
+   so it marks the place, and a merge that would take an instruction away from under it is not done. *)
+let em_last = ref (0 - 1)         (* where the latest instruction starts *)
+let em_op = ref 0                 (* its opcode, as it is now (a merge changes it) *)
+let em_pend = ref 0               (* operand words still to come *)
+let em_nth = ref 0                (* operands so far *)
+let em_prev = ref (0 - 1)         (* the instruction before that, and its opcode *)
+let em_prev_op = ref 0
+let em_barrier = ref (0 - 1)
+let em_ret_add = ref 0
+
+let em_reset () =
+  em_last := 0 - 1; em_op := 0; em_pend := 0; em_nth := 0; em_prev := 0 - 1; em_prev_op := 0;
+  em_barrier := 0 - 1; em_ret_add := 0
+
+(* operand words after the opcode: 0 for nearly everything *)
+let nops op =
+  if op = 36 || op = 43 || op = 55 || op = 56 || op = 62 || op = 98 then 2
+  else if op = 8 || op = 18 || op = 19 || op = 20 || op = 25 || op = 30 || op = 31 || op = 32
+          || (op >= 37 && op <= 40) || op = 42 || op = 53 || op = 54 || op = 57 || op = 58 || op = 59
+          || (op >= 63 && op <= 65) || op = 71 || op = 77 || op = 84 || op = 85 || op = 86 || op = 87
+          || op = 89 || (op >= 93 && op <= 97) || op = 103 || op = 108 || op = 127 || op = 128 then 1
+  else 0
+
+(* the opcode that is this one followed by PUSH, or -1 *)
+let pushed_form op =
+  if op >= 0 && op <= 7 then op + 10
+  else if op = 8 then 18
+  else if op >= 21 && op <= 24 then op + 5
+  else if op = 25 then 30
+  else if op = 53 then 54
+  else if op >= 99 && op <= 102 then op + 5
+  else if op = 103 then 108
+  else 0 - 1
+
+(* PUSH followed by a load is one instruction: PUSHACC n is PUSH then ACC n, which is what the
+   code is doing whenever it has pushed an operand and goes on to fetch the next *)
+let em_fuse () =
+  let f = pushed_form !em_op in
+  let q = !em_last in
+  if f >= 0 && !em_prev >= 0 && !em_prev_op = 9 && !em_prev + 1 = q && !em_barrier <> q then begin
+    let p = !em_prev in
+    let has_operand = !em_op = 8 || !em_op = 25 || !em_op = 53 || !em_op = 103 in
+    (if has_operand then code_wr (p + 1) (code_rd (q + 1)));
+    code_wr p f;
+    cp := p + (if has_operand then 2 else 1);
+    em_last := p; em_op := f; em_prev := 0 - 1; em_prev_op := 0
+  end
+
+let em_done () =
+  let q = !em_last in
+  let op = !em_op in
+  if op = 8 then begin
+    let n = code_rd (q + 1) in
+    (if n < 8 then begin code_wr q n; cp := q + 1; em_op := n end);
+    em_fuse ()
+  end
+  else if op = 25 then begin
+    let n = code_rd (q + 1) in
+    (if n >= 1 && n <= 4 then begin code_wr q (20 + n); cp := q + 1; em_op := 20 + n end);
+    em_fuse ()
+  end
+  else if op = 103 then begin
+    let n = code_rd (q + 1) in
+    (if n >= 0 && n <= 3 then begin code_wr q (99 + n); cp := q + 1; em_op := 99 + n end);
+    em_fuse ()
+  end
+  else if op = 53 then em_fuse ()
+  else if op >= 0 && op <= 7 then em_fuse ()
+  else if op = 71 then begin
+    let n = code_rd (q + 1) in
+    if n >= 0 && n <= 3 then begin code_wr q (67 + n); cp := q + 1; em_op := 67 + n end
+  end
+  else if op = 77 then begin
+    let n = code_rd (q + 1) in
+    if n >= 0 && n <= 3 then begin code_wr q (73 + n); cp := q + 1; em_op := 73 + n end
+  end
+  else if op = 19 then begin
+    (* POP j then POP k is POP (j + k) *)
+    if !em_prev_op = 19 && !em_prev >= 0 && !em_prev + 2 = q && !em_barrier <> q then begin
+      code_wr (!em_prev + 1) (code_rd (!em_prev + 1) + code_rd (q + 1));
+      cp := q; em_last := !em_prev; em_prev := 0 - 1; em_prev_op := 0
+    end
+  end
+  else if op = 40 && !em_ret_add > 0 then begin
+    code_wr (q + 1) (code_rd (q + 1) + !em_ret_add);
+    em_ret_add := 0
+  end
+
+let emit w =
+  if !em_pend > 0 then begin
+    code_wr !cp w; cp := !cp + 1;
+    em_nth := !em_nth + 1;
+    (if !em_op = 87 && !em_nth = 1 then em_pend := (w land 0xFFFF) + (w lsr 16)
+     else em_pend := !em_pend - 1);
+    if !em_pend = 0 then em_done ()
+  end
+  else begin
+    (* POP k just before a RETURN n is RETURN (n + k) *)
+    (if w = 40 && !em_op = 19 && !em_last >= 0 && !em_barrier <> !cp && !em_last + 2 = !cp then begin
+       em_ret_add := code_rd (!em_last + 1);
+       cp := !em_last;
+       em_last := !em_prev; em_op := !em_prev_op; em_prev := 0 - 1; em_prev_op := 0
+     end);
+    code_wr !cp w;
+    em_prev := !em_last; em_prev_op := !em_op;
+    em_last := !cp; em_op := w; cp := !cp + 1;
+    em_pend := nops w; em_nth := 0;
+    if !em_pend = 0 then em_done ()
+  end
+let here () = em_barrier := !cp; !cp
 
 (* a branch's operand is relative to itself *)
 let patch_branch at target = code_wr at (target - at)
@@ -3325,6 +3441,7 @@ let rec install_all l = match l with
 
 let run_phrase_body e name =
   comp_err := "";
+  em_reset ();
   (* the literals first, each into a global of its own, before anything
      that refers to them is compiled *)
   install_all (strs_in e []);
@@ -3577,6 +3694,7 @@ let img_begin (nm : string) =
   img_frags := []; img_strs := []; img_flts := [];
   img_mode := true;
   cp := 0;
+  em_reset ();
   emit op_branch; emit 0;                       (* word 0 jumps to main, which comes last *)
   0
 
@@ -3670,6 +3788,7 @@ let img_end (_n : int) =
     img_mode := false;
     cp := !sv_cp; next_global := !sv_next; globals := !sv_globals;
     literals := !sv_lits; float_lits := !sv_flts;
+    em_reset ();
     0 - 1
   end else begin
     for g = 0 to nglob - 1 do img_wr32 (gbase + 4 * g) 1 done;       (* int 0 *)
@@ -3692,6 +3811,7 @@ let img_end (_n : int) =
     img_mode := false;
     cp := !sv_cp; next_global := !sv_next; globals := !sv_globals;
     literals := !sv_lits; float_lits := !sv_flts;
+    em_reset ();
     let _ = rfs_commit !img_name !img_at total in
     total
   end
