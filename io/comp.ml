@@ -3142,7 +3142,146 @@ and comp_binds env depth path l i pushed = match l with
      | Err m -> Err m
      | Ok (e2, n2) -> comp_binds e2 depth path r (i + 1) n2)
 
+(* The slot an arm's pattern has in a SWITCH table: constants first, then the constructors that
+   carry arguments, as the machine numbers them.  -1 is an arm that takes anything (_ or a name),
+   -2 one that is not a plain constructor pattern, which rules the dispatch out. *)
+and arm_slot pat = match pat with
+  | PWild -> 0 - 1
+  | PVar _ -> 0 - 1
+  | PCon (c, _) ->
+    (match ctor_layout c with
+     | Ok (nc, _, idx, arity) -> if arity = 0 then idx else nc + idx
+     | Err _ -> 0 - 2)
+  | _ -> 0 - 2
+
+(* the constructors' shape if the whole match can be one dispatch: every arm a constructor of the
+   one type or a catch-all, and at least two constructor arms; else (-1, 0) *)
+and dispatch_shape arms =
+  let rec go l shape count = match l with
+    | [] -> if count >= 2 then shape else (0 - 1, 0)
+    | (pat, _) :: r ->
+      (match pat with
+       | PCon (c, _) ->
+         (match ctor_layout c with
+          | Ok (nc, nb, _, _) ->
+            let (a, _) = shape in
+            if a < 0 then go r (nc, nb) (count + 1)
+            else if shape = (nc, nb) then go r shape (count + 1)
+            else (0 - 1, 0)
+          | Err _ -> (0 - 1, 0))
+       | PWild -> go r shape count
+       | PVar _ -> go r shape count
+       | _ -> (0 - 1, 0)) in
+  go arms (0 - 1, 0) 0
+
+(* the first arm after index i that could take what arm i's pattern would: the same constructor, or
+   a catch-all; -1 if none *)
+and next_arm i slot l =
+  let rec go k l = match l with
+    | [] -> 0 - 1
+    | (pat, _) :: r ->
+      if k > i && (let sl = arm_slot pat in sl = slot || sl = 0 - 1 || slot = 0 - 1) then k else go (k + 1) r in
+  go 0 l
+
+and label_of i labels = match labels with
+  | [] -> 0 - 1
+  | (k, p) :: r -> if k = i then p else label_of i r
+
 and comp_match env scrut arms =
+  let (nc, nb) = dispatch_shape arms in
+  if nc >= 0 then comp_match_switch env scrut arms nc nb
+  else comp_match_chain env scrut arms
+
+(* one SWITCH for the whole match.  Each arm starts at a label of its own; what an arm's nested tests
+   or guard cannot match goes on to the next arm that could take the same constructor.  Nothing
+   matching leaves 0, as in the chain below. *)
+and comp_match_switch env scrut arms nc nb =
+  if not_b (comp env scrut) then false
+  else begin
+    emit op_push;
+    let env = scrut_name :: env in
+    let depth = stack_idx env scrut_name 0 in
+    let total = nc + nb in
+    emit op_switch; emit (nc lor (nb lsl 16));
+    let base = here () in
+    let rec zeros k = if k > 0 then begin emit 0; zeros (k - 1) end in
+    zeros total;
+    let labels = ref [] and pend = ref [] and ends = ref [] and ok = ref true in
+    let rec go i l = match l with
+      | [] -> ()
+      | (pat, body) :: r ->
+        if !ok then begin
+          let here_now = here () in
+          labels := (i, here_now) :: !labels;
+          let nxt = next_arm i (arm_slot pat) arms in
+          let fails = ref [] in
+          let tested = match pat with
+            | PCon (_, subs) -> comp_subtests env depth [] subs 0 fails
+            | _ -> true in
+          if not_b tested then ok := false
+          else begin
+            match comp_bind env depth [] pat 0 with
+            | Err m -> comp_err := m; ok := false
+            | Ok (env2, pushed) ->
+              let (guard, body) = match body with Guard (g, b) -> (Some g, b) | _ -> (None, body) in
+              let gfail = ref 0 in
+              let guard_ok = match guard with
+                | None -> true
+                | Some g ->
+                  if not_b (comp env2 g) then false
+                  else begin emit op_branchifnot; gfail := here (); emit 0; true end in
+              if not_b guard_ok then ok := false
+              else if not_b (comp env2 body) then ok := false
+              else begin
+                (if pushed > 0 then begin emit op_pop; emit pushed end);
+                emit op_branch; ends := here () :: !ends; emit 0;
+                (* a failed guard gives back the variables and goes to the next arm that could match *)
+                (if !gfail > 0 then begin
+                   code_wr !gfail (here () - !gfail);
+                   (if pushed > 0 then begin emit op_pop; emit pushed end);
+                   emit op_branch; pend := (nxt, here ()) :: !pend; emit 0
+                 end);
+                let rec add l = match l with [] -> () | p :: t -> pend := (nxt, p) :: !pend; add t in
+                add !fails;
+                go (i + 1) r
+              end
+          end
+        end in
+    go 0 arms;
+    if not_b !ok then false
+    else begin
+      let nomatch = here () in
+      emit op_constint; emit 0;
+      let fin = here () in
+      let rec resolve l = match l with
+        | [] -> ()
+        | (t, p) :: r ->
+          code_wr p ((if t < 0 then nomatch else label_of t !labels) - p); resolve r in
+      resolve !pend;
+      (* the table: each slot to the first arm that takes it, else to no match *)
+      let rec first_arm slot k l = match l with
+        | [] -> 0 - 1
+        | (pat, _) :: r ->
+          let sl = arm_slot pat in
+          if sl = slot || sl = 0 - 1 then k else first_arm slot (k + 1) r in
+      let rec fill s =
+        if s < total then begin
+          let a = first_arm s 0 arms in
+          let target = if a < 0 then nomatch else label_of a !labels in
+          code_wr (base + s) (target - base);
+          fill (s + 1)
+        end in
+      fill 0;
+      let rec patch l = match l with
+        | [] -> ()
+        | a :: t -> code_wr a (fin - a); patch t in
+      patch !ends;
+      emit op_pop; emit 1;
+      true
+    end
+  end
+
+and comp_match_chain env scrut arms =
   if not_b (comp env scrut) then false
   else begin
     emit op_push;
