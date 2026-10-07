@@ -3768,27 +3768,179 @@ let rfs_add nm len =
   if at + len > io_read disk_size_reg then 0 - 1
   else rfs_commit nm at len
 
-(* what the language sees: a file is a string in and a string out *)
-let rfs_put nm (v : string) =
-  let _ = rfs_ready () in
-  let n = string_length v in
-  let at = rfs_add nm n in
-  if at < 0 then 0 - 1
-  else begin
-    for i = 0 to n - 1 do db_set (at + i) (int_of_char (string_get v i)) done;
-    n
-  end
+(* ---- channels ----
+   open_in and open_out as the standard library has them, over the files of the RAM disk, and the disk
+   itself, raw.  A file is a run of bytes in the disk with a directory entry (name, offset, length);
+   nothing is buffered, so what a channel writes is in the disk at once.
 
-let rfs_get nm =
+   Reading: any number of channels (max_in), each a position in a file.  Writing: one channel at a time,
+   because a file being written is the free space at the end of the used part of the disk and two would
+   want the same bytes.  open_out creates the file, or truncates it if it is the newest, whose space it
+   then takes back; an older file of that name is shadowed (the later entry is the one found) and its
+   space is lost, as on any scratch disk here.  The entry's length, and the free space, are brought up to
+   date by flush and close_out, so a file that is never closed has length 0.
+
+   The exceptions are the predefined ones: End_of_file at the end of a file, Sys_error (with the text the
+   system gives) for a missing file, a closed channel, a full disk.  An in_channel and an out_channel
+   are ints here, a handle each; the compiler types them apart. *)
+let max_in = 8
+let in_off = [| 0; 0; 0; 0; 0; 0; 0; 0 |]      (* the file's data, as a disk offset *)
+let in_len = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+let in_pos = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+let in_live = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+
+let out_live = ref false
+let out_ent = ref 0                             (* its directory entry *)
+let out_at = ref 0                              (* its data, as a disk offset *)
+let out_pos = ref 0                             (* where the next byte goes, from the start of the file *)
+let out_len = ref 0                             (* how far the file reaches *)
+
+let open_in (nm : string) =
   let _ = rfs_ready () in
   let k = rfs_find nm in
-  if k < 0 then Err ("no file " ^^ nm)
+  if k < 0 then raise (Sys_error (nm ^^ ": No such file or directory"))
   else begin
-    let at = rfs_offset k and n = rfs_length k in
-    let b = create_bytes n in
-    for i = 0 to n - 1 do bytes_set b i (char_of_int (db (at + i))) done;
-    Ok (bytes_to_string b)
+    let h = ref (0 - 1) and i = ref 0 in
+    while !h < 0 && !i < max_in do
+      (if array_get in_live !i = 0 then h := !i);
+      i := !i + 1
+    done;
+    if !h < 0 then raise (Sys_error "Too many open files")
+    else begin
+      array_set in_off !h (rfs_offset k); array_set in_len !h (rfs_length k);
+      array_set in_pos !h 0; array_set in_live !h 1;
+      !h
+    end
   end
+
+let in_chk (h : int) =
+  if h < 0 || h >= max_in || array_get in_live h = 0 then raise (Sys_error "Bad file descriptor")
+
+let close_in (h : int) = in_chk h; array_set in_live h 0
+
+let input_char (h : int) =
+  in_chk h;
+  let p = array_get in_pos h in
+  if p >= array_get in_len h then raise End_of_file
+  else begin array_set in_pos h (p + 1); db (array_get in_off h + p) end
+
+(* up to the next newline, which is read and not returned; End_of_file only if there was nothing to read *)
+let input_line (h : int) =
+  in_chk h;
+  let p = array_get in_pos h and len = array_get in_len h and off = array_get in_off h in
+  if p >= len then raise End_of_file
+  else begin
+    let e = ref p in
+    while !e < len && db (off + !e) <> 10 do e := !e + 1 done;
+    let n = !e - p in
+    let b = create_bytes n in
+    for i = 0 to n - 1 do bytes_set b i (char_of_int (db (off + p + i))) done;
+    array_set in_pos h (if !e < len then !e + 1 else !e);
+    bytes_to_string b
+  end
+
+let really_input_string (h : int) (n : int) =
+  in_chk h;
+  let p = array_get in_pos h and off = array_get in_off h in
+  if n < 0 then raise (Invalid_argument "really_input_string")
+  else if p + n > array_get in_len h then raise End_of_file
+  else begin
+    let b = create_bytes n in
+    for i = 0 to n - 1 do bytes_set b i (char_of_int (db (off + p + i))) done;
+    array_set in_pos h (p + n);
+    bytes_to_string b
+  end
+
+let in_channel_length (h : int) = in_chk h; array_get in_len h
+let pos_in (h : int) = in_chk h; array_get in_pos h
+let seek_in (h : int) (p : int) =
+  in_chk h;
+  if p < 0 || p > array_get in_len h then raise (Sys_error "Invalid argument")
+  else array_set in_pos h p
+
+let open_out (nm : string) =
+  let _ = rfs_ready () in
+  let n = string_length nm in
+  if !out_live then raise (Sys_error "Too many open output files")
+  else if n = 0 || n > rfs_name_max then raise (Sys_error (nm ^^ ": Invalid argument"))
+  else begin
+    let k = rfs_find nm and cnt = rfs_count () in
+    (if k >= 0 && k = cnt - 1 && rfs_offset k + rfs_length k = rfs_free () then begin
+       out_ent := k; out_at := rfs_offset k;
+       d32_set (rfs_dir + k * rfs_ent + rfs_name_max + 4) 0;
+       d32_set 8 !out_at
+     end else begin
+       let at = rfs_commit nm (rfs_free ()) 0 in
+       if at < 0 then raise (Sys_error (nm ^^ ": No space left on device"))
+       else begin out_ent := cnt; out_at := at end
+     end);
+    out_pos := 0; out_len := 0; out_live := true;
+    1
+  end
+
+let out_chk (h : int) =
+  if h <> 1 || not !out_live then raise (Sys_error "Bad file descriptor")
+
+let out_room (n : int) =
+  if !out_at + !out_pos + n > io_read disk_size_reg then raise (Sys_error "No space left on device")
+
+let out_byte (c : int) =
+  db_set (!out_at + !out_pos) c;
+  out_pos := !out_pos + 1;
+  if !out_pos > !out_len then out_len := !out_pos
+
+let output_char (h : int) (c : int) = out_chk h; out_room 1; out_byte c
+
+let output_string (h : int) (s : string) =
+  out_chk h;
+  let n = string_length s in
+  out_room n;
+  for i = 0 to n - 1 do out_byte (int_of_char (string_get s i)) done
+
+let flush (h : int) =
+  out_chk h;
+  d32_set (rfs_dir + !out_ent * rfs_ent + rfs_name_max + 4) !out_len;
+  d32_set 8 (!out_at + !out_len)
+
+let close_out (h : int) = flush h; out_live := false
+
+(* give a file up unwritten: its entry goes, and the space with it *)
+let discard_out (h : int) =
+  out_chk h;
+  d32_set 4 !out_ent; d32_set 8 !out_at;
+  out_live := false
+
+let seek_out (h : int) (p : int) =
+  out_chk h;
+  if p < 0 then raise (Sys_error "Invalid argument") else out_pos := p
+
+let pos_out (h : int) = out_chk h; !out_pos
+let out_channel_length (h : int) = out_chk h; !out_len
+
+let file_exists (nm : string) = let _ = rfs_ready () in rfs_find nm >= 0
+
+(* the disk, raw: a byte at an offset from its start *)
+let disk_size (_u : int) = io_read disk_size_reg
+let disk_get (i : int) =
+  if i < 0 || i >= io_read disk_size_reg then raise (Invalid_argument "disk_get") else db i
+let disk_set (i : int) (v : int) =
+  if i < 0 || i >= io_read disk_size_reg then raise (Invalid_argument "disk_set") else db_set i (v land 0xFF)
+
+(* a file as a string in and a string out, for write_file and read_file: -1 or "" if it could not be *)
+let rfs_put nm (v : string) =
+  try
+    let oc = open_out nm in
+    output_string oc v; close_out oc;
+    string_length v
+  with Sys_error _ -> 0 - 1
+
+let rfs_get nm =
+  try
+    let ic = open_in nm in
+    let v = really_input_string ic (in_channel_length ic) in
+    close_in ic;
+    Ok v
+  with Sys_error m -> Err m
 
 (* ---- building an image ----
    image_begin "name" starts one: phrases compiled from then on go into it and
@@ -3828,10 +3980,18 @@ let sv_globals : (string * int) list ref = ref []
 let sv_lits : (string * int) list ref = ref []
 let sv_flts : (float * int) list ref = ref []
 
+let img_oc = ref 0
+
+(* the image is a file being written: the channel makes its entry and says where its data is, the code
+   and the rest go into that space by raw writes as the compilation goes, and image_end gives the
+   file its length. *)
 let img_begin (nm : string) =
-  let _ = rfs_ready () in
+  let oc = (try open_out nm with Sys_error _ -> 0 - 1) in
+  if oc < 0 then 0 - 1
+  else begin
+  img_oc := oc;
   img_name := nm;
-  img_at := rfs_free ();
+  img_at := !out_at;
   sv_cp := !cp; sv_next := !next_global; sv_globals := !globals;
   sv_lits := !literals; sv_flts := !float_lits;
   globals := []; literals := []; float_lits := []; next_global := 12;   (* 0..11 are the predefined exceptions *)
@@ -3841,6 +4001,7 @@ let img_begin (nm : string) =
   em_reset ();
   emit op_branch; emit 0;                       (* word 0 jumps to main, which comes last *)
   0
+  end
 
 (* CRC-16-CCITT (0x1021, from 0xFFFF), a byte at a time: 16 bits fit an int *)
 let crc16_byte crc b =
@@ -3933,6 +4094,7 @@ let img_end (_n : int) =
     cp := !sv_cp; next_global := !sv_next; globals := !sv_globals;
     literals := !sv_lits; float_lits := !sv_flts;
     em_reset ();
+    discard_out !img_oc;
     0 - 1
   end else begin
     for g = 0 to nglob - 1 do img_wr32 (gbase + 4 * g) 1 done;       (* int 0 *)
@@ -3956,7 +4118,8 @@ let img_end (_n : int) =
     cp := !sv_cp; next_global := !sv_next; globals := !sv_globals;
     literals := !sv_lits; float_lits := !sv_flts;
     em_reset ();
-    let _ = rfs_commit !img_name !img_at total in
+    out_len := total;
+    close_out !img_oc;
     total
   end
 
@@ -4383,6 +4546,8 @@ and print_arg v = match v with
 
 (* The pervasives: a value and a type for each, so that "sin 0.5" needs no
    declaration and "sin 1" is refused before it runs. *)
+let tin  = TCon ("in_channel", [])
+let tout = TCon ("out_channel", [])
 let f2f  = TArrow (TFloat, TFloat)
 let ff2f = TArrow (TFloat, TArrow (TFloat, TFloat))
 
@@ -4404,6 +4569,25 @@ let builtins =
     ("nfs_fetch", 2, TArrow (TString, TArrow (TString, TInt)));
     ("nfs_done", 1, TArrow (TInt, TInt));
     ("boot_file", 1, TArrow (TString, TInt));
+    (* channels over the RAM disk's files (see the channel layer), and the disk itself, raw *)
+    ("open_in", 1, TArrow (TString, tin)); ("open_in_bin", 1, TArrow (TString, tin));
+    ("open_out", 1, TArrow (TString, tout)); ("open_out_bin", 1, TArrow (TString, tout));
+    ("close_in", 1, TArrow (tin, TInt)); ("close_out", 1, TArrow (tout, TInt));
+    ("input_char", 1, TArrow (tin, TInt)); ("input_byte", 1, TArrow (tin, TInt));
+    ("input_line", 1, TArrow (tin, TString));
+    ("really_input_string", 2, TArrow (tin, TArrow (TInt, TString)));
+    ("in_channel_length", 1, TArrow (tin, TInt)); ("pos_in", 1, TArrow (tin, TInt));
+    ("seek_in", 2, TArrow (tin, TArrow (TInt, TInt)));
+    ("output_char", 2, TArrow (tout, TArrow (TInt, TInt)));
+    ("output_byte", 2, TArrow (tout, TArrow (TInt, TInt)));
+    ("output_string", 2, TArrow (tout, TArrow (TString, TInt)));
+    ("flush", 1, TArrow (tout, TInt));
+    ("out_channel_length", 1, TArrow (tout, TInt)); ("pos_out", 1, TArrow (tout, TInt));
+    ("seek_out", 2, TArrow (tout, TArrow (TInt, TInt)));
+    ("file_exists", 1, TArrow (TString, TBool));
+    ("disk_size", 1, TArrow (TInt, TInt));
+    ("disk_get", 1, TArrow (TInt, TInt));
+    ("disk_set", 2, TArrow (TInt, TArrow (TInt, TInt)));
     ("image_begin", 1, TArrow (TString, TInt));
     ("image_end", 1, TArrow (TInt, TInt)) ]
 
@@ -4498,14 +4682,16 @@ let words_of_line () =
 let directive () =
   match words_of_line () with
   | [w; out; src] when string_equal w "image" ->
-    let _ = img_begin out in
-    src_echo := true;
-    let n = !fs_run src in
-    src_echo := false;
-    let size = img_end 0 in
-    puts "image "; puts out; puts ": "; put_int n; puts " phrases, ";
-    (if size < 0 then puts "not written" else begin put_int size; puts " bytes" end);
-    newline ()
+    if img_begin out < 0 then begin puts "error: cannot create "; puts out; newline () end
+    else begin
+      src_echo := true;
+      let n = !fs_run src in
+      src_echo := false;
+      let size = img_end 0 in
+      puts "image "; puts out; puts ": "; put_int n; puts " phrases, ";
+      (if size < 0 then puts "not written" else begin put_int size; puts " bytes" end);
+      newline ()
+    end
   | _ -> puts "error: unknown directive"; newline ()
 
 let evaluate_line () =
@@ -4630,33 +4816,44 @@ let () = fs_ls := (fun (_ : int) ->
    newline is a space; and a line that starts in column 0 with let, type, external,
    exception, open or module begins the next phrase.  Each phrase is compiled as though it
    had been typed, from a buffer big enough for it. *)
-let starts_phrase (text : string) i =
-  let n = string_length text in
+(* byte i of what an in channel reads, whatever its position *)
+let inch (ic : int) i = char_of_int (db (array_get in_off ic + i))
+
+let starts_phrase (ic : int) i =
+  let n = array_get in_len ic in
   let at w =
     let m = string_length w in
     i + m < n && (let ok = ref true and j = ref 0 in
                   while !ok && !j < m do
-                    (if string_get text (i + !j) <> string_get w !j then ok := false);
+                    (if inch ic (i + !j) <> string_get w !j then ok := false);
                     j := !j + 1
                   done;
-                  !ok && string_get text (i + m) = ' ') in
+                  !ok && inch ic (i + m) = ' ') in
   at "let" || at "type" || at "external" || at "exception" || at "open" || at "module"
 
-let run_source (text : string) =
-  let n = string_length text in
+let run_source (ic : int) =
+  let n = array_get in_len ic in
   let small = !line in
-  let big = create_bytes (n + 2) in
-  line := big;
+  let cap = ref 4096 in
+  let big = ref (create_bytes !cap) in
+  line := !big;
   let i = ref 0 and count = ref 0 and depth = ref 0 in
-  let put c = bytes_set big !line_len c; line_len := !line_len + 1 in
+  (* the phrase buffer grows to the longest phrase and no further, not to the size of the file *)
+  let put c =
+    (if !line_len + 2 > !cap then begin
+       let nb = create_bytes (2 * !cap) in
+       for k = 0 to !line_len - 1 do bytes_set nb k (bytes_get !big k) done;
+       big := nb; line := nb; cap := 2 * !cap
+     end);
+    bytes_set !big !line_len c; line_len := !line_len + 1 in
   let flush () =
     (* a phrase that is only blanks is nothing *)
     let blank = ref true in
-    for k = 0 to !line_len - 1 do if bytes_get big k <> ' ' then blank := false done;
+    for k = 0 to !line_len - 1 do if bytes_get !big k <> ' ' then blank := false done;
     (if not_b !blank then begin
        (if !src_echo then begin
           puts "@ ";
-          for k = 0 to (if !line_len < 70 then !line_len else 70) - 1 do putc (bytes_get big k) done;
+          for k = 0 to (if !line_len < 70 then !line_len else 70) - 1 do putc (bytes_get !big k) done;
           newline ()
         end);
        evaluate_line (); count := !count + 1
@@ -4664,41 +4861,41 @@ let run_source (text : string) =
     line_len := 0 in
   line_len := 0;
   while !i < n do
-    let c = string_get text !i in
+    let c = inch ic !i in
     if !depth > 0 then begin
-      (if c = '(' && !i + 1 < n && string_get text (!i + 1) = '*' then begin depth := !depth + 1; i := !i + 2 end
-       else if c = '*' && !i + 1 < n && string_get text (!i + 1) = ')' then begin depth := !depth - 1; i := !i + 2 end
+      (if c = '(' && !i + 1 < n && inch ic (!i + 1) = '*' then begin depth := !depth + 1; i := !i + 2 end
+       else if c = '*' && !i + 1 < n && inch ic (!i + 1) = ')' then begin depth := !depth - 1; i := !i + 2 end
        else if c = '"' then begin
          (* a string inside a comment *)
          i := !i + 1;
-         while !i < n && string_get text !i <> '"' do
-           (if string_get text !i = '\\' then i := !i + 1);
+         while !i < n && inch ic !i <> '"' do
+           (if inch ic !i = '\\' then i := !i + 1);
            i := !i + 1
          done;
          i := !i + 1
        end
-       else if c = '\'' && !i + 2 < n && string_get text (!i + 2) = '\'' then i := !i + 3
+       else if c = '\'' && !i + 2 < n && inch ic (!i + 2) = '\'' then i := !i + 3
        else i := !i + 1)
     end
-    else if c = '(' && !i + 1 < n && string_get text (!i + 1) = '*' then begin depth := 1; put ' '; i := !i + 2 end
+    else if c = '(' && !i + 1 < n && inch ic (!i + 1) = '*' then begin depth := 1; put ' '; i := !i + 2 end
     else if c = '"' then begin
       (* a string literal, copied as it stands *)
       put c; i := !i + 1;
-      while !i < n && string_get text !i <> '"' do
-        (if string_get text !i = '\\' && !i + 1 < n then begin put (string_get text !i); i := !i + 1 end);
-        put (string_get text !i); i := !i + 1
+      while !i < n && inch ic !i <> '"' do
+        (if inch ic !i = '\\' && !i + 1 < n then begin put (inch ic !i); i := !i + 1 end);
+        put (inch ic !i); i := !i + 1
       done;
       (if !i < n then begin put '"'; i := !i + 1 end)
     end
-    else if c = '\'' && !i + 2 < n && string_get text (!i + 2) = '\'' then begin
-      put c; put (string_get text (!i + 1)); put c; i := !i + 3
+    else if c = '\'' && !i + 2 < n && inch ic (!i + 2) = '\'' then begin
+      put c; put (inch ic (!i + 1)); put c; i := !i + 3
     end
-    else if c = '\'' && !i + 3 < n && string_get text (!i + 1) = '\\' && string_get text (!i + 3) = '\'' then begin
-      put c; put (string_get text (!i + 1)); put (string_get text (!i + 2)); put c; i := !i + 4
+    else if c = '\'' && !i + 3 < n && inch ic (!i + 1) = '\\' && inch ic (!i + 3) = '\'' then begin
+      put c; put (inch ic (!i + 1)); put (inch ic (!i + 2)); put c; i := !i + 4
     end
     else if c = '\n' then begin
       put ' '; i := !i + 1;
-      (if !i < n && starts_phrase text !i then flush ())
+      (if !i < n && starts_phrase ic !i then flush ())
     end
     else begin put c; i := !i + 1 end
   done;
@@ -4708,9 +4905,12 @@ let run_source (text : string) =
   !count
 
 let () = fs_run := (fun nm ->
-  match rfs_get nm with
-  | Err m -> puts m; newline (); 0
-  | Ok text -> run_source text)
+  try
+    let ic = open_in nm in
+    let n = run_source ic in
+    close_in ic;
+    n
+  with Sys_error m -> puts m; newline (); 0)
 
 (* ---- the UART: a line collected a byte at a time, echoed ---- *)
 (* ---- 32-bit sequence numbers as two 16-bit halves ---- *)
@@ -5291,6 +5491,30 @@ let () =
       (magic (fun (e : string) (f : string) -> nfs_start e f));
     install_fn "nfs_done" (magic (fun (_n : int) -> !nfs_result));
     install_fn "boot_file" (magic (fun (a : string) -> boot_file a));
+    install_fn "open_in" (magic (fun (a : string) -> open_in a));
+    install_fn "open_in_bin" (magic (fun (a : string) -> open_in a));
+    install_fn "open_out" (magic (fun (a : string) -> open_out a));
+    install_fn "open_out_bin" (magic (fun (a : string) -> open_out a));
+    install_fn "close_in" (magic (fun (h : int) -> close_in h; 0));
+    install_fn "close_out" (magic (fun (h : int) -> close_out h; 0));
+    install_fn "input_char" (magic (fun (h : int) -> input_char h));
+    install_fn "input_byte" (magic (fun (h : int) -> input_char h));
+    install_fn "input_line" (magic (fun (h : int) -> input_line h));
+    install_fn "really_input_string" (magic (fun (h : int) (n : int) -> really_input_string h n));
+    install_fn "in_channel_length" (magic (fun (h : int) -> in_channel_length h));
+    install_fn "pos_in" (magic (fun (h : int) -> pos_in h));
+    install_fn "seek_in" (magic (fun (h : int) (p : int) -> seek_in h p; 0));
+    install_fn "output_char" (magic (fun (h : int) (c : int) -> output_char h c; 0));
+    install_fn "output_byte" (magic (fun (h : int) (c : int) -> output_char h c; 0));
+    install_fn "output_string" (magic (fun (h : int) (a : string) -> output_string h a; 0));
+    install_fn "flush" (magic (fun (h : int) -> flush h; 0));
+    install_fn "out_channel_length" (magic (fun (h : int) -> out_channel_length h));
+    install_fn "pos_out" (magic (fun (h : int) -> pos_out h));
+    install_fn "seek_out" (magic (fun (h : int) (p : int) -> seek_out h p; 0));
+    install_fn "file_exists" (magic (fun (a : string) -> file_exists a));
+    install_fn "disk_size" (magic (fun (u : int) -> disk_size u));
+    install_fn "disk_get" (magic (fun (i : int) -> disk_get i));
+    install_fn "disk_set" (magic (fun (i : int) (v : int) -> disk_set i v; 0));
     install_fn "image_begin" (magic (fun (a : string) -> img_begin a));
     install_fn "image_end" (magic (fun (n : int) -> img_end n))
   end;

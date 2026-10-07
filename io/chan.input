@@ -1,0 +1,34 @@
+write_file "a.txt" "hello\nworld\nlast"
+let ic = open_in "a.txt"
+input_line ic
+input_line ic
+input_line ic
+let r = try input_line ic with End_of_file -> "eof"
+in_channel_length ic
+seek_in ic 6
+input_char ic
+pos_in ic
+really_input_string ic 4
+close_in ic
+let oc = open_out "b.txt"
+output_string oc "abc"
+output_char oc 100
+pos_out oc
+seek_out oc 1
+output_char oc 88
+close_out oc
+read_file "b.txt"
+let msg = try (close_in (open_in "nope"); "opened") with Sys_error m -> m
+file_exists "b.txt"
+file_exists "zzz"
+disk_get 0
+disk_size 0
+let oc2 = open_out "b.txt"
+output_string oc2 "second"
+close_out oc2
+read_file "b.txt"
+let rec count ic n = try (let _ = input_char ic in count ic (n + 1)) with End_of_file -> n
+let ic2 = open_in "a.txt"
+count ic2 0
+close_in (open_in "b.txt")
+disk_set 5000000 1
