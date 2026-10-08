@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--log", default="/tmp/bc/board.log")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("boot")
+    sl = sub.add_parser("serial-load"); sl.add_argument("program"); sl.add_argument("disk", nargs="?")
     r = sub.add_parser("run"); r.add_argument("line"); r.add_argument("--until"); r.add_argument("--timeout", type=float, default=120)
     d = sub.add_parser("dump"); d.add_argument("out")
     sc = sub.add_parser("script"); sc.add_argument("file"); sc.add_argument("--until"); sc.add_argument("--timeout", type=float, default=120)
@@ -51,6 +52,23 @@ def main():
     if a.cmd == "boot":
         out = drain(s, until=r"OCaml processor mini-ML[^\n]*\n(?:.|\n)*# ", timeout=300, log=log)
         sys.exit(0 if "mini-ML" in out else 1)
+    elif a.cmd == "serial-load":
+        # the loader's serial window (io/netboot.ml): send 0x01 until it asks, then lengths and bytes, no network
+        prog = open(a.program, "rb").read()
+        disk = (open(a.disk, "rb").read() if a.disk else b"").rstrip(b"\0")       # the RAM disk is zero at power-up: no need to send the tail
+        t0 = time.time(); got = ""
+        while "program length?" not in got and time.time() - t0 < 120:
+            s.write(b"\x01"); s.flush()
+            got += s.read(256).decode("latin-1"); log.write(got.encode("latin-1")); 
+        if "program length?" not in got: sys.exit("the loader did not offer a serial boot")
+        s.reset_input_buffer()
+        def send(b):
+            b = b.replace(b"\x7d", b"\x7d\x5d").replace(b"\x14", b"\x7d\x34")      # the loader unescapes (io/netboot.ml)
+            for k in range(0, len(b), 64):
+                s.write(b[k:k+64]); s.flush(); time.sleep(64 * 10 / 115200 * 0.97)
+        send(len(prog).to_bytes(4, "little")); send(prog)
+        send(len(disk).to_bytes(4, "little")); send(disk)
+        drain(s, until=r"OCaml processor mini-ML[^\n]*\n(?:.|\n)*# ", timeout=300, log=log)
     elif a.cmd == "run":
         send_line(s, a.line)
         drain(s, until=a.until, timeout=a.timeout, quiet=None if a.until else 3, log=log)
@@ -62,7 +80,7 @@ def main():
     elif a.cmd == "dump":
         s.write(b"\x14"); s.flush()
         got = drain(s, timeout=60, quiet=4, log=log, echo=False)
-        lines = [l.strip() for l in got.splitlines() if re.fullmatch(r"[0-9A-Fa-f]{18}", l.strip())]
+        lines = [l.strip() for l in got.splitlines() if re.fullmatch(r"[0-9A-Fa-f]{18}|[0-9A-Fa-f]{37}", l.strip())]
         open(a.out, "w").write("\n".join(lines) + "\n")
         print("%d trace records -> %s" % (len(lines), a.out))
 

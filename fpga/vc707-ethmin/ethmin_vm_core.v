@@ -397,6 +397,10 @@ module ethmin_vm_core #(
 	wire [7:0]  vm_opcode;
 	wire        vm_halted;
 	wire        vm_oob_hit;
+	wire [35:0] vm_env;
+	wire [23:0] vm_dpc;
+	wire        vm_gc_start;
+	wire [19:0] vm_hp;
 	wire        trap_valid;
 	wire [7:0]  trap_prim;
 	wire [31:0] trap_arg0, trap_arg1;
@@ -421,9 +425,9 @@ module ethmin_vm_core #(
 		.trap_valid(trap_valid), .trap_prim(trap_prim),
 		.trap_arg0(trap_arg0), .trap_arg1(trap_arg1),
 		.trap_ready(trap_ready), .trap_result(trap_result),
-		.accu(vm_accu), .sp(vm_sp), .state_out(vm_state), .imm(), .nvars(), .offset(),
+		.accu(), .sp(vm_sp), .state_out(vm_state), .imm(), .nvars(), .offset(),
 		.alloc_wosize(), .alloc_base(), .alloc_tag(), .closure_codeptr(),
-		.closure_nvars(), .closure_i(), .opcode_out(vm_opcode), .tos(), .halted(vm_halted), .oob_hit(vm_oob_hit),
+		.closure_nvars(), .closure_i(), .opcode_out(vm_opcode), .tos(), .halted(vm_halted), .oob_hit(vm_oob_hit), .dbg_accu(vm_accu), .dbg_env(vm_env), .dbg_hp(vm_hp), .dbg_pc(vm_dpc), .gc_start(vm_gc_start),
 		.putc_valid(putc_valid), .putc_char(putc_char),
 		.load_we(load_we), .load_globals(load_globals), .load_addr(load_addr),
 		.load_data(load_data), .image_heap_words(image_words));
@@ -521,8 +525,8 @@ module ethmin_vm_core #(
 	wire [7:0] tr_byte;
 	wire       tr_ready = !uf_full && !putc_valid && io_state != IO_UART;
 	vm_trace #(.DEPTH_LOG2(TRACE_LOG2)) trace (
-		.clk(clk_sys), .resetn(resetn), .state(vm_state), .pc(pc[23:0]), .sp(vm_sp), .accu(vm_accu),
-		.opcode(vm_opcode), .halted(vm_halted), .freeze(vm_oob_hit), .dump_req(tr_dump),
+		.clk(clk_sys), .resetn(resetn), .state(vm_state), .pc(vm_dpc), .sp(vm_sp), .accu(vm_accu),
+		.opcode(vm_opcode), .halted(vm_halted), .freeze(vm_oob_hit), .arm(vm_gc_start && code_bank), .dump_req(tr_dump), .env(vm_env), .hp(vm_hp),
 		.out_byte(tr_byte), .out_valid(tr_valid_raw), .out_ready(tr_ready));
 	assign tr_valid = tr_valid_raw && tr_ready;
 	reg [1:0] io_lane;

@@ -793,6 +793,73 @@ let uart_build () =
   uart_puts " btn=";
   uart_putc (string_get digits (io_read buttons land 0x1F))
 
+(* ---- boot over the serial line, with the network left alone ----
+   For a run whose behaviour must not depend on what is on the network (frames arriving change what the compiler
+   allocates, and so when it collects), the program and the RAM disk come in over the UART.  Within a few
+   seconds of reset the host sends 0x01; then: the program's length (4 bytes, little-endian) and its bytes, with 0x14 and 0x7D escaped as 0x7D and the byte xor 0x20, the
+   RAM disk image's length (4 bytes) and its bytes (0 for none).  The loader checks and boots the program as for
+   TFTP, and leaves a mark in the last byte of the RAM disk (0x4E, "N") that the compiler reads to keep its network
+   handling off too. *)
+let uart_rx = 0x1008
+
+let rec wait_byte limit_ms =
+  let t0 = now () in
+  let rec go () =
+    let c = io_read uart_rx in
+    if c >= 0 then c
+    else if now () - t0 > limit_ms then 0 - 1
+    else go () in
+  go ()
+
+(* 0x14 (Ctrl-T, the trace dump) never reaches a program, so the stream escapes it: 0x7D then the byte xor 0x20 *)
+let sbyte () =
+  let c = wait_byte 5000 in
+  if c = 0x7D then (let d = wait_byte 5000 in if d < 0 then d else d lxor 0x20) else c
+
+let serial_len () =
+  let a = sbyte () in let b = sbyte () in let c = sbyte () in let d = sbyte () in
+  if a < 0 || b < 0 || c < 0 || d < 0 then 0 - 1 else a lor (b lsl 8) lor (c lsl 16) lor (d lsl 24)
+
+let serial_boot () =
+  uart_puts "serial boot: program length?\n";
+  let n1 = serial_len () in
+  if n1 <= 0 || n1 > stage_size then uart_puts "serial boot: bad program length\n"
+  else begin
+    let i = ref 0 and ok = ref true in
+    while !ok && !i < n1 do
+      let c = sbyte () in
+      if c < 0 then ok := false else begin io_write (stage + !i) c; i := !i + 1 end
+    done;
+    if not !ok then uart_puts "serial boot: program cut short\n"
+    else begin
+      let n2 = serial_len () in
+      let disk = io_read 0x100d in
+      if n2 < 0 || n2 > disk - 1 then uart_puts "serial boot: bad disk length\n"
+      else begin
+        let j = ref 0 and ok2 = ref true in
+        while !ok2 && !j < n2 do
+          let c = sbyte () in
+          if c < 0 then ok2 := false else begin io_write (disk_ram + !j) c; j := !j + 1 end
+        done;
+        if not !ok2 then uart_puts "serial boot: disk cut short\n"
+        else begin
+          io_write (disk_ram + disk - 1) 0x4E;                          (* no network, please *)
+          received := n1; img_len := n1;
+          uart_puts "serial boot: "; uart_dec n1; uart_puts " + "; uart_dec n2; uart_puts " bytes\n";
+          check_and_boot ()
+        end
+      end
+    end
+  end
+
+(* the window after reset in which the host may ask for it *)
+let serial_window () =
+  uart_puts "serial boot window\n";
+  let t0 = now () in
+  while now () - t0 < 4000 do
+    if io_read uart_rx = 1 then serial_boot ()
+  done
+
 let () =
   io_write leds 1;
   uart_puts "netboot (OCaml processor): build ";
@@ -800,6 +867,7 @@ let () =
   uart_puts " phy=";
   uart_hex16 (io_read eth_status_phy);
   uart_putc '\n';
+  serial_window ();
   let pkts = ref 0 in
   while true do
     dhcp_tick ();
