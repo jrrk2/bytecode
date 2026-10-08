@@ -31,6 +31,20 @@ collector's bits 35:33, pointers still even words.  The VM word becomes 33 bits.
   mode can trap a type-confused `=`.  Preserved by whole-word moves, dropped by arithmetic, I/O and C primitives; comparison must
   mask it; never relied on for correctness.
 
+## Loader: safer unmarshalling (`io/netboot.ml` `strip_and_boot`, `tools/bc2image.ml`)
+Today it checks the trailer and section table, bounds the staging space, rejects unsupported marshal codes and range-checks
+shared-object references.  Missing:
+* After unmarshalling, require that the read position equals the end of the DATA section and that the object count matches the
+  header; reject otherwise.
+* Record each block start as it is written, and check that every pointer value written (fields and globals) lands on one
+  (including infix headers inside closure blocks); reject a pointer into the middle of a block.
+* Integrity of the raw `.bc` path: the OCVM-image path has a CRC-16 and a primitive digest, the raw bytecode file has none, and
+  TFTP over UDP gives no checksum (our client does not verify the UDP one).  Add a CRC-16 (or CRC-32) trailer from a small
+  `tools/mkbc` step on the host, checked before stripping; also check the primitive table against the VM's.
+* Once words carry kinds (see above), stamp heap pointers and code pointers as they are written, so a corrupted file fails in
+  the loader and not minutes into a run.
+* The same checks in `tools/bc2image.ml`, which writes the simulator's heap image.
+
 ## SD card
 * CMD0/CMD8, then ACMD41, CMD2/3/7, CMD17 reads, 4-bit mode; ML block layer; a small FAT32 reader; `DISK.RFS` as the
   persistent RAM-disk volume, read and written in place; load from the card at power-on, fall back to the network.
