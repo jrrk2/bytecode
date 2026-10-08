@@ -7,7 +7,7 @@ BIT        := $(OUT)/gateware/xilinx_vc707.bit
 
 .PHONY: gateware load term clean
 gateware:
-	PATH=$(LITEX_PY):$(VIVADO_BIN):$$PATH $(LITEX_PY)/python $(TEMPLATE)/vc707_litex.py \
+	PATH=$(LITEX_PY):$(VIVADO_BIN):$$PATH $(LITEX_PY)/python $(CURDIR)/ddr_soc.py \
 	  --cpu-type serv --with-ddr --with-ddr64 --with-led-chaser --flow vivado --build --output-dir $(OUT)
 
 load: $(BIT)
