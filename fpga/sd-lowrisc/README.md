@@ -11,7 +11,10 @@ ETH Zurich / University of Bologna Solderpad Hardware License v0.51.  Keep them 
 One local change, in `sd_data_serial_host.sv`: it ignored `blkcnt` and did one block per start.  It now repeats the
 transfer `blkcnt` times for a multi-block read (CMD18) or write (CMD25): a read goes straight back to `READ_WAIT` (the
 card's next start bit follows the end bit at once), a write passes through `NEXT_BLK`; `crc_ok` covers every block;
-`finish` comes after the last one.  With `blkcnt` 0 or 1 it behaves as before.  `test/tb_multi.sv` checks 3-block reads
+`finish` comes after the last one.  The write-ack wait also changed: the host's own CRC and end bit come back on DAT0
+through the pads and synchronisers a few clocks late, and a CRC ending in zeros looked like the card's ack start bit (a
+zero-filled block left the card in the receive state).  The host now measures that loop delay from its start bit and
+looks for the ack only after the stop bit has had time to come back.  With `blkcnt` 0 or 1 it behaves as before.  `test/tb_multi.sv` checks 3-block reads
 and writes against a behavioural card (iverilog: see its first lines); `test/run_model.sh` runs single blocks through
 `sd_top` against lowRISC's `sdModel.v` (from the sd-card-controller bench) and shows the same results as the original
 host (that model swaps the read and write sides of CMD18/CMD25, so it cannot check multi-block).

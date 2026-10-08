@@ -2,7 +2,8 @@
 // iverilog -g2012 -I.. -o tb tb_multi.sv ../sd_data_serial_host.sv ../sd_crc_16.v && vvp tb
 `timescale 1ns/1ps
 module tb_multi;
-	localparam NB = 3;                       // blocks per transfer
+	localparam NB = 3;
+	parameter ZERO = 0;                      // 1: all-zero data, whose CRC is zero too                       // blocks per transfer
 	reg sd_clk = 0, rst = 1;
 	always #5 sd_clk = ~sd_clk;
 	reg  [31:0] mem [0:1023];                // the 4 KB buffer as the wrapper has it: address steps on rd|we at the falling edge
@@ -10,7 +11,13 @@ module tb_multi;
 	reg  [31:0] dq;
 	wire [31:0] data_out; wire we, rd;
 	wire [3:0]  dat_o; wire dat_oe;
-	reg  [3:0]  dat_i = 4'hF;
+	reg  [3:0]  card_dat = 4'hF;                // what the card drives (0 = pulled up when nobody drives)
+	parameter LAT = 5;                      // pad + synchroniser delay of the board, in SD clocks, on everything the host sees
+	wire [3:0] bus = dat_oe ? dat_o : card_dat;
+	reg  [3:0] bus_d [0:LAT-1];
+	integer q;
+	always @(posedge sd_clk) begin bus_d[0] <= bus; for (q = 1; q < LAT; q = q + 1) bus_d[q] <= bus_d[q-1]; end
+	wire [3:0] dat_i = bus_d[LAT-1];
 	reg  [1:0]  start = 0;
 	wire        crc_ok, finish, busy, dbusy;
 	wire [31:0] wait_o; wire [15:0] cnt;
@@ -32,7 +39,7 @@ module tb_multi;
 
 	// ---- the card sends NB blocks back to back ----
 	reg [15:0] cc [0:3];
-	task send_nibble(input [3:0] n); begin @(negedge sd_clk); dat_i = n; end endtask
+	task send_nibble(input [3:0] n); begin @(negedge sd_clk); card_dat = n; end endtask
 	task card_read_blocks;
 		integer blk, j, l;
 		reg [3:0] nib;
@@ -48,7 +55,7 @@ module tb_multi;
 				for (j = 15; j >= 0; j = j - 1) send_nibble({cc[3][j], cc[2][j], cc[1][j], cc[0][j]});
 				send_nibble(4'hF);                           // end bit; the next block's start bit follows at once
 			end
-			dat_i = 4'hF;
+			card_dat = 4'hF;
 		end
 	endtask
 
@@ -70,20 +77,20 @@ module tb_multi;
 				for (j = 15; j >= 0; j = j - 1) begin @(negedge sd_clk); for (l = 0; l < 4; l = l + 1) rc[l][j] = dat_o[l]; end
 				for (l = 0; l < 4; l = l + 1) if (rc[l] != cc[l]) crc_errs = crc_errs + 1;
 				@(negedge sd_clk);                           // end bit
-				@(negedge sd_clk); dat_i = 4'hE;             // status token: start 0, 010, end 1, then busy
-				@(negedge sd_clk); dat_i = 4'hE;
-				@(negedge sd_clk); dat_i = 4'hF;
-				@(negedge sd_clk); dat_i = 4'hE;
-				@(negedge sd_clk); dat_i = 4'hF;
-				repeat (20) begin @(negedge sd_clk); dat_i = 4'hE; end
-				@(negedge sd_clk); dat_i = 4'hF;
+				@(negedge sd_clk); card_dat = 4'hE;             // status token: start 0, 010, end 1, then busy
+				@(negedge sd_clk); card_dat = 4'hE;
+				@(negedge sd_clk); card_dat = 4'hF;
+				@(negedge sd_clk); card_dat = 4'hE;
+				@(negedge sd_clk); card_dat = 4'hF;
+				repeat (20) begin @(negedge sd_clk); card_dat = 4'hE; end
+				@(negedge sd_clk); card_dat = 4'hF;
 			end
 		end
 	endtask
 
 	integer w; reg fin, ok;
 	initial begin
-		for (i = 0; i < 512*NB; i = i + 1) ref_data[i] = (i * 7 + (i >> 8) * 13 + 5) & 255;
+		for (i = 0; i < 512*NB; i = i + 1) ref_data[i] = ZERO ? 8'h00 : (i * 7 + (i >> 8) * 13 + 5) & 255;
 		repeat (4) @(negedge sd_clk); rst = 0; repeat (4) @(negedge sd_clk);
 
 		// read
@@ -105,7 +112,7 @@ module tb_multi;
 
 		// write
 		for (i = 0; i < 128*NB; i = i + 1) mem[i] = {ref_data[4*i], ref_data[4*i+1], ref_data[4*i+2], ref_data[4*i+3]};
-		rst = 1; repeat (3) @(negedge sd_clk); rst = 0; dat_i = 4'hF; addr = 0; dq = mem[0];
+		rst = 1; repeat (3) @(negedge sd_clk); rst = 0; card_dat = 4'hF; addr = 0; dq = mem[0];
 		repeat (3) @(negedge sd_clk);
 		start = 2'b01;
 		fork card_write_blocks; join_none

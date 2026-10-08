@@ -57,7 +57,7 @@ module tb_top_model;
 			end
 		// 3-block write to blocks 8..10, stop, and read back
 		for (i = 0; i < 128*NB; i = i + 1) mem[i] = {ref_data[4*i], ref_data[4*i+1], ref_data[4*i+2], ref_data[4*i+3]};
-		command(24, 8*512, 3'b101, 3'b001, NB, ok);            $display("CMD25 ok=%b", ok); if (!ok) errors = errors + 1;
+		command(24, 8*512, 3'b101, 3'b101, NB, ok);            $display("CMD25 ok=%b", ok); if (!ok) errors = errors + 1;
 		repeat (2000) @(posedge sd_clk);
 		for (i = 0; i < 1024; i = i + 1) mem[i] = 0;
 		command(17, 8*512, 3'b101, 3'b110, NB, ok);            $display("CMD18 (readback) ok=%b", ok); if (!ok) errors = errors + 1;

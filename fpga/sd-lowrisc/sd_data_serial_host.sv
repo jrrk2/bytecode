@@ -101,6 +101,8 @@ parameter FINISH     = 8'b01000000;
 parameter NEXT_BLK   = 8'b10000000;   // between the blocks of a multi-block write (local change, see README)
 reg [`BLKCNT_W-1:0] blk_left;
 reg crc_bad;
+reg [7:0] lat_cnt;   // clocks from driving the start bit to seeing it come back on DAT0: the board's pad and synchroniser delay
+reg lat_run;
 reg [2:0] crc_status;
 reg busy_int;
 reg [`BLKSIZE_W-1:0] blksize_reg;
@@ -135,6 +137,8 @@ begin: FSM_OUT
         crc_status <= 0;
         crc_lane_ok <= 0;
         crc_bad <= 0;
+        lat_cnt <= 0;
+        lat_run <= 0;
         blk_left <= 0;
         crc_s <= 0;
         we0 <= 0;
@@ -188,6 +192,14 @@ begin: FSM_OUT
             WRITE_DAT: begin
                 transf_cnt_o <= transf_cnt_o + 16'h1;
                 rd <= 0;
+                // measure the loop delay with the start bit (the bus is idle high before it)
+                if (transf_cnt_o == 0) begin
+                    lat_cnt <= 0;
+                    lat_run <= 1;
+                end else if (lat_run) begin
+                    if (!DAT_dat_reg[0]) lat_run <= 0;
+                    else lat_cnt <= lat_cnt + 8'h1;
+                end
                 //special case
                 if (transf_cnt_o == 0) begin
                     crc_rst <= 0;
@@ -245,7 +257,10 @@ begin: FSM_OUT
                 else begin /* wait for write ack */
                     DAT_oe_o <= 0;
                     crc_s[4] <= DAT_dat_reg[0];
-                    if (!DAT_dat_reg[0])
+                    // our own last bits come back through the pads and synchronisers lat_cnt clocks late, and a CRC ending in
+                    // zeros looks like the card's ack start bit: the ack cannot come before the clock after our stop bit
+                    // has come back, so only look from then on (the card leaves two clocks after the end bit)
+                    if (!DAT_dat_reg[0] && transf_cnt_o >= data_cycles + 16 + lat_cnt)
                         state <= WRITE_CRC;
                 end
             end
