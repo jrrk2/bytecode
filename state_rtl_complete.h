@@ -177,6 +177,7 @@
     // obsolete states
     S_OFFSETCLOSURE_READ,
     S_OFFSETCLOSURE_ADD,
+    S_GC_CHECK,
     // Unknown state for debugging
     S_UNKNOWN
 } state_t;

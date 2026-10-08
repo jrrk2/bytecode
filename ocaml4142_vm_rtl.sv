@@ -5,9 +5,14 @@ module ocaml4142_vm_rtl #(
     // The value still lives in [31:0] with the low bit saying integer, as
     // it always has; [35:32] is room for the collector's own metadata.
     parameter int VALUEW     = 36,
-    parameter int STACK_AW   = 16,
+    // the VC707 machine's sizes (fpga/vc707-ethmin/ethmin_vm_core.v): a simulation that runs with more
+    // hides the overflows the board will have
+    // a character on the UART at the events that end a run or change what it is doing: G a collection starts, D it
+    // is done, S stack overflow, O out of memory, H halted on an uncaught exception (bring-up: where a silent board is)
+    parameter bit DEBUG_TRACE = 1'b1,
+    parameter int STACK_AW   = 15,
     parameter int HEAP_AW    = 18,
-    parameter int GLOBALS_AW = 12,
+    parameter int GLOBALS_AW = 13,
     // Initial heap (the program's structured constants) and global table, as
     // laid out by bc2image; the heap allocates from HEAP_INIT_WORDS upwards.
     // In simulation +heap=, +globals= and +heap_words= override them.
@@ -30,6 +35,9 @@ module ocaml4142_vm_rtl #(
     output logic [PCW-1:0] pc,
     input  logic [   31:0] code_rdata,
     input  logic           code_valid,
+    // the word at pc is outside the program (a jump or a return to nowhere): raise "index out of bounds" rather
+    // than execute whatever the fetch unit answers with.  Counts only with code_valid, like code_rdata.
+    input  logic           code_oob,
 
 
     output logic                trap_valid,
@@ -53,6 +61,9 @@ module ocaml4142_vm_rtl #(
     output logic [         7:0] opcode_out,
     output logic [        31:0] tos,
     output logic                halted,
+    // a fetch outside the program was just refused (the cycle before S_BOUND_ERROR): for a trace that freezes
+    // on the first one
+    output logic                oob_hit,
     // caml_ml_output_char: one-cycle strobe with the character written
     output logic                putc_valid,
     output logic [         7:0] putc_char,
@@ -346,6 +357,12 @@ module ocaml4142_vm_rtl #(
   logic [15:0] gc_scan_size;  // the block being scanned (gc_size is the one being copied)
   logic gc_copy_valid, gc_mark_second;
   logic [STACK_AW:0] gc_i;
+  // the collector's self-check (DEBUG_TRACE): after a collection, anything still pointing into the old space
+  logic [2:0]  chk_ph;
+  logic [HEAP_AW:0] chk_idx;
+  logic [15:0] chk_f, chk_size;
+  logic [STACK_AW:0] chk_i;
+  logic [4:0]  chk_seen;
   logic [31:0] gc_need, alloc_need;
   // MULINT's pipeline: operands, then product (see the MULINT arm)
   logic signed [VALUEW-1:0] mul_a, mul_b;
@@ -467,6 +484,8 @@ module ocaml4142_vm_rtl #(
 
   state_t state;
   assign state_out = state;
+  // the first bounds error of any kind freezes a trace: a fetch outside the program, or an index outside a block
+  assign oob_hit   = ((state == S_FETCH) && code_valid && code_oob) || (state == S_BOUND_ERROR);
   
 
 
@@ -978,6 +997,7 @@ module ocaml4142_vm_rtl #(
 
         S_FETCH:
         if (!code_valid) ;  // wait for the fetch unit
+        else if (code_oob) state <= S_BOUND_ERROR;
         else if (sp < STACK_MARGIN[STACK_AW-1:0]) state <= S_STACK_OVERFLOW;
         else begin
           opcode <= opcode_t'(code_rdata[7:0]);
@@ -2143,7 +2163,7 @@ module ocaml4142_vm_rtl #(
             PUSHOFFSETCLOSURE: begin
               sp <= sp - 1;
               stack_write(sp-1, accu);
-              accu <= env + (imm << 2);
+              accu <= env + (VALUEW'($signed(imm)) <<< 2);   // imm is signed: a sibling before this closure has a negative offset, and a zero-extended one carried into the collector's bits
             end
 
 
@@ -2502,7 +2522,7 @@ module ocaml4142_vm_rtl #(
             OFFSETCLOSURE0:  accu <= env;
             OFFSETCLOSURE3:  accu <= env + 12;
             OFFSETCLOSUREM3: accu <= env - 12;
-            OFFSETCLOSURE:   accu <= env + (imm << 2);
+            OFFSETCLOSURE:   accu <= env + (VALUEW'($signed(imm)) <<< 2);   // imm is signed: a sibling before this closure has a negative offset, and a zero-extended one carried into the collector's bits
 
             PUSHOFFSETCLOSURE0: begin
               logic [31:0] old_sp;
@@ -2578,6 +2598,7 @@ module ocaml4142_vm_rtl #(
 
         // ---- GC: roots, then Cheney scan of to-space ----
         S_GC_START: begin
+          if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "G"; end
           to_lo <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
           gc_free <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
           gc_scan <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
@@ -2623,6 +2644,9 @@ module ocaml4142_vm_rtl #(
         endcase
 
         S_GC_ROOT_WB: begin  // store the forwarded root
+          if (DEBUG_TRACE && !gc_new[0] && (gc_new[HEAP_AW+1:2] < to_lo || gc_new[HEAP_AW+1:2] > gc_free)) begin
+            putc_valid <= 1'b1; putc_char <= "P";            // a root forwarded to somewhere other than to-space
+          end
           gc_infix_off <= 0;
           case (gc_phase)
             GC_ACCU: accu <= gc_new;
@@ -2647,6 +2671,9 @@ module ocaml4142_vm_rtl #(
           gc_val <= gc_val - {hm_rd_a[31:16], 2'b00};
           gc_infix_off <= gc_infix_off + hm_rd_a[31:16];
         end else if (hm_rd_a[15:8] == GC_FORWARDED) begin
+          if (DEBUG_TRACE && (hm_rd_b[HEAP_AW+1:2] < to_lo || hm_rd_b[HEAP_AW+1:2] >= gc_free)) begin
+            putc_valid <= 1'b1; putc_char <= "F";            // a forwarding pointer that does not point into to-space
+          end
           gc_new <= hm_rd_b + {gc_infix_off, 2'b00};
           state <= gc_return_to_scan ? S_GC_SCAN_WB : S_GC_ROOT_WB;
         end else begin
@@ -2697,7 +2724,10 @@ module ocaml4142_vm_rtl #(
 
         // Cheney scan: every block copied to to-space has its fields forwarded.
         S_GC_SCAN:
-        if (gc_scan == gc_free) state <= S_GC_DONE;
+        if (gc_scan == gc_free) begin
+          if (DEBUG_TRACE) begin chk_ph <= 0; chk_idx <= to_lo; chk_f <= 0; chk_seen <= 0; state <= S_GC_CHECK; end
+          else state <= S_GC_DONE;
+        end
         else if (!rd_phase) begin
           heap_read_a(gc_scan);
           hold_for_read();
@@ -2723,13 +2753,59 @@ module ocaml4142_vm_rtl #(
         end else gc_j <= gc_j + 1;
 
         S_GC_SCAN_WB: begin
+          if (DEBUG_TRACE && !gc_new[0] && (gc_new[HEAP_AW+1:2] < to_lo || gc_new[HEAP_AW+1:2] > gc_free)) begin
+            putc_valid <= 1'b1; putc_char <= "Q";            // a field forwarded to somewhere other than to-space
+          end
           gc_infix_off <= 0;
           heap_write(gc_scan + 1 + gc_j, gc_new);
           gc_j <= gc_j + 1;
           state <= S_GC_SCAN_FIELD;
         end
 
+        // After the copy, before the spaces swap: no root and no field of a live block may still point into the old
+        // space.  One letter, once per kind per collection, for the first that does: a accu, e env, h a heap
+        // field, s a stack word, g a global.  (The simulator's gc_check_to_space, in a form that synthesizes.)
+        S_GC_CHECK:
+        case (chk_ph)
+          3'd0: begin
+            if (gc_points_to_from(accu) && !chk_seen[0]) begin putc_valid <= 1'b1; putc_char <= "a"; chk_seen[0] <= 1'b1; end
+            chk_ph <= 3'd1;
+          end
+          3'd1: begin
+            if (gc_points_to_from(env) && !chk_seen[1]) begin putc_valid <= 1'b1; putc_char <= "e"; chk_seen[1] <= 1'b1; end
+            chk_ph <= 3'd2;
+          end
+          3'd2:
+          if (chk_idx >= gc_free) begin chk_ph <= 3'd3; chk_i <= {1'b0, sp}; end
+          else if (!rd_phase) begin heap_read_a(chk_idx[HEAP_AW-1:0] + HEAP_AW'(chk_f)); hold_for_read(); end
+          else if (chk_f == 0) begin
+            chk_size <= hm_rd_a[31:16];
+            if (hm_rd_a[7:0] >= NO_SCAN_TAG || hm_rd_a[31:16] == 0) chk_idx <= chk_idx + 1 + hm_rd_a[31:16];
+            else chk_f <= 1;
+          end else begin
+            if (gc_points_to_from(hm_rd_a) && !chk_seen[2]) begin putc_valid <= 1'b1; putc_char <= "h"; chk_seen[2] <= 1'b1; end
+            if (chk_f == chk_size) begin chk_idx <= chk_idx + 1 + chk_size; chk_f <= 0; end
+            else chk_f <= chk_f + 1;
+          end
+          3'd3:
+          if (chk_i >= (1 << STACK_AW) - 1) begin chk_ph <= 3'd4; chk_i <= 0; end
+          else if (!rd_phase) begin stack_read_a(chk_i[STACK_AW-1:0]); hold_for_read(); end
+          else begin
+            if (gc_points_to_from(st_rd_a) && !chk_seen[3]) begin putc_valid <= 1'b1; putc_char <= "s"; chk_seen[3] <= 1'b1; end
+            chk_i <= chk_i + 1;
+          end
+          3'd4:
+          if (chk_i >= (1 << GLOBALS_AW)) chk_ph <= 3'd5;
+          else if (!rd_phase) begin globals_read_a(chk_i[GLOBALS_AW-1:0]); hold_for_read(); end
+          else begin
+            if (gc_points_to_from(gm_rd_a) && !chk_seen[4]) begin putc_valid <= 1'b1; putc_char <= "g"; chk_seen[4] <= 1'b1; end
+            chk_i <= chk_i + 1;
+          end
+          default: state <= S_GC_DONE;
+        endcase
+
         S_GC_DONE: begin
+          if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "D"; end
 `ifndef SYNTHESIS
           gc_check_to_space();
 `endif
@@ -3270,6 +3346,7 @@ module ocaml4142_vm_rtl #(
         // time, so this walks out rather than spinning.
         S_STACK_OVERFLOW:
         if (!rd_phase) begin
+          if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "S"; end
           globals_read_a(STACK_OVERFLOW_EXN[GLOBALS_AW-1:0]);
           hold_for_read();
         end else begin
@@ -3386,6 +3463,7 @@ module ocaml4142_vm_rtl #(
         // everything between is what lets the next collection succeed.
         S_OUT_OF_MEMORY:
         if (!rd_phase) begin
+          if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "O"; end
           globals_read_a(OUT_OF_MEMORY_EXN[GLOBALS_AW-1:0]);
           hold_for_read();
         end else begin
@@ -3396,6 +3474,7 @@ module ocaml4142_vm_rtl #(
         S_RAISE_ENTER: begin
           if (trapsp == {STACK_AW{1'b1}}) begin
             uncaught_exn <= 1'b1;   // no handler left: stop, as STOP does
+            if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "H"; end
             state        <= S_DONE;
           end else begin
             sp    <= trapsp;

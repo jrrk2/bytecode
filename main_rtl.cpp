@@ -24,7 +24,9 @@ static bool code_dirty = false;
 // The RAM disk, as ethmin_vm_core decodes it at 0x100000.  Backed by a file
 // when +disk= names one, so a filesystem can be written and read here and
 // then looked at from outside.
-static uint8_t disk_ram[512 * 1024];
+// the RAM disk: the board's 512 KiB unless $OCVM_DISK_KIB says otherwise (to measure an image that would not fit)
+static uint8_t disk_ram[16 * 1024 * 1024];
+static size_t disk_bytes = 512 * 1024;
 static const char *disk_path = nullptr;
 
 #include <stdio.h>
@@ -188,13 +190,13 @@ static uint16_t crc16_ccitt(const uint8_t *p, size_t n) {
 static void put_be32(std::string &s, uint32_t v) { for (int i = 3; i >= 0; i--) s.push_back((char)(v >> (8 * i))); }
 
 static void boot_from_disk(uint32_t off) {
-    if ((size_t)off + 32 > sizeof(disk_ram)) { printf("BOOT: offset %u is off the disk\n", off); return; }
+    if ((size_t)off + 32 > disk_bytes) { printf("BOOT: offset %u is off the disk\n", off); return; }
     const uint8_t *h = disk_ram + off;
     auto rd32 = [&](uint32_t o) { return (uint32_t)h[o] | (uint32_t)h[o + 1] << 8 | (uint32_t)h[o + 2] << 16 | (uint32_t)h[o + 3] << 24; };
     if (rd32(0) != 0x4D56434Fu || rd32(4) != 1) { printf("BOOT: no image at %u\n", off); return; }
     uint32_t cw = rd32(8), hw = rd32(12), gw = rd32(16), crc = rd32(24);
     size_t body = 4 * ((size_t)cw + hw + gw);
-    if ((size_t)off + 32 + body > sizeof(disk_ram)) { printf("BOOT: the image runs past the disk\n"); return; }
+    if ((size_t)off + 32 + body > disk_bytes) { printf("BOOT: the image runs past the disk\n"); return; }
     if (crc16_ccitt(h + 32, body) != (crc & 0xFFFF)) { printf("BOOT: CRC mismatch\n"); return; }
     if (!Verilated::commandArgsPlusMatch("notrace")[0]) { printf("BOOT from the disk needs +notrace\n"); return; }
 
@@ -237,7 +239,7 @@ static void boot_from_disk(uint32_t off) {
     hex("heap.hex", cw, hw); hex("globals.hex", (size_t)cw + hw, gw);
     // the disk outlives the chain load
     std::string diskfile = (disk_path && *disk_path) ? std::string(disk_path) : dp + "disk.bin";
-    { FILE *f = fopen(diskfile.c_str(), "wb"); if (f) { fwrite(disk_ram, 1, sizeof(disk_ram), f); fclose(f); } }
+    { FILE *f = fopen(diskfile.c_str(), "wb"); if (f) { fwrite(disk_ram, 1, disk_bytes, f); fclose(f); } }
     setenv("ETHMODEL_UART_SKIP", std::to_string(ethmodel_uart_consumed()).c_str(), 1);
 
     std::vector<std::string> args = { g_argv[0], dp + "prog.bc", "+notrace", "+heap=" + dp + "heap.hex",
@@ -258,6 +260,7 @@ typedef char linbuf[256];
 linbuf trace[4096];
 
 int main(int argc, char** argv) {
+    if (getenv("OCVM_DISK_KIB")) disk_bytes = (size_t)atol(getenv("OCVM_DISK_KIB")) * 1024;
     g_argc = argc; g_argv = argv;
     Verilated::commandArgs(argc, argv);
 
@@ -304,6 +307,8 @@ int main(int argc, char** argv) {
     top->reset = 0;
 
     uint64_t cycles = 0;
+    FILE *trace_out = getenv("OCVM_TRACE_FILE") ? fopen(getenv("OCVM_TRACE_FILE"), "wb") : nullptr;
+    uint64_t max_cycles = getenv("OCVM_MAX_CYCLES") ? strtoull(getenv("OCVM_MAX_CYCLES"), nullptr, 0) : 50'000'000;
     const char *op;
     linbuf opcode;
     uint32_t addr, op1, cnt, oldpc, vitems, cycle, accu, spaddr, items, oldcycle = 0;
@@ -319,7 +324,7 @@ int main(int argc, char** argv) {
             disk_path = eq ? strdup(eq + 1) : nullptr;
             if (disk_path && *disk_path) {
                 FILE *f = fopen(disk_path, "rb");
-                if (f) { fread(disk_ram, 1, sizeof(disk_ram), f); fclose(f); }
+                if (f) { fread(disk_ram, 1, disk_bytes, f); fclose(f); }
             }
         }
     }
@@ -327,11 +332,7 @@ int main(int argc, char** argv) {
     printf("Program length %d\n", prog_length);
 
     while (windup && !Verilated::gotFinish()) {
-      if (top->pc >= prog_length)
-	{
-	  printf("Terminating on PC %d out of %d range\n", top->pc, prog_length);
-	  matching = 0;
-	}
+      // A pc outside the program is the VM's to deal with: code_oob raises "index out of bounds".
         // The trap port as an I/O bus (vm_io_read / vm_io_write), answered by
         // the ethmin device model: one ready per request, not again until
         // trap_valid has dropped.
@@ -359,7 +360,7 @@ int main(int argc, char** argv) {
                 } else {
                     top->trap_result = (code_rom[w] >> (8 * lane)) & 0xFF;
                 }
-            } else if (a >= 0x100000 && a < 0x180000) {
+            } else if (a >= 0x100000 && a < 0x100000 + disk_bytes) {
                 uint32_t off = a - 0x100000;
                 if (top->trap_prim == 2) disk_ram[off] = (uint8_t)top->trap_arg1;
                 else top->trap_result = disk_ram[off];
@@ -367,7 +368,7 @@ int main(int argc, char** argv) {
                 if (top->trap_prim == 2) boot_from_disk((uint32_t)top->trap_arg1);
                 else top->trap_result = 0;
             } else if (a == 0x100d) {
-                if (top->trap_prim == 1) top->trap_result = sizeof(disk_ram);
+                if (top->trap_prim == 1) top->trap_result = disk_bytes;
             } else if (a == 0x100c) {
                 // prog_words.  Read, it says where the program's code ends,
                 // which is what lets a compiler find its own end; written,
@@ -429,6 +430,7 @@ int main(int argc, char** argv) {
         bool code_valid = code_q_pc == top->pc;
         top->code_rdata = code_q;
         top->code_valid = code_valid;
+        top->code_oob = code_q_pc >= sizeof(code_rom)/sizeof(*code_rom);
         uint32_t fetch_pc = code_valid ? top->pc + 1 : top->pc;
         // Clock tick
         top->clk = 0;
@@ -516,6 +518,20 @@ int main(int argc, char** argv) {
 	
         top->clk = 1;
         top->eval();
+        // OCVM_TRACE_FILE: the same history the board's vm_trace keeps, but all of it -- a 12-byte record
+        // (state, opcode, pc, sp, accu low 16 bits, cycle low 32 bits) whenever the state or pc changes
+        if (trace_out) {
+            static unsigned last_state = ~0u, last_pc = ~0u;
+            unsigned st = top->state_out, pcv = top->pc;
+            if (st != last_state || pcv != last_pc) {
+                unsigned char r[12] = { (unsigned char)st, (unsigned char)top->opcode_out,
+                    (unsigned char)pcv, (unsigned char)(pcv >> 8), (unsigned char)(pcv >> 16), 0,
+                    (unsigned char)top->sp, (unsigned char)(top->sp >> 8),
+                    (unsigned char)top->accu, (unsigned char)(top->accu >> 8), 0, 0 };
+                fwrite(r, 1, 12, trace_out);
+                last_state = st; last_pc = pcv;
+            }
+        }
         code_q = fetch_pc < sizeof(code_rom)/sizeof(*code_rom) ? code_rom[fetch_pc] : 0xDEADBEEF;
         code_q_pc = fetch_pc;
 
@@ -528,7 +544,7 @@ int main(int argc, char** argv) {
             break;
         }
 
-        if (++cycles > 50'000'000) {
+        if (++cycles > max_cycles) {
             std::cerr << "Timeout\n";
             break;
         }
@@ -538,7 +554,7 @@ int main(int argc, char** argv) {
 
     if (disk_path && *disk_path) {
         FILE *f = fopen(disk_path, "wb");
-        if (f) { fwrite(disk_ram, 1, sizeof(disk_ram), f); fclose(f); }
+        if (f) { fwrite(disk_ram, 1, disk_bytes, f); fclose(f); }
     }
     if (tfp) { tfp->close(); delete tfp; }
     delete top;

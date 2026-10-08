@@ -34,7 +34,7 @@ enum {
   RX_BASE = 0x0000, TX_BASE = 0x0800, WINDOW = 0x0800,
   ETH_STATUS = 0x1000, ETH_STATUS_PHY = 0x1001, ETH_RXLEN = 0x1002,
   ETH_TXLEN = 0x1003, LEDS = 0x1004, UART = 0x1005, ETH_TIMER_MS = 0x1006,
-  ETH_BOOT = 0x1007, UART_RX = 0x1008, STAGE_BASE = 0x10000, STAGE_SIZE = 0x10000,
+  ETH_BOOT = 0x1007, UART_RX = 0x1008, STAGE_BASE = 0x10000, STAGE_SIZE = 0x40000,
 };
 enum { TFTP_PORT = 6969, TFTP_TID = 6970, TFTP_BLOCK = 512 };
 enum { RX_VALID = 1, TX_BUSY = 2, RX_TRUNC = 4 };
@@ -72,6 +72,7 @@ static frame_t *reply_slot(void) {
 
 // netboot: the staging window, the TFTP transfer, and the boot
 static uint8_t stage[STAGE_SIZE];
+static long stage_desc[6];
 static uint8_t *tftp_data;
 static long tftp_size;
 static int tftp_active, tftp_last_block_sent, booted;
@@ -282,7 +283,9 @@ static void tftp_server(const uint8_t *b, int len) {
   dport = (udp[2] << 8) | udp[3];
   p = udp + 8;
   if (dport == TFTP_PORT && p[0] == 0 && p[1] == 1) {          // RRQ
-    const char *name = env_file("ETHMODEL_TFTP_FILE");
+    // "disk.img" is the RAM disk's contents, $ETHMODEL_TFTP_DISK; anything else the program image
+    int is_disk = strcmp((const char *)p + 2, "disk.img") == 0;
+    const char *name = env_file(is_disk ? "ETHMODEL_TFTP_DISK" : "ETHMODEL_TFTP_FILE");
     FILE *fp = name ? fopen(name, "rb") : NULL;
     printf("eth: TFTP RRQ %s\n", (const char *)p + 2);
     if (!fp) {
@@ -291,8 +294,9 @@ static void tftp_server(const uint8_t *b, int len) {
       return;
     }
     free(tftp_data);
-    tftp_data = (uint8_t *)malloc(STAGE_SIZE + 1);
-    tftp_size = fread(tftp_data, 1, STAGE_SIZE + 1, fp);
+    size_t cap = is_disk ? 0x400001 : STAGE_SIZE + 1;   // the host model's disk is 4 MiB
+    tftp_data = (uint8_t *)malloc(cap);
+    tftp_size = fread(tftp_data, 1, cap, fp);
     fclose(fp);
     tftp_active = 1;
     tftp_send_block(b, 1);
@@ -369,6 +373,7 @@ long ethmodel_read(long a) {
     if (!rx_valid && !dhcp_in_progress && !tftp_active && next_frame >= nframes) idle_polls++;
     return rx_valid ? RX_VALID : 0;
   case ETH_TIMER_MS: return now_ms & 0x3FFFFFFF;
+  case 0x1009: return getenv("ETHMODEL_DIP") ? atoi(getenv("ETHMODEL_DIP")) & 0xFF : 0;   // the DIP switches
   case UART_RX: return uart_rx();
   case ETH_STATUS_PHY: return PHY_STATUS;
   case ETH_RXLEN: return rx_len;
@@ -402,7 +407,17 @@ void ethmodel_write(long a, long d) {
     tftp_server(txbuf, (int)d);
     if (!rx_valid) load_next_frame();
     break;
+  case 0x1010: case 0x1011: case 0x1012: case 0x1013: case 0x1014: case 0x1015:
+    stage_desc[a - 0x1010] = d; break;               // the staged image: lengths, then word offsets
   case ETH_BOOT:
+    if (getenv("ETHMODEL_STAGE_DUMP")) {             // the staging RAM and its description, for a check
+      char p[512];
+      snprintf(p, sizeof p, "%s.stage", getenv("ETHMODEL_STAGE_DUMP"));
+      FILE *f = fopen(p, "wb"); if (f) { fwrite(stage, 1, sizeof stage, f); fclose(f); }
+      snprintf(p, sizeof p, "%s.desc", getenv("ETHMODEL_STAGE_DUMP"));
+      f = fopen(p, "w");
+      if (f) { for (int i = 0; i < 6; i++) fprintf(f, "%ld\n", stage_desc[i]); fclose(f); }
+    }
     printf("eth: BOOT: staged image %s the file (%ld bytes)\n",
            tftp_data && memcmp(stage, tftp_data, tftp_size) == 0 ? "matches" : "DIFFERS from", tftp_size);
     booted = 1;
