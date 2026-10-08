@@ -88,16 +88,19 @@ reg bus_4bit_reg;
 //CRC16
    reg [4:0]                                         crc_in;
 reg crc_rst;
-parameter SIZE = 7;
+parameter SIZE = 8;
 reg [SIZE-1:0] state;
 reg [SIZE-1:0] next_state;
-parameter IDLE       = 7'b0000001;
-parameter WRITE_DAT  = 7'b0000010;
-parameter WRITE_CRC  = 7'b0000100;
-parameter WRITE_BUSY = 7'b0001000;
-parameter READ_WAIT  = 7'b0010000;
-parameter READ_DAT   = 7'b0100000;
-parameter FINISH     = 7'b1000000;
+parameter IDLE       = 8'b00000001;
+parameter WRITE_DAT  = 8'b00000010;
+parameter WRITE_CRC  = 8'b00000100;
+parameter WRITE_BUSY = 8'b00001000;
+parameter READ_WAIT  = 8'b00010000;
+parameter READ_DAT   = 8'b00100000;
+parameter FINISH     = 8'b01000000;
+parameter NEXT_BLK   = 8'b10000000;   // between the blocks of a multi-block write (local change, see README)
+reg [`BLKCNT_W-1:0] blk_left;
+reg crc_bad;
 reg [2:0] crc_status;
 reg busy_int;
 reg [`BLKSIZE_W-1:0] blksize_reg;
@@ -115,7 +118,7 @@ endgenerate
 
 assign busy = (state != IDLE) && (state != FINISH);
 assign sd_data_busy = !DAT_dat_reg[0];
-assign crc_ok = &crc_lane_ok;
+assign crc_ok = &crc_lane_ok && !crc_bad;
 
 always @(posedge sd_clk or posedge rst)
 begin: FSM_OUT
@@ -131,6 +134,8 @@ begin: FSM_OUT
         DAT_dat_o <= 0;
         crc_status <= 0;
         crc_lane_ok <= 0;
+        crc_bad <= 0;
+        blk_left <= 0;
         crc_s <= 0;
         we0 <= 0;
         we <= 0;
@@ -173,6 +178,8 @@ begin: FSM_OUT
 	        wait_reg_o <= 0;
 	        finish_o <= 0;
                 data_out <= 0;
+                blk_left <= blkcnt;
+                crc_bad <= 0;
                 if (start == 2'b01)
                   state <= WRITE_DAT;
                 else if (start == 2'b10)
@@ -252,8 +259,13 @@ begin: FSM_OUT
             end
              WRITE_BUSY: begin /* wait for write completion */
                 busy_int <= !DAT_dat_reg[0];
-                if (!busy_int)
-                  state <= FINISH;
+                if (!busy_int) begin
+                  if (blk_left > 1) begin
+                    blk_left <= blk_left - 1;
+                    state <= NEXT_BLK;
+                  end else
+                    state <= FINISH;
+                end
                 end
              READ_WAIT: begin /* wait for a start bit in read mode */
                 DAT_oe_o <= 0;
@@ -308,9 +320,37 @@ begin: FSM_OUT
                   begin
                      for (k = 0; k < 4; k=k+1)
                        crc_lane_ok[k] <= crc_calc[k] == crc_din[k];
-                     state <= FINISH;
+                     for (k = 0; k < 4; k=k+1)
+                       if (crc_calc[k] != crc_din[k]) crc_bad <= 1;
+                     if (blk_left > 1) begin
+                       // multi-block: the card's next start bit is one clock wide and follows the end bit at once,
+                       // so go straight back to READ_WAIT (already past its turnaround delay) with a fresh CRC
+                       blk_left <= blk_left - 1;
+                       crc_rst <= 1;
+                       transf_cnt_o <= 0;
+                       data_index <= 0;
+                       wait_reg_o <= 3;
+                       state <= READ_WAIT;
+                     end else
+                       state <= FINISH;
                 end
             end // case: READ_DAT
+             NEXT_BLK: begin
+                // the next block follows at once: the card's CRC and end bit were the last of this one
+                crc_rst <= 1;
+                crc_in <= 0;
+                DAT_oe_o <= 0;
+                DAT_dat_o <= 4'b1111;
+                transf_cnt_o <= 0;
+                crc_c <= 16;
+                crc_status <= 0;
+                crc_s <= 0;
+                data_index <= 0;
+                wait_reg_o <= 0;
+                we0 <= 0;
+                rd <= 0;
+                state <= WRITE_DAT;
+             end
 	  FINISH:
                begin
 	    finish_o <= 1;
