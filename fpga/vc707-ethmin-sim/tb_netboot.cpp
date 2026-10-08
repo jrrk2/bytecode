@@ -33,7 +33,15 @@ static void type_step() {           // at each clk_sys edge
   if (!typing || typed_all) return;
   if (type_bit < 0) {                  // idle: two bit times, then the next byte
     if (--type_cnt > 0) return;
+    // a 0x1A in the input is "wait until the console has been quiet", so that a Ctrl-T can follow a hang
+    static bool waiting = false;
+    static const uint64_t pause_quiet = 250000ULL * (getenv("TB_QUIET_MS") ? atoi(getenv("TB_QUIET_MS")) : 30);
+    if (waiting) {
+      if (ticks_now() - last_output_tick > pause_quiet) waiting = false;
+      else return;
+    }
     int c = fgetc(uart_in);
+    if (c == 0x1A) { waiting = true; return; }
     if (c == EOF) { typed_all = 1; top->UART_RX = 1; return; }
     type_byte = c; type_bit = 0; type_cnt = bit;
     top->UART_RX = 0;                  // start bit
@@ -102,6 +110,7 @@ int main(int argc, char **argv) {
   top->tx_axis_tready = 1;
   top->pcspma_status = 0x0303;
   top->UART_RX = 1;
+  top->DIP = getenv("TB_DIP") ? atoi(getenv("TB_DIP")) : 106;   // the netboot host's address, 192.168.1.106
   if (getenv("TB_UART_INPUT")) uart_in = fopen(getenv("TB_UART_INPUT"), "rb");
   top->resetn = 0; top->eth_rst = 1;
   for (int i = 0; i < 200; i++) step();

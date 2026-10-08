@@ -3,6 +3,7 @@
 # images for the FPGA builds.
 #   program.hex           its CODE section (bc2hex.py)
 #   heap.hex, globals.hex its DATA section in the VM's heap format (bc2image)
+#   data.hex, data_bram.v heap.hex then globals.hex, and the explicit-RAMB36 ROM made of them
 #   program.vh            PROGRAM_HEX, PROGRAM_WORDS, PROGRAM_NAME, HEAP_WORDS,
 #                         GLOBALS_WORDS
 # A .ml is compiled with ocamlc -nopervasives, and with the VM's primitive
@@ -43,8 +44,16 @@ words=$(wc -l < "$OUT/program.hex")
 # ...and the same code as explicit x1 block RAMs, which is what the design
 # instantiates: inference picks x9, and the open flow gets x9 wrong.
 python3 "$REPO/tools/gen_rom_bram.py" "$OUT/program.hex" "$OUT/program_bram.v" code_rom_bram > /dev/null
+# The heap and globals images the resident program starts from, one ROM, also as explicit block RAMs: the
+# heap words, then the globals (what a loader's strings and constants are made of, and so what has to be
+# replaceable along with its code).
 heap_words=$(awk '/heap_words/{print $2}' "$OUT/image.txt")
 globals_words=$(awk '/^globals/{print $2}' "$OUT/image.txt")
+# the ROM starts with its own description -- heap words, globals words, program words -- so that the core takes the
+# resident program's sizes from the ROM and not from the synthesis: a new program can be put into a built bitstream
+# (tools/loader_update.py)
+{ printf '%08x\n%08x\n%08x\n' "$heap_words" "$globals_words" "$words"; cat "$OUT/heap.hex" "$OUT/globals.hex"; } > "$OUT/data.hex"
+python3 "$REPO/tools/gen_rom_bram.py" "$OUT/data.hex" "$OUT/data_bram.v" data_rom_bram > /dev/null
 rm "$OUT/image.txt"
 cat > "$OUT/program.vh" <<VH
 \`define PROGRAM_HEX "program.hex"

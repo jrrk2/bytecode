@@ -3,14 +3,17 @@
    the DHCP reply names (siaddr, file) -- or, when the DIP switches are
    set, this board's own network with the switches as the host number
    (1..255) -- else 10.10.10.10 and "vm.img" --
-   into the staging RAM, checks it (tools/mkvmimage.py's format) and writes
+   into the staging RAM, checks it -- tools/mkvmimage.py's format, or a bytecode
+   executable as ocamlc writes it, which is stripped where it lies to what the
+   machine runs (its code, its global data as a heap image) -- and writes
    BOOT: the boot sequencer then loads it into the VM and starts it.
    (siaddr counts only when the reply names a file too.)
 
    I/O space as ethmin.ml, plus
      0x1006   milliseconds since reset (30 bits)
      0x1007   w: boot the staged image
-     0x10000  the staging RAM, a byte per address (64 KiB)
+     0x10000  the staging RAM, a byte per address (256 KiB)
+     0x1010..0x1015  w: the staged image, where the sequencer is to find it (describe below)
 
    Init -> DISCOVER -> Selecting -> (OFFER) REQUEST -> Requesting -> (ACK)
    Bound; a timeout in Selecting or Requesting starts again, and a Bound
@@ -66,7 +69,7 @@ let dip_sw = 0x1009
 let buttons = 0x100b
 let boot_reg = 0x1007
 let stage = 0x10000
-let stage_size = 0x20000   (* 128 KiB of staging RAM *)
+let stage_size = 0x40000   (* 256 KiB of staging RAM *)
 
 let eth_rx_valid = 1
 let eth_tx_busy = 2
@@ -332,7 +335,11 @@ let dhcp_tick () =
 
 (* ---- TFTP into the staging RAM, then boot ---- *)
 let tftp_port = 6969
-let local_port = 50000
+(* a fresh one for each request, so that a transfer the server is still running for an earlier request (it starts
+   a second when a request is repeated) cannot be taken for the answer to this one *)
+let local_port_base = 50000
+let request_no = ref 0
+let local_port = ref local_port_base
 let block_size = 512
 
 type boot = Waiting | Arping | Loading | Checking | Done
@@ -340,7 +347,14 @@ type boot = Waiting | Arping | Loading | Checking | Done
 let boot_state = ref Waiting
 let server_port = ref tftp_port      (* the server's TID once its DATA arrives *)
 let next_block = ref 1
-let received = ref 0                 (* bytes staged *)
+let received = ref 0                 (* bytes of the file being fetched so far *)
+let img_len = ref 0                  (* the program image's length, once it is staged *)
+let want_disk = ref false            (* fetching the RAM disk's contents ("disk.img") after the image *)
+let disk_name = "disk.img"
+let disk_ram = 0x100000
+(* the RFS magic, "RFS" in the first three bytes: the disk holds a file system *)
+let disk_formatted () =
+  io_read disk_ram = 0x52 && io_read (disk_ram + 1) = 0x46 && io_read (disk_ram + 2) = 0x53
 let boot_deadline = ref 0
 let tries = ref 0
 
@@ -355,7 +369,7 @@ let udp_to_server dport payload_len =
   for i = 0 to 3 do tx (26 + i) (ip i); tx (30 + i) (array_get server_ip i) done;
   let s = ip_checksum 14 20 in
   tx 24 (s lsr 8); tx 25 (s land 0xFF);
-  tx 34 (local_port lsr 8); tx 35 (local_port land 0xFF);
+  tx 34 (!local_port lsr 8); tx 35 (!local_port land 0xFF);
   tx 36 (dport lsr 8); tx 37 (dport land 0xFF);
   tx 38 ((8 + payload_len) lsr 8); tx 39 ((8 + payload_len) land 0xFF);
   tx 40 0; tx 41 0;                                             (* no UDP checksum *)
@@ -372,8 +386,11 @@ let arp_for_server () =
 
 let send_rrq () =
   tx 42 0; tx 43 1;                                             (* RRQ *)
-  for i = 0 to !file_len - 1 do tx (44 + i) (array_get file_name i) done;
-  let o = 44 + !file_len in
+  let n = if !want_disk then string_length disk_name else !file_len in
+  for i = 0 to n - 1 do
+    tx (44 + i) (if !want_disk then int_of_char (string_get disk_name i) else array_get file_name i)
+  done;
+  let o = 44 + n in
   tx o 0;
   let mode = "octet" in
   for i = 0 to 4 do tx (o + 1 + i) (int_of_char (string_get mode i)) done;
@@ -405,6 +422,8 @@ let server_arp_reply len =
     next_block := 1;
     received := 0;
     tries := 0;
+    want_disk := false;
+    request_no := !request_no + 1; local_port := local_port_base + !request_no;
     send_rrq ();
     boot_state := Loading;
     boot_deadline := now () + 1000
@@ -413,9 +432,9 @@ let server_arp_reply len =
 (* ---- the image: tools/mkvmimage.py's header, then code, heap, globals ---- *)
 let byte i = io_read (stage + i)
 let small i = byte i lor (byte (i + 1) lsl 8) lor (byte (i + 2) lsl 16)   (* a word < 2^24 *)
-let code_max = 32768         (* the program code RAM, in words *)
-let heap_max = 4096          (* heap image words the VM's heap can take *)
-let globals_max = 4096
+let code_max = 65535         (* the program code RAM, in words *)
+let heap_max = 24576         (* heap image words: a semi-space is 32768, and the program has to live in it *)
+let globals_max = 8192
 let prims_digest = [| 0x21; 0xad; 0xa2; 0x86 |]   (* mkvmimage.py: this VM's primitives *)
 
 let crc16 from upto =
@@ -431,24 +450,205 @@ let crc16 from upto =
 
 let reject why = uart_puts "boot: image rejected: "; uart_puts why; uart_putc '\n'
 
+(* Tell the sequencer where the staged image's sections are: lengths in words, then
+   each section's first word in the staging RAM, then BOOT. *)
+let describe code heap globals code_at heap_at globals_at =
+  io_write 0x1010 code; io_write 0x1011 heap; io_write 0x1012 globals;
+  io_write 0x1013 code_at; io_write 0x1014 heap_at; io_write 0x1015 globals_at
+
+let start_it code heap globals =
+  uart_puts "boot: ";
+  uart_dec code; uart_puts " code, ";
+  uart_dec heap; uart_puts " heap, ";
+  uart_dec globals; uart_puts " globals words: starting it\n";
+  io_write boot_reg 1
+
+(* ---- a bytecode executable, stripped where it lies ----
+   ocamlc's file is the shebang line, then the sections in the order of the table
+   that ends the file (CODE, DLPT, DLLS, PRIM, DATA, SYMB, CRCS), then the table
+   (a name and a big-endian length each), its count and "Caml1999X0nn".  What the
+   machine runs is the code as it is and the DATA section, a marshalled block whose
+   fields are the program's globals, laid out as the VM keeps a heap
+   (tools/bc2image.ml does the same on the host).  The code stays where it is, the
+   sequencer being told where; the heap image and the globals are built after the
+   end of the file. *)
+let be4 i = (byte i lsl 24) lor (byte (i + 1) lsl 16) lor (byte (i + 2) lsl 8) lor byte (i + 3)
+let name_at i s =
+  byte i = int_of_char (string_get s 0) && byte (i + 1) = int_of_char (string_get s 1)
+  && byte (i + 2) = int_of_char (string_get s 2) && byte (i + 3) = int_of_char (string_get s 3)
+
+let um = ref 0              (* the marshalled data: the next byte *)
+let bad = ref false
+let hb = ref 0              (* the heap image's base, and the next free byte of it *)
+let hp = ref 0
+let tbl = ref 0             (* the objects read so far: heap offsets, a word each *)
+let nobj = ref 0
+let atoms = ref 0           (* the zero-sized blocks, by tag: heap offset + 4, 0 for none yet *)
+
+let nxt () = let c = byte !um in um := !um + 1; c
+let rd n = let v = ref 0 in for _i = 1 to n do v := (!v lsl 8) lor nxt () done; !v
+let sext bits v = if v >= 1 lsl (bits - 1) then v - (1 lsl bits) else v
+(* a byte into the staging RAM at offset a *)
+let sput a v = io_write (stage + a) v
+let put3 a v = sput a (v land 0xFF); sput (a + 1) ((v lsr 8) land 0xFF); sput (a + 2) ((v lsr 16) land 0xFF)
+let get3 a = byte a lor (byte (a + 1) lsl 8) lor (byte (a + 2) lsl 16)
+(* an OCaml int n is the word 2n + 1, to its bit 31 *)
+let put_int a n =
+  sput a (((n lsl 1) lor 1) land 0xFF); sput (a + 1) ((n lsr 7) land 0xFF);
+  sput (a + 2) ((n lsr 15) land 0xFF); sput (a + 3) ((n lsr 23) land 0xFF)
+let put_ptr a off = put3 a off; sput (a + 3) 0       (* off is the block's byte offset: its index << 2 *)
+let put_hdr a size tag = sput a tag; sput (a + 1) 0; sput (a + 2) (size land 0xFF); sput (a + 3) (size lsr 8)
+
+let room n = if !hp + n > stage_size then bad := true
+let nobj_max = ref 0
+let register off =
+  (if !nobj > !nobj_max then bad := true else put3 (!tbl + 4 * !nobj) off);
+  nobj := !nobj + 1
+
+(* one value of the marshalled data into the word at dst *)
+let rec value dst =
+  if not !bad then begin
+    let c = nxt () in
+    if c >= 0x80 then block dst (c land 0xF) ((c lsr 4) land 7)
+    else if c >= 0x40 then put_int dst (c land 0x3F)
+    else if c >= 0x20 then str dst (c land 0x1F)
+    else if c = 0x00 then put_int dst (sext 8 (rd 1))
+    else if c = 0x01 then put_int dst (sext 16 (rd 2))
+    else if c = 0x02 then put_int dst (rd 4)
+    else if c = 0x03 then begin um := !um + 4; put_int dst (rd 4) end
+    else if c = 0x04 then shared dst (rd 1)
+    else if c = 0x05 then shared dst (rd 2)
+    else if c = 0x06 then shared dst (rd 4)
+    else if c = 0x08 then begin let h = rd 4 in block dst (h land 0xFF) (h lsr 10) end
+    else if c = 0x09 then str dst (rd 1)
+    else if c = 0x0A then str dst (rd 4)
+    else if c = 0x0C then copied dst 1 253
+    else if c = 0x0E then copied dst (rd 1) 254
+    else if c = 0x07 then copied dst (rd 4) 254
+    else bad := true                        (* big-endian doubles, code pointers, custom blocks *)
+  end
+
+and shared dst k =
+  let o = !nobj - k in
+  if o < 0 || o >= !nobj then bad := true else put_ptr dst (get3 (!tbl + 4 * o))
+
+and block dst tag size =
+  if size = 0 then begin
+    let e = get3 (!atoms + 4 * tag) in
+    let off = if e <> 0 then e - 4 else begin
+        room 4;
+        let off = !hp - !hb in
+        put_hdr !hp 0 tag; put3 (!atoms + 4 * tag) (off + 4); hp := !hp + 4; off
+      end in
+    put_ptr dst off
+  end else begin
+    room (4 + 4 * size);
+    if size > 0xFFFF then bad := true;
+    if not !bad then begin
+      let off = !hp - !hb in
+      register off;
+      put_ptr dst off;
+      put_hdr !hp size tag;
+      let base = !hp + 4 in
+      hp := base + 4 * size;
+      for i = 0 to size - 1 do value (base + 4 * i) done
+    end
+  end
+
+and str dst len =
+  let nw = len / 4 + 1 in
+  room (4 + 4 * nw);
+  if not !bad then begin
+    let off = !hp - !hb in
+    register off;
+    put_ptr dst off;
+    put_hdr !hp nw 252;
+    for i = 0 to 4 * nw - 1 do
+      sput (!hp + 4 + i) (if i < len then nxt () else if i = 4 * nw - 1 then 4 * nw - 1 - len else 0)
+    done;
+    hp := !hp + 4 + 4 * nw
+  end
+
+(* doubles, little-endian: the bytes are the two words, low half first *)
+and copied dst n tag =
+  room (4 + 8 * n);
+  if not !bad then begin
+    let off = !hp - !hb in
+    register off;
+    put_ptr dst off;
+    put_hdr !hp (2 * n) tag;
+    for i = 0 to 8 * n - 1 do sput (!hp + 4 + i) (nxt ()) done;
+    hp := !hp + 4 + 8 * n
+  end
+
+let strip_and_boot () =
+  let e = !img_len in
+  let n = if e >= 32 then be4 (e - 16) else 0 in
+  let table = e - 16 - 8 * n in
+  if e < 32 || byte (e - 12) <> int_of_char 'C' || byte (e - 4) <> int_of_char 'X' || n < 2 || n > 16 || table < 0 then
+    reject "neither an image nor a bytecode executable"
+  else begin
+    let total = ref 0 in
+    for i = 0 to n - 1 do total := !total + be4 (table + 8 * i + 4) done;
+    let code_at = ref 0 and code_len = ref 0 and data_at = ref 0 and data_len = ref 0 in
+    let pos = ref (table - !total) in
+    for i = 0 to n - 1 do
+      let len = be4 (table + 8 * i + 4) in
+      if name_at (table + 8 * i) "CODE" then begin code_at := !pos; code_len := len end
+      else if name_at (table + 8 * i) "DATA" then begin data_at := !pos; data_len := len end;
+      pos := !pos + len
+    done;
+    let d = !data_at in
+    if !code_len = 0 || !data_len < 24 || !pos < 0 then reject "no code or data section"
+    else if !code_at land 3 <> 0 || !code_len land 3 <> 0 then reject "code not word aligned"
+    else if !code_len / 4 > code_max then reject "too much code"
+    else if byte d <> 0x84 || byte (d + 1) <> 0x95 || byte (d + 2) <> 0xA6 || byte (d + 3) <> 0xBE then
+      reject "data is not marshalled"
+    else begin
+      let nobjects = be4 (d + 8) in
+      um := d + 20;
+      (* the root: a block whose fields are the globals *)
+      let c = nxt () in
+      let nglobals = if c >= 0x80 then (c lsr 4) land 7 else if c = 0x08 then rd 4 lsr 10 else 0 in
+      let g0 = (e + 3) land (0 - 4) in
+      tbl := g0 + 4 * nglobals;
+      nobj_max := nobjects;
+      atoms := !tbl + 4 * (nobjects + 1);
+      hb := !atoms + 1024;
+      hp := !hb;
+      bad := nglobals = 0 || nglobals > globals_max || !hb + 4 > stage_size;
+      if not !bad then begin
+        for i = 0 to 255 do put3 (!atoms + 4 * i) 0 done;
+        nobj := 0;
+        register 0;                                   (* the root is object 0 *)
+        for i = 0 to nglobals - 1 do value (g0 + 4 * i) done
+      end;
+      let heap = (!hp - !hb) / 4 in
+      if !bad then reject "global data not convertible"
+      else if heap > heap_max then reject "too much data"
+      else begin
+        describe (!code_len / 4) heap nglobals (!code_at / 4) (!hb / 4) (g0 / 4);
+        start_it (!code_len / 4) heap nglobals
+      end
+    end
+  end
+
 let check_and_boot () =
   let code = small 8 and heap = small 12 and globals = small 16 in
-  if !received < 32 then reject "short"
+  if !img_len >= 4 && not (byte 0 = 0x4f && byte 1 = 0x43 && byte 2 = 0x56 && byte 3 = 0x4d) then strip_and_boot ()
+  else if !img_len < 32 then reject "short"
   else if byte 0 <> 0x4f || byte 1 <> 0x43 || byte 2 <> 0x56 || byte 3 <> 0x4d then reject "magic"
   else if byte 4 <> 1 || small 5 <> 0 then reject "version"
   else if byte 11 <> 0 || byte 15 <> 0 || byte 19 <> 0
           || code > code_max || heap > heap_max || globals > globals_max then reject "too large"
-  else if 32 + 4 * (code + heap + globals) <> !received then reject "length"
+  else if 32 + 4 * (code + heap + globals) <> !img_len then reject "length"
   else if byte 20 <> array_get prims_digest 0 || byte 21 <> array_get prims_digest 1
           || byte 22 <> array_get prims_digest 2 || byte 23 <> array_get prims_digest 3 then
     reject "built for other primitives"
-  else if crc16 32 !received <> (byte 24 lor (byte 25 lsl 8)) then reject "checksum"
+  else if crc16 32 !img_len <> (byte 24 lor (byte 25 lsl 8)) then reject "checksum"
   else begin
-    uart_puts "boot: ";
-    uart_dec code; uart_puts " code, ";
-    uart_dec heap; uart_puts " heap, ";
-    uart_dec globals; uart_puts " globals words: starting it\n";
-    io_write boot_reg 1
+    describe code heap globals 8 (8 + code) (8 + code + heap);
+    start_it code heap globals
   end
 
 let tftp_data len =
@@ -457,36 +657,69 @@ let tftp_data len =
   if !boot_state = Loading && ip_is_mine 30
      && rx 26 = array_get server_ip 0 && rx 27 = array_get server_ip 1
      && rx 28 = array_get server_ip 2 && rx 29 = array_get server_ip 3
-     && ((rx (udp + 2) lsl 8) lor rx (udp + 3)) = local_port then begin
+     && ((rx (udp + 2) lsl 8) lor rx (udp + 3)) = !local_port then begin
     if opcode = 3 then begin
       let block = (rx (udp + 10) lsl 8) lor rx (udp + 11) in
       let n = ((rx (udp + 4) lsl 8) lor rx (udp + 5)) - 12 in
-      server_port := (rx udp lsl 8) lor rx (udp + 1);
-      if block = !next_block && !received + n > stage_size then begin
+      (* the server's TID is the port its first block comes from, and from then on the only one listened to *)
+      let from_port = (rx udp lsl 8) lor rx (udp + 1) in
+      (if !next_block = 1 && !received = 0 then server_port := from_port);
+      if from_port <> !server_port then ()
+      else
+      let limit = if !want_disk then io_read 0x100d else stage_size in
+      let base = if !want_disk then disk_ram else stage in
+      if block = !next_block && !received + n > limit then begin
         (* silence here looks like a dead server: say so instead *)
-        uart_puts "boot: image needs more than ";
-        uart_dec stage_size;
-        uart_puts " bytes of staging RAM\n";
+        uart_puts (if !want_disk then "boot: disk image needs more than " else "boot: image needs more than ");
+        uart_dec limit;
+        uart_puts (if !want_disk then " bytes of RAM disk\n" else " bytes of staging RAM\n");
+        want_disk := false;
         boot_state := Waiting;
         boot_deadline := now () + 5000
-      end else if block = !next_block && !received + n <= stage_size && len >= udp + 12 + n then begin
-        for i = 0 to n - 1 do io_write (stage + !received + i) (rx (udp + 12 + i)) done;
+      end else if block = !next_block && !received + n <= limit && len >= udp + 12 + n then begin
+        for i = 0 to n - 1 do io_write (base + !received + i) (rx (udp + 12 + i)) done;
         received := !received + n;
         send_ack block;
         next_block := block + 1;
         tries := 0;
         boot_deadline := now () + 1000;
         if n < block_size then begin
-          uart_puts "boot: ";
-          uart_dec !received;
-          uart_puts " bytes\n";
-          boot_state := Checking
+          if !want_disk then begin
+            uart_puts "boot: RAM disk "; uart_dec !received; uart_puts " bytes\n";
+            boot_state := Checking
+          end else begin
+            uart_puts "boot: ";
+            uart_dec !received;
+            uart_puts " bytes\n";
+            img_len := !received;
+            if disk_formatted () then begin
+              (* back from a program that ran: the disk has its files, which a fetch would replace *)
+              uart_puts "boot: RAM disk kept\n";
+              boot_state := Checking
+            end else begin
+              (* then the RAM disk's contents, if the server has them: a file system with what the
+                 program is to work on *)
+              want_disk := true;
+              next_block := 1;
+              received := 0;
+              tries := 0;
+              server_port := tftp_port;
+              request_no := !request_no + 1; local_port := local_port_base + !request_no;
+              send_rrq ();
+              boot_deadline := now () + 1000
+            end
+          end
         end
       end else if block < !next_block then send_ack block        (* a repeat: ACK again *)
     end else if opcode = 5 then begin
-      uart_puts "boot: tftp error\n";
-      boot_state := Waiting;
-      boot_deadline := now () + 5000
+      if !want_disk then begin
+        uart_puts "boot: no RAM disk image\n";             (* not every program wants one *)
+        boot_state := Checking
+      end else begin
+        uart_puts "boot: tftp error\n";
+        boot_state := Waiting;
+        boot_deadline := now () + 5000
+      end
     end
   end
 

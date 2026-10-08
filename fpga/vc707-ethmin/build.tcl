@@ -12,14 +12,14 @@ set repo [file normalize $here/../..]
 set eth $repo/fpga/eth-rtl
 file mkdir out
 # $readmemh resolves against the working directory
-foreach f {program.hex heap.hex globals.hex} { file copy -force $here/$f . }
+foreach f {program.hex data.hex} { file copy -force $here/$f . }
 
 read_verilog -sv $repo/ocaml4142_vm_rtl.sv
 # The floating-point peripheral: Berkeley HardFloat's cores, the IEEE
 # boundary, and the wrapper the trap port talks to (fpga/fpu-rtl).
 set fpu $repo/fpga/fpu-rtl
 read_verilog [list $fpu/fpu_hardfloat.v $fpu/recode64.v $fpu/hardfloat.v]
-read_verilog [list $here/program_bram.v $here/ethmin_vm_core.v $here/vc707_ethmin_vm.v $eth/simpleuart.v $eth/liteeth_sgmii_phy.v]
+read_verilog [list $here/program_bram.v $here/data_bram.v $here/vm_trace.v $here/ethmin_vm_core.v $here/vc707_ethmin_vm.v $eth/simpleuart.v $eth/liteeth_sgmii_phy.v]
 read_verilog -sv [list $eth/eth_mac_1g.sv $eth/axis_gmii_rx.sv $eth/axis_gmii_tx.sv $eth/rgmii_lfsr.sv \
     $eth/eth_lutram_fifo.sv $eth/eth_stream_dma.sv $eth/eth_gmii_retime256.sv $eth/eth_pkt_buf256.sv \
     $eth/sgmii_soc_liteeth.sv $eth/clkgen_vc707.sv]
@@ -47,13 +47,13 @@ puts "build id $build_id (commit $commit, dirty $dirty, Vivado)"
 synth_design -top vc707_ethmin_vm -part $part -include_dirs [list $repo $here] -verilog_define $defs
 report_utilization -file out/util_synth.rpt
 opt_design
-place_design
+place_design -directive Explore
 # Physical optimisation, which this flow used to skip entirely: retiming moves
 # registers across logic now that placement knows the real delays, and the
 # post-route pass fixes what is left.  Worth about a nanosecond at 100 MHz,
 # where the design has little to spare.
 phys_opt_design -directive AggressiveExplore
-route_design
+route_design -directive Explore
 phys_opt_design -directive AggressiveExplore
 report_timing_summary -max_paths 10 -file out/timing.rpt
 report_utilization -file out/util.rpt
@@ -61,4 +61,12 @@ report_methodology -file out/methodology.rpt
 report_drc -file out/drc.rpt
 report_cdc -file out/cdc.rpt
 write_bitstream -force out/vc707_ethmin_vm.bit
+# What replacing the loader in this bitstream needs (tools/rom_mmi.py, updatemem): the routed design,
+# and where every block RAM went -- the program ROM is b0..b31 under code_rom_i, one bit each
+write_checkpoint -force out/routed.dcp
+set fp [open out/ram_cells.txt w]
+foreach c [get_cells -hier -filter {REF_NAME =~ RAMB*}] {
+    puts $fp "[get_property NAME $c] [get_property LOC $c] [get_property READ_WIDTH_A $c] [get_property REF_NAME $c]"
+}
+close $fp
 puts "ETHMIN_VM_BUILD_DONE"
