@@ -14,6 +14,12 @@ module vc707_ethmin_vm (
 	input  wire       UART_RX,
 	output wire       UART_TX,
 
+	// the SD card slot (sd_wrap.v)
+	output wire       sd_sclk,
+	inout  wire       sd_cmd,
+	inout  wire [3:0] sd_dat,
+	input  wire       sd_detect,
+
 	input  wire       sgmii_rxp,
 	input  wire       sgmii_rxn,
 	output wire       sgmii_txp,
@@ -128,7 +134,8 @@ module vc707_ethmin_vm (
 		.tx_axis_tlast(tx_tlast), .tx_axis_tready(tx_tready),
 		.tx_axis_tuser(tx_tuser),
 		.pcspma_status(pcspma_status),
-		.LED(core_led), .DIP(GPIO_DIP_SW), .BTN(GPIO_SW), .UART_RX(UART_RX), .UART_TX(UART_TX));
+		.LED(core_led), .DIP(GPIO_DIP_SW), .BTN(GPIO_SW), .UART_RX(UART_RX), .UART_TX(UART_TX),
+		.sd_sclk(sd_sclk), .sd_cmd(sd_cmd), .sd_dat(sd_dat), .sd_detect(sd_detect));
 
 	// Hardware heartbeat on LED7, independent of the VM.  The LEDs are otherwise
 	// written only by the loader running on the VM, so a dead board shows nothing

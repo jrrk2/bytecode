@@ -105,3 +105,19 @@ set_property -dict {PACKAGE_PIN AW40 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get
 set_property -dict {PACKAGE_PIN AP40 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[2]}]
 set_property -dict {PACKAGE_PIN AU38 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[3]}]
 set_property -dict {PACKAGE_PIN AR40 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[4]}]
+
+# --- SD card slot (the lowRISC host, sd_wrap.v) -----------------------------
+set_property -dict {PACKAGE_PIN AN30 IOSTANDARD LVCMOS18 SLEW FAST} [get_ports sd_sclk]
+set_property -dict {PACKAGE_PIN AP30 IOSTANDARD LVCMOS18 SLEW FAST PULLUP true} [get_ports sd_cmd]
+set_property -dict {PACKAGE_PIN AR30 IOSTANDARD LVCMOS18 SLEW FAST PULLUP true} [get_ports {sd_dat[0]}]
+set_property -dict {PACKAGE_PIN AU31 IOSTANDARD LVCMOS18 SLEW FAST PULLUP true} [get_ports {sd_dat[1]}]
+set_property -dict {PACKAGE_PIN AV31 IOSTANDARD LVCMOS18 SLEW FAST PULLUP true} [get_ports {sd_dat[2]}]
+set_property -dict {PACKAGE_PIN AT30 IOSTANDARD LVCMOS18 SLEW FAST PULLUP true} [get_ports {sd_dat[3]}]
+set_property -dict {PACKAGE_PIN AP32 IOSTANDARD LVCMOS18} [get_ports sd_detect]
+# the SD clock is clk_sys divided by a flip-flop (sd_clock_divider): a clock of its own, unrelated to clk_sys as far as
+# anything crossing between them is concerned (software writes quasi-static registers and polls status)
+create_generated_clock -name sd_clk -source [get_pins core/sd/sdclk_div/SD_CLK_O_reg/C] -divide_by 2 \
+    [get_pins core/sd/sdclk_div/SD_CLK_O_reg/Q]
+set_clock_groups -asynchronous -group [get_clocks clk_sys_unbuf] -group [get_clocks sd_clk]
+set_false_path -to [get_ports {sd_cmd sd_dat[*] sd_sclk}]
+set_false_path -from [get_ports {sd_cmd sd_dat[*] sd_detect}]

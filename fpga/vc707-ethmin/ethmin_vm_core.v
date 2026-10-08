@@ -79,7 +79,12 @@ module ethmin_vm_core #(
 	input  wire [15:0] pcspma_status,
 	output wire [7:0]  LED,
 	input  wire        UART_RX,
-	output wire        UART_TX
+	output wire        UART_TX,
+	// the SD card slot (sd_wrap.v)
+	output wire        sd_sclk,
+	inout  wire        sd_cmd,
+	inout  wire [3:0]  sd_dat,
+	input  wire        sd_detect
 );
 `include "program.vh"  // PROGRAM_HEX, PROGRAM_WORDS, HEAP_WORDS (tools/progimage.sh)
 
@@ -512,10 +517,10 @@ module ethmin_vm_core #(
 	// operation, then the upper half of the answer.
 	localparam [7:0] TRAP_FP_A = 8'h10, TRAP_FP_B = 8'h11,
 	                 TRAP_FP_EXEC = 8'h12, TRAP_FP_HI = 8'h13;
-	localparam [2:0] IO_IDLE = 3'd0, IO_PKT_READ = 3'd1, IO_UART = 3'd2, IO_DONE = 3'd3,
-	                 IO_STAGE_READ = 3'd4, IO_FP_WAIT = 3'd5, IO_CODE_READ = 3'd6,
-	                 IO_DISK_READ = 3'd7;
-	reg [2:0] io_state;
+	localparam [3:0] IO_IDLE = 4'd0, IO_PKT_READ = 4'd1, IO_UART = 4'd2, IO_DONE = 4'd3,
+	                 IO_STAGE_READ = 4'd4, IO_FP_WAIT = 4'd5, IO_CODE_READ = 4'd6,
+	                 IO_DISK_READ = 4'd7, IO_SDB_READ = 4'd8;
+	reg [3:0] io_state;
 
 	// The machine's recent history, kept in hardware and printed on a Ctrl-T from the console (vm_trace.v),
 	// so a machine that has stopped answering can still say where it was.  The VM's own UART output wins a
@@ -582,6 +587,18 @@ module ethmin_vm_core #(
 
 	// The RAM disk, written and read a byte at a time as the staging RAM is.
 	wire io_is_disk = io_addr >= 32'h100000 && io_addr < 32'h180000;
+
+	// The SD host (sd_wrap.v, the lowRISC controller): 0x1100.. its registers, two 16-bit halves each; 0x2000.. its 4 KB block buffer
+	wire io_is_sdreg = io_addr >= 32'h1100 && io_addr < 32'h1180;
+	wire io_is_sdbuf = io_addr >= 32'h2000 && io_addr < 32'h3000;
+	wire [15:0] sd_rdata;
+	wire [7:0]  sd_buf_rdata;
+	sd_wrap sd (
+		.clk(clk_sys), .resetn(resetn),
+		.reg_write(io_new && io_is_sdreg && io_write), .reg_addr(io_addr[6:0]), .reg_wdata(trap_arg1[15:0]), .reg_rdata(sd_rdata),
+		.buf_en(io_new && io_is_sdbuf), .buf_write(io_write), .buf_addr(io_addr[11:0]), .buf_wdata(trap_arg1[7:0]),
+		.buf_rdata(sd_buf_rdata),
+		.sd_sclk(sd_sclk), .sd_cmd(sd_cmd), .sd_dat(sd_dat), .sd_detect(sd_detect));
 	wire [16:0] disk_idx = (io_addr - 32'h100000) >> 2;
 
 	always @(*) begin
@@ -675,6 +692,13 @@ module ethmin_vm_core #(
 				if (io_is_disk) begin
 					if (io_read) io_state <= IO_DISK_READ;
 					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
+				end else if (io_is_sdbuf) begin
+					if (io_read) io_state <= IO_SDB_READ;           // block RAM data next cycle
+					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
+				end else if (io_is_sdreg) begin
+					trap_result <= {16'd0, sd_rdata};
+					trap_ready  <= 1'b1;
+					io_state    <= IO_DONE;
 				end else if (io_is_code) begin
 					if (io_read) io_state <= IO_CODE_READ;   // block RAM data next cycle
 					else begin trap_ready <= 1'b1; io_state <= IO_DONE; end
@@ -720,6 +744,11 @@ module ethmin_vm_core #(
 					trap_ready <= 1'b1;
 					io_state   <= IO_DONE;
 				end
+			end
+			IO_SDB_READ: begin
+				trap_result <= {24'd0, sd_buf_rdata};
+				trap_ready  <= 1'b1;
+				io_state    <= IO_DONE;
 			end
 			IO_PKT_READ, IO_STAGE_READ, IO_CODE_READ, IO_DISK_READ: begin
 				trap_result <= {24'd0, io_read_word[8*io_lane +: 8]};
