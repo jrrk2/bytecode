@@ -131,7 +131,7 @@ let uart_ip a =
   done
 
 (* ---- the line being evaluated (the tokenizer reads it) ---- *)
-let line_max = 120
+let line_max = 1000
 (* the line being compiled: 120 bytes from the UART, a larger buffer while a source file is read *)
 let line = ref (create_bytes line_max)
 let line_len = ref 0
@@ -428,6 +428,7 @@ let tokenize () =
     else begin
       let c = char_at i in
       if is_space c then go (i + 1) acc
+      else if c = 59 && i + 1 < !line_len && char_at (i + 1) = 59 then go (i + 2) acc      (* ;; ends a phrase: here it is nothing *)
       (* 0x1F: hexadecimal *)
       else if c = 48 && i + 2 < !line_len && char_at (i + 1) = 120 && is_hex (char_at (i + 2)) then begin
         let j = ref (i + 2) and n = ref 0 in
@@ -437,13 +438,15 @@ let tokenize () =
         go !j (TInt !n :: acc)
       end
       else if is_digit c then begin
-        let j = ref i and n = ref 0 in
+        let j = ref i and n = ref 0 and big = ref 0.0 in
         while !j < !line_len && is_digit (char_at !j) do
-          n := !n * 10 + (char_at !j - 48); j := !j + 1
+          n := !n * 10 + (char_at !j - 48);
+          big := !big *. 10.0 +. float_of_int (char_at !j - 48);   (* the same digits as a float: an int is 31 bits here *)
+          j := !j + 1
         done;
         (* a point with a digit after it, or a point at the end as OCaml
            allows in "1.", makes this a float rather than an int; so does an exponent, 1e18 *)
-        let is_float = ref false and mant = ref (float_of_int !n) in
+        let is_float = ref false and mant = ref !big in
         (if !j < !line_len && char_at !j = 46 then begin
            is_float := true;
            j := !j + 1;
@@ -3156,7 +3159,7 @@ and dispatch_shape arms =
           | Ok (nc, nb, _, _) ->
             let (a, _) = shape in
             if a < 0 then go r (nc, nb) (count + 1)
-            else if shape = (nc, nb) then go r shape (count + 1)
+            else if (let (sc, sb) = shape in sc = nc && sb = nb) then go r shape (count + 1)   (* ints, not a tuple: caml_equal is not in the processor *)
             else (0 - 1, 0)
           | Err _ -> (0 - 1, 0))
        | PWild -> go r shape count
@@ -3650,10 +3653,13 @@ let run_phrase_body e name =
   end
   else if !doorway < 0 then Err "the doorway was not found"
   else begin
+    if here () >= 65500 then Err "out of code space"       (* the code window is 64K words *)
+    else begin
     io_write prog_words_reg (here ());
     code_wr !doorway op_branch;
     patch_branch (!doorway + 1) start;
     Ok (dispatch 0)
+    end
   end
 
 (* image_end is typed into a session that is compiling for an image, so it
@@ -3884,7 +3890,7 @@ let open_out (nm : string) =
        d32_set (rfs_dir + k * rfs_ent + rfs_name_max + 4) 0;
        d32_set 8 !out_at
      end else begin
-       let at = rfs_commit nm (rfs_free ()) 0 in
+       let at = rfs_commit nm (rfs_next (rfs_free ()) 0) 0 in      (* on a word boundary, whatever came before *)
        if at < 0 then raise (Sys_error (nm ^^ ": No space left on device"))
        else begin out_ent := cnt; out_at := at end
      end);
@@ -4039,6 +4045,11 @@ let img_end (_n : int) =
       patch_branch p start;
       emit op_apply1 in
   calls !img_frags;
+  (* finished: ask for the loader back (I/O 0x100f), which restarts the resident program with the RAM disk as
+     it is; where there is no such register the STOP that follows halts the machine as it always did *)
+  emit op_constint; emit 0; emit op_push;
+  emit op_constint; emit 0x100f;
+  emit 94; emit 404;                          (* C_CALL2 vm_io_write *)
   emit op_stop;
   let code_words = here () in
   let base = !img_at + 32 in
@@ -4696,8 +4707,14 @@ let infer_line e = match e with
    as well as on the machine -- and the work is the same as image_begin, run_file and image_end. *)
 let src_echo = ref false          (* name each phrase before it is compiled: for a long source *)
 
+(* where the first thing on the line is: blanks before a directive's # are nothing, as they are in OCaml *)
+let lead_blanks () =
+  let k = ref 0 in
+  while !k < !line_len && char_at !k = 32 do k := !k + 1 done;
+  !k
+
 let words_of_line () =
-  let acc = ref [] and i = ref 1 in
+  let acc = ref [] and i = ref (lead_blanks () + 1) in
   while !i < !line_len do
     if char_at !i = 32 then i := !i + 1
     else begin
@@ -4714,9 +4731,10 @@ let directive () =
   | [w; out; src] when string_equal w "image" ->
     if img_begin out < 0 then begin puts "error: cannot create "; puts out; newline () end
     else begin
-      src_echo := true;
+      src_echo := false;
       let n = !fs_run src in
       src_echo := false;
+      newline ();
       let size = img_end 0 in
       puts "image "; puts out; puts ": "; put_int n; puts " phrases, ";
       (if size < 0 then puts "not written" else begin put_int size; puts " bytes" end);
@@ -4724,8 +4742,8 @@ let directive () =
     end
   | _ -> puts "error: unknown directive"; newline ()
 
-let evaluate_line () =
-  if !line_len > 0 && char_at 0 = 35 then directive ()
+let evaluate_line_unsafe () =
+  if lead_blanks () < !line_len && char_at (lead_blanks ()) = 35 then directive ()
   else if !line_len > 0 then begin
     match tokenize () with
     | Err m -> puts "error: "; puts m; newline ()
@@ -4821,16 +4839,65 @@ let evaluate_line () =
          | Err m -> puts "error: "; puts m; newline ()
          | Ok v ->
            let elapsed = now () - t0 in
+           (* compiling for an image says nothing per phrase (the UART is much slower than the compiler, and nothing was
+              run: there is no value to show); only the session's types are kept *)
            (match top_let, e with
             | true, Let (_, name, _, Var _) ->
               type_session := (bound_name, sc) :: !type_session;
-              puts "val "; puts name; puts " : "; puts (type_name ty); puts " = "
-            | _ -> puts "- : "; puts (type_name ty); puts " = ");
-           (if !img_mode then puts "<in the image>" else print_compiled ty v);   (* nothing was run: there is no value *)
-           if elapsed > 0 then begin puts "   ("; put_int elapsed; puts " ms)" end;
-           newline ())
+              if not !img_mode then begin puts "val "; puts name; puts " : "; puts (type_name ty); puts " = " end
+            | _ -> if not !img_mode then begin puts "- : "; puts (type_name ty); puts " = " end);
+           if not !img_mode then begin
+             print_compiled ty v;
+             (if elapsed > 0 then begin puts "   ("; put_int elapsed; puts " ms)" end);
+             newline ()
+           end)
   end
 
+
+(* a phrase, whole: reading, typing, compiling and running it.  The machine raises Stack_overflow when the
+   stack is within a margin of its end and Out_of_memory when a collection frees too little; here they are
+   reported and the session goes on, rather than leaving an uncaught exception that halts the processor.
+   (The stack is 32K words, the heap two 32K-word semi-spaces: what the compiler's own recursion over a
+   long phrase has to fit in.) *)
+(* where the first ";;" is in the line, outside any string or character literal; -1 if none *)
+let find_semis () =
+  let n = !line_len in
+  let i = ref 0 and r = ref (0 - 1) and inq = ref false in
+  while !r < 0 && !i < n do
+    let c = char_at !i in
+    (if !inq then begin
+       (if c = 92 then i := !i + 1 else if c = 34 then inq := false)
+     end
+     else if c = 34 then inq := true
+     else if c = 39 && !i + 2 < n && char_at (!i + 2) = 39 then i := !i + 2
+     else if c = 59 && !i + 1 < n && char_at (!i + 1) = 59 then r := !i);
+    i := !i + 1
+  done;
+  !r
+
+let evaluate_line_whole () =
+  try evaluate_line_unsafe () with
+  | Stack_overflow -> puts "error: stack overflow"; newline ()
+  | Out_of_memory -> puts "error: out of memory"; newline ()
+  | Invalid_argument _ -> puts "error: index out of bounds"; newline ()
+  | Not_found -> puts "error: internal Not_found"; newline ()
+  | Failure m -> puts "error: Failure "; puts m; newline ()
+  | _ -> puts "error: uncaught exception"; newline ()
+
+(* a typed line may hold several phrases, ended by ";;" *)
+let rec evaluate_line () =
+  let k = find_semis () in
+  if k < 0 then evaluate_line_whole ()
+  else begin
+    let n = !line_len in
+    let rest = create_bytes (n - k - 2) in
+    for j = 0 to n - k - 3 do bytes_set rest j (char_of_int (char_at (k + 2 + j))) done;
+    line_len := k;
+    evaluate_line_whole ();
+    for j = 0 to n - k - 3 do bytes_set !line j (bytes_get rest j) done;
+    line_len := n - k - 2;
+    if !line_len > 0 then evaluate_line ()
+  end
 
 let () = fs_put := (fun nm v -> rfs_put nm v)
 let () = fs_get := (fun nm -> rfs_get nm)
@@ -4893,7 +4960,8 @@ let run_source (ic : int) =
           for k = 0 to (if !line_len < 70 then !line_len else 70) - 1 do putc (bytes_get !big k) done;
           newline ()
         end);
-       evaluate_line (); count := !count + 1
+       evaluate_line (); count := !count + 1;
+       (if !img_mode && !count land 15 = 0 then putc '.')
      end);
     line_len := 0 in
   line_len := 0;
@@ -4930,6 +4998,7 @@ let run_source (ic : int) =
     else if c = '\'' && !i + 3 < n && inch ic (!i + 1) = '\\' && inch ic (!i + 3) = '\'' then begin
       put c; put (inch ic (!i + 1)); put (inch ic (!i + 2)); put c; i := !i + 4
     end
+    else if c = ';' && !i + 1 < n && inch ic (!i + 1) = ';' then begin flush (); i := !i + 2 end   (* ;; ends a phrase *)
     else if c = '\n' then begin
       put ' '; i := !i + 1;
       (if !i < n && starts_phrase ic !i then flush ())
