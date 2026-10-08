@@ -2,9 +2,9 @@
    Registers are 32 bits wide and an int here has 31, so every register is written and read as two 16-bit halves; a command's
    argument is likewise given as two halves (the host-capacity bit of ACMD41 is bit 30 and does not survive as one number).
    Registers (index n at I/O 0x1100 + 2n, high half at +1): writes 0 align, 1 clock divider (SD clock = clk / (2 (n + 1))),
-   2 argument, 3 command, 4 setting, 5 start, 6 run flags, 7 block count, 8 block size, 9 timeout;
+   2 argument, 3 command, 4 setting (data start: +8 write, +0x10 read, +0x20 four bits), 5 start, 6 run flags, 7 block count, 8 block size, 9 timeout;
    reads 0..3 response, 5 status, 12 card detect (1 = present on the VC707), 14 {finish_data, finish_cmd}.  The 4 KB block buffer is at I/O 0x2000.
-   Reading only: nothing here writes a block. *)
+   sd_write puts a block back; nothing else here writes the card. *)
 external io_read : int -> int = "vm_io_read"
 external io_write : int -> int -> unit = "vm_io_write"
 external not : bool -> bool = "%boolnot"
@@ -14,7 +14,7 @@ let sdlo n = io_read (0x1100 + 2 * n)
 let sdhi n = io_read (0x1100 + 2 * n + 1)
 let delay n = let i = ref 0 in while !i < n do i := !i + 1 done
 
-(* start a command: the argument as two halves, the setting 0 none / 1 short / 3 long response, + 4 data, + 0x10 read, + 0x20 4 bit *)
+(* start a command: the argument as two halves, the setting 0 none / 1 short / 3 long response, + 4 data, + 0x10 read, + 0x20 4 bit (sd_init selects 4 bit; the 1-bit write path of the vendored host does not work) *)
 let sd_start idx hi lo setting =
   sdw 6 5; sdw 0 0; io_write (0x1100 + 5) hi; io_write (0x1100 + 4) lo;
   sdw 3 idx; sdw 4 setting; sdw 5 0; sdw 6 7; sdw 9 100000; sdw 5 1
@@ -48,14 +48,31 @@ let sd_init () =
   else if not (sd_cmd 3 0 0 1) then 6
   else begin
     sd_rca := sdhi 0;
-    if not (sd_cmd 7 !sd_rca 0 1) then 7 else 0
+    if not (sd_cmd 7 !sd_rca 0 1) then 7
+    else if not (sd_cmd 55 !sd_rca 0 1) || not (sd_cmd 6 0 2 1) then 8      (* ACMD6: four data lines from here on *)
+    else 0
   end
 
 (* block blk (SDHC: a block number, 512-byte blocks, 24 bits here) into the buffer at I/O 0x2000; true if the data arrived and checked *)
 let sd_read blk =
   sdw 7 1; sdw 8 512;
-  sd_start 17 (blk lsr 16) (blk land 0xFFFF) 0x15;
+  sd_start 17 (blk lsr 16) (blk land 0xFFFF) 0x35;
   delay 3000;
   sd_wait_bit 1 && sd_wait_bit 2 && (sdlo 5) land 64 <> 0
 
 let sd_byte i = io_read (0x2000 + i)
+
+(* poll CMD13 until the card is back in the transfer state and ready for data (bit 8 of the status): it can still be programming a block just written *)
+let rec sd_ready n =
+  if n = 0 then false
+  else if sd_cmd 13 !sd_rca 0 1 && ((sdlo 0) land 0x100) <> 0 then true
+  else sd_ready (n - 1)
+
+let sd_put i v = io_write (0x2000 + i) v
+
+(* the buffer at I/O 0x2000 (filled with sd_put) to block blk; true if the card took it (CMD24, then the host waits out the card's busy) *)
+let sd_write blk =
+  sdw 7 1; sdw 8 512;
+  sd_start 24 (blk lsr 16) (blk land 0xFFFF) 0x2D;
+  delay 3000;
+  sd_wait_bit 1 && sd_wait_bit 2 && sd_ready 1000
