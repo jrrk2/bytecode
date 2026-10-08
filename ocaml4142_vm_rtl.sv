@@ -64,6 +64,13 @@ module ocaml4142_vm_rtl #(
     // a fetch outside the program was just refused (the cycle before S_BOUND_ERROR): for a trace that freezes
     // on the first one
     output logic                oob_hit,
+    // what a trace records (vm_trace.v, the harness's OCVM_TRACE_FILE): the machine's registers, or while a collection runs
+    // its own -- the pointer being forwarded, its new address, the next free word, the root being scanned
+    output logic [  VALUEW-1:0] dbg_accu,
+    output logic [  VALUEW-1:0] dbg_env,
+    output logic [        19:0] dbg_hp,
+    output logic [        23:0] dbg_pc,
+    output logic                gc_start,
     // caml_ml_output_char: one-cycle strobe with the character written
     output logic                putc_valid,
     output logic [         7:0] putc_char,
@@ -363,6 +370,7 @@ module ocaml4142_vm_rtl #(
   logic [15:0] chk_f, chk_size;
   logic [STACK_AW:0] chk_i;
   logic [4:0]  chk_seen;
+  logic        ver_seen;        // a copied word differed from its original (letter X, once per collection)
   logic [31:0] gc_need, alloc_need;
   // MULINT's pipeline: operands, then product (see the MULINT arm)
   logic signed [VALUEW-1:0] mul_a, mul_b;
@@ -411,6 +419,13 @@ module ocaml4142_vm_rtl #(
   function automatic logic [HEAP_AW-1:0] Heap_index_of_ptr(input logic [VALUEW-1:0] ptr);
 
     Heap_index_of_ptr = ptr[HEAP_AW+1:2];
+  endfunction
+
+  // imm sign-extended to the machine word by hand.  A size cast of a signed expression, VALUEW'($signed(imm)), is sign-extending
+  // in the simulator and was not in Vivado's synthesis: a negative offset came out zero-extended, and its carry set bit 34 of
+  // every closure pointer made from a sibling (the board's compile failed after the first collection because of it).
+  function automatic logic [VALUEW-1:0] Sext32(input logic [31:0] v);
+    Sext32 = {{(VALUEW-32){v[31]}}, v};
   endfunction
 
   function automatic logic [PCW-1:0] Codeptr_val(input logic [VALUEW-1:0] ptr);
@@ -484,6 +499,13 @@ module ocaml4142_vm_rtl #(
 
   state_t state;
   assign state_out = state;
+  wire in_gc = state == S_GC_START || state == S_GC_ROOT || state == S_GC_ROOT_WB || state == S_GC_FWD || state == S_GC_COPY
+            || state == S_GC_MARK || state == S_GC_SCAN || state == S_GC_SCAN_FIELD || state == S_GC_SCAN_WB;
+  assign dbg_accu  = in_gc ? gc_new : accu;
+  assign dbg_env   = in_gc ? gc_val : env;
+  assign dbg_hp    = in_gc ? 20'(gc_free) : 20'(hp);
+  assign dbg_pc    = in_gc ? {1'b1, gc_phase, 4'b0, gc_i[15:0]} : pc;
+  assign gc_start  = state == S_GC_START;
   // the first bounds error of any kind freezes a trace: a fetch outside the program, or an index outside a block
   assign oob_hit   = ((state == S_FETCH) && code_valid && code_oob) || (state == S_BOUND_ERROR);
   
@@ -826,6 +848,11 @@ module ocaml4142_vm_rtl #(
   endtask
 
 `ifndef SYNTHESIS
+  // +heapdump=FILE: the heap, as $readmemh words, when the simulation ends (compared with a readback of the board's block RAM)
+  final begin
+    string fn;
+    if ($value$plusargs("heapdump=%s", fn)) $writememh(fn, heap_mem);
+  end
   // After a collection (at S_GC_DONE, before the spaces swap): to-space must
   // be a run of blocks from to_lo exactly to gc_free, none left marked
   // forwarded, and every pointer in them, in the live stack and in the
@@ -849,22 +876,22 @@ module ocaml4142_vm_rtl #(
       is_block[idx] = 1;
       if (heap_mem[idx][15:8] == GC_FORWARDED) bad++;
     end
-    if (idx != gc_free) bad++;
+    if (idx != gc_free) begin bad++; $display("BAD walk ended at %0d, gc_free %0d", idx, gc_free); end
     for (idx = to_lo; idx < gc_free; idx += 1 + hdr[31:16]) begin
       hdr = heap_mem[idx];
       if (hdr[7:0] < NO_SCAN_TAG)
         for (f = 1; f <= hdr[31:16]; f++) begin
           v = heap_mem[idx+f];
-          if (!v[0] && !v[31] && !gc_valid_target(v, is_block)) bad++;
+          if (!v[0] && !v[31] && !gc_valid_target(v, is_block)) begin bad++; $display("BAD heap blk@%0d tag %0d size %0d field %0d = %h", idx, hdr[7:0], hdr[31:16], f, v); end
         end
     end
     for (idx = sp; idx < (1 << STACK_AW) - 1; idx++) begin
       v = stack_mem[idx];
-      if (!v[0] && !v[31] && !gc_valid_target(v, is_block)) bad++;
+      if (!v[0] && !v[31] && !gc_valid_target(v, is_block)) begin bad++; $display("BAD stack[%0d] = %h", idx, v); end
     end
     for (idx = 0; idx < (1 << GLOBALS_AW); idx++) begin
       v = globals_mem[idx];
-      if (!v[0] && !v[31] && !gc_valid_target(v, is_block)) bad++;
+      if (!v[0] && !v[31] && !gc_valid_target(v, is_block)) begin bad++; $display("BAD global[%0d] = %h", idx, v); end
     end
     $display("GC %0d: %0d words live, semi-space %0d%s", gc_count + 1, gc_free - to_lo, gc_semi,
              bad ? " -- HEAP CHECK FAILED" : "");
@@ -2163,7 +2190,7 @@ module ocaml4142_vm_rtl #(
             PUSHOFFSETCLOSURE: begin
               sp <= sp - 1;
               stack_write(sp-1, accu);
-              accu <= env + (VALUEW'($signed(imm)) <<< 2);   // imm is signed: a sibling before this closure has a negative offset, and a zero-extended one carried into the collector's bits
+              accu <= env + (Sext32(imm) << 2);   // a sibling before this closure has a negative offset
             end
 
 
@@ -2522,7 +2549,7 @@ module ocaml4142_vm_rtl #(
             OFFSETCLOSURE0:  accu <= env;
             OFFSETCLOSURE3:  accu <= env + 12;
             OFFSETCLOSUREM3: accu <= env - 12;
-            OFFSETCLOSURE:   accu <= env + (VALUEW'($signed(imm)) <<< 2);   // imm is signed: a sibling before this closure has a negative offset, and a zero-extended one carried into the collector's bits
+            OFFSETCLOSURE:   accu <= env + (Sext32(imm) << 2);   // a sibling before this closure has a negative offset
 
             PUSHOFFSETCLOSURE0: begin
               logic [31:0] old_sp;
@@ -2598,6 +2625,7 @@ module ocaml4142_vm_rtl #(
 
         // ---- GC: roots, then Cheney scan of to-space ----
         S_GC_START: begin
+          ver_seen <= 1'b0;
           if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "G"; end
           to_lo <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
           gc_free <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
@@ -2703,7 +2731,8 @@ module ocaml4142_vm_rtl #(
           end else gc_copy_valid <= 1'b0;
           if (gc_wr + gc_copy_valid == gc_size && gc_rd == gc_size) begin
             gc_mark_second <= 1'b0;
-            state <= S_GC_MARK;
+            if (DEBUG_TRACE) begin chk_f <= 0; state <= S_GC_VERIFY; end
+            else state <= S_GC_MARK;
           end
         end
 
@@ -2765,6 +2794,18 @@ module ocaml4142_vm_rtl #(
         // After the copy, before the spaces swap: no root and no field of a live block may still point into the old
         // space.  One letter, once per kind per collection, for the first that does: a accu, e env, h a heap
         // field, s a stack word, g a global.  (The simulator's gc_check_to_space, in a form that synthesizes.)
+        // The copy just made, word for word against its original (both still in place): the header and the fields
+        S_GC_VERIFY:
+        if (chk_f > gc_size) begin gc_mark_second <= 1'b0; state <= S_GC_MARK; end
+        else if (!rd_phase) begin
+          heap_read_a(gc_new_idx + HEAP_AW'(chk_f));
+          heap_read_b(gc_obj + HEAP_AW'(chk_f));
+          hold_for_read();
+        end else begin
+          if (hm_rd_a != hm_rd_b && !ver_seen) begin putc_valid <= 1'b1; putc_char <= "X"; ver_seen <= 1'b1; end
+          chk_f <= chk_f + 1;
+        end
+
         S_GC_CHECK:
         case (chk_ph)
           3'd0: begin

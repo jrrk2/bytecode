@@ -519,16 +519,28 @@ int main(int argc, char** argv) {
         top->clk = 1;
         top->eval();
         // OCVM_TRACE_FILE: the same history the board's vm_trace keeps, but all of it -- a 12-byte record
-        // (state, opcode, pc, sp, accu low 16 bits, cycle low 32 bits) whenever the state or pc changes
-        if (trace_out) {
+        // (24 bytes: state, opcode, pc, sp, accu 36 bits, env 36 bits, hp low 16 bits) whenever the state or pc changes
+        const unsigned GCSTART = 0x36;  /* S_GC_START (state_rtl_complete.h) */
+        static uint64_t records = 0, max_records = getenv("OCVM_MAX_RECORDS") ? strtoull(getenv("OCVM_MAX_RECORDS"), nullptr, 0) : 0;
+        {
+            static unsigned cs = ~0u, cp = ~0u;
+            if (top->state_out != cs || top->dbg_pc != cp) { cs = top->state_out; cp = top->dbg_pc; records++; if (cs == 0x3F && getenv("OCVM_REPORT_GC")) std::cerr << "GC_DONE record " << records << "\n"; if (cs == GCSTART && getenv("OCVM_REPORT_GC")) std::cerr << "GC_START record " << records << "\n"; }
+            if (max_records && records >= max_records) { std::cerr << "Stopped at record " << records << "\n"; break; }
+        }
+        static uint64_t trace_from = getenv("OCVM_TRACE_FROM") ? strtoull(getenv("OCVM_TRACE_FROM"), nullptr, 0) : 0;
+        if (trace_out && records >= trace_from) {
             static unsigned last_state = ~0u, last_pc = ~0u;
-            unsigned st = top->state_out, pcv = top->pc;
+            unsigned st = top->state_out, pcv = top->dbg_pc;
             if (st != last_state || pcv != last_pc) {
-                unsigned char r[12] = { (unsigned char)st, (unsigned char)top->opcode_out,
+                uint64_t ac = top->dbg_accu, ev = top->dbg_env;
+                unsigned hpv = top->dbg_hp;
+                unsigned char r[24] = { (unsigned char)st, (unsigned char)top->opcode_out,
                     (unsigned char)pcv, (unsigned char)(pcv >> 8), (unsigned char)(pcv >> 16), 0,
-                    (unsigned char)top->sp, (unsigned char)(top->sp >> 8),
-                    (unsigned char)top->accu, (unsigned char)(top->accu >> 8), 0, 0 };
-                fwrite(r, 1, 12, trace_out);
+                    (unsigned char)top->sp, (unsigned char)(top->sp >> 8), 0, 0, 0, 0,
+                    (unsigned char)ac, (unsigned char)(ac >> 8), (unsigned char)(ac >> 16), (unsigned char)(ac >> 24), (unsigned char)(ac >> 32),
+                    (unsigned char)ev, (unsigned char)(ev >> 8), (unsigned char)(ev >> 16), (unsigned char)(ev >> 24), (unsigned char)(ev >> 32),
+                    (unsigned char)hpv, (unsigned char)(hpv >> 8) };
+                fwrite(r, 1, 24, trace_out);
                 last_state = st; last_pc = pcv;
             }
         }
@@ -557,6 +569,7 @@ int main(int argc, char** argv) {
         if (f) { fwrite(disk_ram, 1, disk_bytes, f); fclose(f); }
     }
     if (tfp) { tfp->close(); delete tfp; }
+    top->final();
     delete top;
     return 0;
 }
