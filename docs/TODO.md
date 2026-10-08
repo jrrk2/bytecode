@@ -18,7 +18,15 @@ collector's bits 35:33, pointers still even words.  The VM word becomes 33 bits.
   walk a value (string/bytes tag: compare raw words; double tag: compare as float; closure tag: not comparable; else field by
   field), so these need a microcoded walk with its own stack in the RTL, or an ML library linked into `comp.ml`.  Until then
   the compiler must not use `=` on tuples or other structured values (see `dispatch_shape`).
-* Later, with the 32-bit-integer layout, use the spare bits 35:34 as an advisory 2-bit hint on immediates (int / char / bool or
+* Tagged words as an early warning (the user's intent, 2026-10-08): give bits 35:34 a *kind* that the hardware checks on use, so a
+  corrupted word traps at the instruction that used it: 00 integer (bit 0 set), 01 heap pointer, 10 code pointer, 11 invalid.
+  Check at every dereference (base must be a heap pointer), at APPLY/RETURN/APPTERM/PUSHTRAP (code pointer), in integer
+  arithmetic and comparisons (integer operands), and in the collector's scan.  A violation raises the bounds exception and
+  freezes `vm_trace` at that record.  All producers are in the VM (allocation, closure creation, `Make_codeptr`, the
+  collector's forwarding) plus the word-rebuilding places: `bc2image`, the loader's unmarshaller, I/O reads, C primitives.
+  Make the full checks a mode (`#strict`), off for plain `ocamlc` programs that use `Obj.magic`; keep the kind-11 check always
+  on.  It would have caught the `OFFSETCLOSURE` carry (a stray bit 34 on a closure pointer) at its first use.
+* Separately, an advisory hint (as above, not the invariant check) could ride on the same bits; with the 32-bit-integer layout, use the spare bits 35:34 as an advisory 2-bit hint on immediates (int / char / bool or
   unit / constructor), set by `comp.ml` for char and bool constants, so that a generic printer shows `'a'` and `true` and a debug
   mode can trap a type-confused `=`.  Preserved by whole-word moves, dropped by arithmetic, I/O and C primitives; comparison must
   mask it; never relied on for correctness.
