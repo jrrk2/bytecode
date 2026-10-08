@@ -13,6 +13,16 @@ collector's bits 35:33, pointers still even words.  The VM word becomes 33 bits.
 * Needs the full regress, new reference traces where a test overflows 31 bits, and a bitstream.  Do it on a branch, after the
   SD card works.
 
+## Polymorphic comparison, and type hints in the spare bits
+* The core has no `caml_equal`, `caml_compare` or `caml_hash` (`tools/check_prims.py` flags them).  Headers carry enough to
+  walk a value (string/bytes tag: compare raw words; double tag: compare as float; closure tag: not comparable; else field by
+  field), so these need a microcoded walk with its own stack in the RTL, or an ML library linked into `comp.ml`.  Until then
+  the compiler must not use `=` on tuples or other structured values (see `dispatch_shape`).
+* Later, with the 32-bit-integer layout, use the spare bits 35:34 as an advisory 2-bit hint on immediates (int / char / bool or
+  unit / constructor), set by `comp.ml` for char and bool constants, so that a generic printer shows `'a'` and `true` and a debug
+  mode can trap a type-confused `=`.  Preserved by whole-word moves, dropped by arithmetic, I/O and C primitives; comparison must
+  mask it; never relied on for correctness.
+
 ## SD card
 * CMD0/CMD8, then ACMD41, CMD2/3/7, CMD17 reads, 4-bit mode; ML block layer; a small FAT32 reader; `DISK.RFS` as the
   persistent RAM-disk volume, read and written in place; load from the card at power-on, fall back to the network.
