@@ -4726,6 +4726,8 @@ let words_of_line () =
   done;
   rev_acc !acc []
 
+let freeze_on_oob = ref false
+
 let directive () =
   match words_of_line () with
   | [w; out; src] when string_equal w "image" ->
@@ -4740,6 +4742,10 @@ let directive () =
       (if size < 0 then puts "not written" else begin put_int size; puts " bytes" end);
       newline ()
     end
+  | [w] when string_equal w "freeze" ->
+    (* bring-up: the next bounds error stops the machine in a loop that allocates nothing, so that its memories can be
+       read back over JTAG as they were *)
+    freeze_on_oob := true; puts "freeze on the first bounds error"; newline ()
   | _ -> puts "error: unknown directive"; newline ()
 
 let evaluate_line_unsafe () =
@@ -4879,7 +4885,8 @@ let evaluate_line_whole () =
   try evaluate_line_unsafe () with
   | Stack_overflow -> puts "error: stack overflow"; newline ()
   | Out_of_memory -> puts "error: out of memory"; newline ()
-  | Invalid_argument _ -> puts "error: index out of bounds"; newline ()
+  | Invalid_argument _ -> puts "error: index out of bounds"; newline ();
+    if !freeze_on_oob then begin puts "frozen"; newline (); while true do () done end
   | Not_found -> puts "error: internal Not_found"; newline ()
   | Failure m -> puts "error: Failure "; puts m; newline ()
   | _ -> puts "error: uncaught exception"; newline ()
@@ -5524,8 +5531,13 @@ let packets = ref 0
 
 
 
+(* the loader's serial boot leaves 0x4E in the RAM disk's last byte: then the network is not touched at all, so that
+   what the compiler allocates cannot depend on what frames arrive *)
+let net_on = ref true
+
 let poll () =
   uart_poll ();
+  if !net_on then begin
   dhcp_tick ();
   tcp_tick ();
   nfs_tick ();
@@ -5548,6 +5560,7 @@ let poll () =
     io_write eth_rxlen 0;
     packets := !packets + 1;
     io_write leds ((if bound () then 2 else 0) lor ((!packets land 0x3F) lsl 2))
+  end
   end
 
 (* Emptying the output buffer: send what is queued and take the
@@ -5582,6 +5595,7 @@ let uart_build () =
 (* ==== MAIN ==== *)
 let () =
   io_write leds 1;
+  net_on := io_read (disk + io_read disk_size_reg - 1) <> 0x4E;
   if not_b (find_doorway ()) then uart_puts "compiler: the doorway is missing\n"
   else begin
     uart_puts "compiler: doorway at "; uart_dec !doorway;
