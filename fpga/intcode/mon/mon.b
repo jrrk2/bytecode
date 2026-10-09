@@ -11,7 +11,7 @@ $( LET N = 0
    LET C = 0
    $( C := RDCH()
       IF C = ENDSTREAMCH DO $( WRCH('*N'); RESULTIS FALSE $)
-      IF C = '*N' \/ C = '*C' DO BREAK
+      IF C = '*N' \/ C = 13 DO BREAK
       TEST (C = 8 \/ C = 127) THEN
       $( IF N > 0 DO $( N := N - 1; WRCH(8); WRCH(' '); WRCH(8) $) $)
       OR IF N < 79 DO $( N := N + 1; PUTBYTE(V, N, UPPER(C)); WRCH(C) $)
@@ -90,6 +90,17 @@ $( LET O = FINDOUTPUT(NAME)
    WRITES("OK*N")
 $)
 
+// RUN name args: the arguments (the rest of the line) go into the file ARGS, and then the program is started
+AND DORUN(NAME, LINE, P) BE
+$( LET O = FINDOUTPUT("ARGS")
+   IF O \= 0 DO
+   $( SELECTOUTPUT(O)
+      FOR I = P + 1 TO GETBYTE(LINE, 0) DO WRCH(GETBYTE(LINE, I))
+      WRCH('*N')
+      ENDWRITE()  $)
+   IF EXEC(NAME) = 0 DO WRITES("NO SUCH PROGRAM*N")
+$)
+
 AND DOCOPY(A, B) BE
 $( LET S = OPEN(A)
    LET O = 0
@@ -114,18 +125,19 @@ $( LET LINE = VEC 21
    LET W3 = VEC 7
    WRITES("*NINTCODE MONITOR  DIR CAT PUT COPY RUN HELP*N")
    $( LET P = 0
+      LET Q = 0
       WRCH('>')
       UNLESS READLINE(LINE) DO LOOP
       P := WORD(LINE, 0, W1)
       P := WORD(LINE, P, W2)
+      Q := P
       P := WORD(LINE, P, W3)
       TEST GETBYTE(W1, 0) = 0 THEN LOOP
       OR TEST SAME(W1, "DIR") THEN DODIR()
       OR TEST SAME(W1, "CAT") THEN DOCAT(W2)
       OR TEST SAME(W1, "PUT") THEN DOPUT(W2)
       OR TEST SAME(W1, "COPY") THEN DOCOPY(W2, W3)
-      OR TEST SAME(W1, "RUN") THEN
-         $( IF EXEC(W2) = 0 DO WRITES("NO SUCH PROGRAM*N") $)
-      OR WRITES("DIR  CAT n  PUT n  COPY a b  RUN n*N")
+      OR TEST SAME(W1, "RUN") THEN DORUN(W2, LINE, Q)
+      OR WRITES("DIR  CAT n  PUT n  COPY a b  RUN n args*N")
    $) REPEAT
 $)
