@@ -28,6 +28,7 @@ int main(int argc, char **argv) {
     int ts = -1, tcnt = 0, tbyte = 0, last = 1;
     uint64_t clocks = 0; unsigned chars = 0;
     uint64_t halted_at = 0;
+    int credit = 96;                                             // CREDIT=1: type only what the board has asked for (ENQ gives 32 more)
     while (clocks < max && !(halted_at && clocks > halted_at + 40ULL * 10 * div)) {      // after the halt, long enough for the UART to finish
         if ((top->led & 2) && !halted_at) halted_at = clocks;
         top->clk = 0; top->eval(); top->clk = 1; top->eval(); clocks++;
@@ -53,7 +54,7 @@ int main(int argc, char **argv) {
         }
         if (clocks < 100) continue;
         // typing
-        if (ibit < 0) { if (ib < ni && clocks > 40000) { ibyte = (unsigned char)input[ib++]; ibit = 0; icnt = div; top->uart_rx_in = 0; } }
+        if (ibit < 0) { if (ib < ni && clocks > 40000 && (!getenv("CREDIT") || credit > 0)) { ibyte = (unsigned char)input[ib++]; credit--; ibit = 0; icnt = div; top->uart_rx_in = 0; } }
         else if (--icnt == 0) {
             icnt = div;
             if (ibit < 8) top->uart_rx_in = (ibyte >> ibit++) & 1;
@@ -65,7 +66,7 @@ int main(int argc, char **argv) {
         if (ts < 0) { if (last && !tx) { ts = 0; tcnt = div + div / 2; tbyte = 0; } }
         else if (--tcnt == 0) {
             if (ts < 8) { tbyte |= tx << ts++; tcnt = div; }
-            else { putchar(tbyte); fflush(stdout); chars++; ts = -1; }
+            else { if (tbyte == 5) credit += 32; else { putchar(tbyte); fflush(stdout); } chars++; ts = -1; }
         }
         if (getenv("TX_EDGES") && tx != last) fprintf(stderr, "%llu:%d ", (unsigned long long)clocks, tx);
         last = tx;

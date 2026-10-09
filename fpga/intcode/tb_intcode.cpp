@@ -120,12 +120,12 @@ int main(int argc, char **argv) {
 
     Vintcode_core *top = new Vintcode_core;
     top->rst = 1;
-    top->init_c = base; top->init_p = P; top->init_g = G; top->boot_store = 0;
+    top->init_c = base; top->init_p = P; top->init_g = G; top->boot_store = 0; top->io_maddr = 0; top->io_mre = 0;
     top->m_rdata = 0; top->io_ack = 0; top->io_res = 0; top->clk = 0;
     for (int i = 0; i < 4; i++) { top->clk = 0; top->eval(); top->clk = 1; top->eval(); }
     top->rst = 0; top->clk = 0; top->eval();
 
-    uint64_t clocks = 0, instrs = 0;
+    uint64_t clocks = 0, instrs = 0; uint32_t maxw = 0;
     uint32_t rdata = 0, ack = 0, res = 0;
     while (!top->halted && clocks < max_clocks) {
         // outputs of the cycle about to end
@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
         top->clk = 1; top->eval();
         clocks++;
         // what the outside world does at that edge: the RAM, and the streams
-        if (we) M[addr] = (int)wdata;
+        if (we) { M[addr] = (int)wdata; if (addr > maxw) maxw = addr; }
         if (re) rdata = (uint32_t)M[addr];
         ack = 0;
         if (req) {
@@ -164,6 +164,7 @@ int main(int argc, char **argv) {
     fflush(stdout);
     fprintf(stderr, "RTL: %llu clocks, %llu instructions, %.2f clocks per instruction\n",
             (unsigned long long)clocks, (unsigned long long)instrs, instrs ? (double)clocks / instrs : 0.0);
+    fprintf(stderr, "highest store word written: %u\n", maxw);
     delete top;
     return code;
 }

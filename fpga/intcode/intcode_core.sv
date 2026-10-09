@@ -28,6 +28,8 @@ module intcode_core #(
 	output reg  [5:0]       io_op,
 	output reg  [WIDTH-1:0] io_a,
 	input  wire             io_ack,
+	input  wire [AW-1:0]    io_maddr,                     // while the core waits for io_ack the stream device may read the store: findinput looks at the file name
+	input  wire             io_mre,
 	input  wire [WIDTH-1:0] io_res,
 	output reg              instr_done,                   // one pulse per instruction executed
 	output reg              halted,
@@ -130,6 +132,7 @@ module intcode_core #(
 			S_PB0: begin m_addr = A[AW-1:0] + bw[AW-1:0]; m_re = 1'b1; end
 			S_PB2: begin m_addr = A[AW-1:0] + bw[AW-1:0]; m_wdata = tword; m_we = 1'b1; end
 			S_IO:  io_req = 1'b1;
+			S_IOW: begin m_addr = io_maddr; m_re = io_mre; end
 			default: ;
 		endcase
 	end
