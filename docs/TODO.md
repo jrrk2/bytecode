@@ -66,9 +66,9 @@ The RAM disk (128 RAMB36 tiles, 512 KiB) and the staging RAM (64 tiles, 256 KiB)
 part of the device: block RAM spent on storage that the card and the network provide, when the machine is short of code RAM and heap.
 Files by device name (`sd(U,P)`, `nfs(U,P)`; see docs/NFS_README.md) are the first step: the compiler reads its source from them in
 place.  To finish:
-* Output to the card and to NFS in place (an NFS write channel that sends as its buffer fills; FAT file creation and growth), then
-  `image_begin` on a device name.  The image builder patches earlier words (branches, the header), so it needs the file open for
-  random writes, or a small write-back cache, or two passes.
+* Done for NFS: output channels stream, and `image_begin` / `#image` on an `nfs(U,P)` name builds the image into the server through a window
+  (docs/image-mode.md); checked on the host with no RAM disk (`tools/selfhost_nodisk.sh`).  To do: the same on the board; output to the card
+  (FAT file creation and growth); the window in the heap or DDR rather than the RAM disk on the board.
 * What the RAM disk does that nothing else does: it survives a chain load, so one image can leave files for the next.  A card or NFS
   file does the same; check each use (`boot_file`, the loader's "RAM disk kept", `image2.input`, the preloaded disc).
 * Boot without the staging RAM: the loader strips a bytecode file and builds its heap image in staging before the sequencer copies

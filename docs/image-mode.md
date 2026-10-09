@@ -42,3 +42,17 @@ Testing in the simulator: run comp.ml's bytecode with `+disk=disk.bin` and `io/i
     main_rtl model: prog.bc +notrace +heap=dir/heap.hex +globals=dir/globals.hex +heap_words=N
 
 io/image.input builds t.img, boots it, and the new program prints "hello from the image" and "4".
+
+## Building an image on a server, with no RAM disk
+
+`image_begin "nfs(U,P)dir/out.img"` (or `#image nfs(U,P)dir/out.img src.ml`, the source also a device name) builds the image straight into a
+file on an NFS server.  The file is created at once.  Code is written in order and patched only near its end, except words 0 and 1 (the branch to
+`main`, patched last): words 0..255 are kept until the end, the later ones go through a ring of recent words (32768 words in the free part of the RAM
+disk, not committed to any file; 16384 words in the heap if there is no RAM disk) and an older 256-word piece is sent, 1 KiB at a time, when the ring
+is needed for newer words.  The heap and globals sections are built in memory and sent at the end; the CRC is taken by reading the code back from the
+server once; the header goes last.  A patch that would reach back past the ring prints "image: a patch reaches back past the window".
+
+`tools/selfhost_nodisk.sh` runs this on the host with no RAM disk at all (`ETHMODEL_NODISK=1`): `ethmodel.c` has an NFS server (portmap, mountd, nfsd:
+GETPORT, MNT, LOOKUP, READ, CREATE, WRITE over the directory `$ETHMODEL_NFS_ROOT`), the compiler reads `comp.ml` from it and writes the image back, and
+the result is compared with the conventional build: they are byte-for-byte the same.  `image_begin "stm:name"` is the test path for the same code with
+a RAM-disk file as the sink.

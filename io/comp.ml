@@ -2240,17 +2240,89 @@ let img_mode = ref false
 let quiet = ref false          (* a phrase run at start-up says nothing: predefine *)
 let img_at = ref 0
 
+(* An image can also be built straight into a file on an NFS server (img_dev 1; the output channel opened on the name has created
+   it).  The code is the long part, and it is written in order, patched only near its end -- except words 0 and 1, the branch to main,
+   which are patched last.  So: words 0..255 are kept in iw_first until the end; the rest go through a ring of recent words (in the
+   free part of the RAM disk, not committed to any file) and an older piece of 256 words is sent to the server, 1 KiB at a time, when
+   the ring is wanted for newer ones.  The heap and globals sections come after the code and are small: they are built in iw_tail and
+   sent at the end, and the header in iw_hdr.  The CRC is taken by reading the code back from the server once, after it is all there. *)
+let img_dev = ref 0
+let iw_ring = ref 0                  (* the ring's size in words, a multiple of 256 *)
+let iw_base = ref 0                  (* its I/O address, in the RAM disk *)
+let iw_heap = ref (create_bytes 0)   (* or, with no RAM disk, the ring itself, in the heap *)
+let iw_hon = ref false
+let iw_flushed = ref 256             (* code words below this are on the server (0..255 wait in iw_first) *)
+let iw_hw = ref 0                    (* one past the highest code word written *)
+let iw_first = create_bytes 1024
+let iw_hdr = create_bytes 32
+let iw_tail = ref (create_bytes 0)
+let iw_tail_cap = ref 0
+let iw_tail_base = ref 0             (* the offset in the file where iw_tail starts: after the code *)
+let img_send_hook = ref (fun (_off : int) (_n : int) (_get : int -> int) -> ())   (* file offset, length, byte i of it *)
+let img_crc_hook = ref (fun (_from : int) (_len : int) (crc : int) -> crc)
+
 let img_put4 off b0 b1 b2 b3 =
-  io_write (0x100000 + off) b0; io_write (0x100000 + off + 1) b1;
-  io_write (0x100000 + off + 2) b2; io_write (0x100000 + off + 3) b3
+  if !img_dev = 0 then begin
+    io_write (0x100000 + off) b0; io_write (0x100000 + off + 1) b1;
+    io_write (0x100000 + off + 2) b2; io_write (0x100000 + off + 3) b3
+  end else if off < 32 then begin
+    bytes_set iw_hdr off (char_of_int b0); bytes_set iw_hdr (off + 1) (char_of_int b1);
+    bytes_set iw_hdr (off + 2) (char_of_int b2); bytes_set iw_hdr (off + 3) (char_of_int b3)
+  end else begin
+    let t = off - !iw_tail_base in
+    (if t + 4 > !iw_tail_cap then begin
+       let cap = ref (if !iw_tail_cap = 0 then 16384 else !iw_tail_cap) in
+       while t + 4 > !cap do cap := 2 * !cap done;
+       let nb = create_bytes !cap in
+       for k = 0 to !iw_tail_cap - 1 do bytes_set nb k (bytes_get !iw_tail k) done;
+       iw_tail := nb; iw_tail_cap := !cap
+     end);
+    bytes_set !iw_tail t (char_of_int b0); bytes_set !iw_tail (t + 1) (char_of_int b1);
+    bytes_set !iw_tail (t + 2) (char_of_int b2); bytes_set !iw_tail (t + 3) (char_of_int b3)
+  end
 
 (* a word as the VM would hold it: two's complement in 32 bits *)
 let img_wr32 off v =
   img_put4 off (v land 0xFF) ((v lsr 8) land 0xFF) ((v lsr 16) land 0xFF)
     (((v lsr 24) land 0x7F) lor (if v < 0 then 0x80 else 0))
 
+let iw_slot w = (if !iw_hon then 0 else !iw_base) + 4 * (w mod !iw_ring)
+let iw_b (a : int) = if !iw_hon then int_of_char (bytes_get !iw_heap a) else io_read a
+let iw_setb (a : int) (v : int) = if !iw_hon then bytes_set !iw_heap a (char_of_int v) else io_write a v
+
+(* send the oldest piece in the ring: 256 words from iw_flushed *)
+let iw_send_piece () =
+  let w0 = !iw_flushed in
+  let a = iw_slot w0 in
+  (!img_send_hook) (32 + 4 * w0) 1024 (fun (i : int) -> iw_b (a + i));
+  iw_flushed := w0 + 256
+
+let iw_rd w =
+  if w < 256 then
+    int_of_char (bytes_get iw_first (4 * w)) lor (int_of_char (bytes_get iw_first (4 * w + 1)) lsl 8)
+    lor (int_of_char (bytes_get iw_first (4 * w + 2)) lsl 16)
+  else if w < !iw_flushed then begin puts "image: a patch reaches back past the window"; newline (); 0 end
+  else begin
+    let a = iw_slot w in
+    iw_b a lor (iw_b (a + 1) lsl 8) lor (iw_b (a + 2) lsl 16)
+  end
+
+let iw_wr w v =
+  let b0 = v land 0xFF and b1 = (v lsr 8) land 0xFF and b2 = (v lsr 16) land 0xFF
+  and b3 = ((v lsr 24) land 0x7F) lor (if v < 0 then 0x80 else 0) in
+  if w < 256 then begin
+    bytes_set iw_first (4 * w) (char_of_int b0); bytes_set iw_first (4 * w + 1) (char_of_int b1);
+    bytes_set iw_first (4 * w + 2) (char_of_int b2); bytes_set iw_first (4 * w + 3) (char_of_int b3)
+  end else begin
+    while w >= !iw_flushed + !iw_ring do iw_send_piece () done;
+    let a = iw_slot w in
+    iw_setb a b0; iw_setb (a + 1) b1; iw_setb (a + 2) b2; iw_setb (a + 3) b3;
+    if w + 1 > !iw_hw then iw_hw := w + 1
+  end
+
 let code_rd w =
-  if !img_mode then begin
+  if !img_mode && !img_dev <> 0 then iw_rd w
+  else if !img_mode then begin
     let a = 0x100000 + !img_at + 32 + w * 4 in
     io_read a lor (io_read (a + 1) lsl 8) lor (io_read (a + 2) lsl 16)
   end else begin
@@ -2259,7 +2331,8 @@ let code_rd w =
   end
 
 let code_wr w v =
-  if !img_mode then img_wr32 (!img_at + 32 + w * 4) v
+  if !img_mode && !img_dev <> 0 then iw_wr w v
+  else if !img_mode then img_wr32 (!img_at + 32 + w * 4) v
   else begin
     let a = code_win + w * 4 in
     io_write a (v land 0xFF);
@@ -4227,7 +4300,7 @@ let nfs_out_send_hook = ref (fun (_off : int) (_n : int) -> ())
 
 let open_out (nm : string) =
   let d = dev_split nm in
-  let _ = rfs_ready () in
+  (if d = 0 then (let _ = rfs_ready () in ()));
   let n = string_length nm in
   if !out_live then raise (Sys_error "Too many open output files")
   else if d = 2 then raise (Sys_error (nm ^^ ": writing to the card is not done"))
@@ -4375,13 +4448,48 @@ let img_oc = ref 0
 (* the image is a file being written: the channel makes its entry and says where its data is, the code
    and the rest go into that space by raw writes as the compilation goes, and image_end gives the
    file its length. *)
-let img_begin (nm : string) =
+let img_begin (nm0 : string) =
+  (* "stm:name" builds the image through the streaming path into a RAM-disk file, as a test of it where there is no server *)
+  let tst = string_length nm0 > 4 && string_get nm0 0 = 's' && string_get nm0 1 = 't' && string_get nm0 2 = 'm' && string_get nm0 3 = ':' in
+  let nm = if tst then begin
+      let r = create_bytes (string_length nm0 - 4) in
+      for k = 4 to string_length nm0 - 1 do bytes_set r (k - 4) (string_get nm0 k) done;
+      bytes_to_string r
+    end else nm0 in
   let oc = (try open_out nm with Sys_error _ -> 0 - 1) in
   if oc < 0 then 0 - 1
   else begin
+  if (!out_dev = 1 && io_read disk_size_reg > 0 && ((io_read disk_size_reg - rfs_free ()) / 4) / 256 * 256 < 4096)
+     || (tst && io_read disk_size_reg < 524288) then begin
+    puts "image: the RAM disk has too little free space for the code window (16 KiB at least)"; newline ();
+    discard_out oc;
+    0 - 1
+  end else begin
   img_oc := oc;
   img_name := nm;
-  img_at := !out_at;
+  img_dev := (if tst then 3 else !out_dev);
+  img_at := (if !out_dev = 1 || tst then 0 else !out_at);
+  (if tst then begin
+     iw_ring := 32768; iw_hon := false; iw_base := 0x100000 + io_read disk_size_reg - 4 * 32768;
+     iw_flushed := 256; iw_hw := 0;
+     for k = 0 to 1023 do bytes_set iw_first k (char_of_int 0) done;
+     iw_tail := create_bytes 16384; iw_tail_cap := 16384; iw_tail_base := 0
+   end);
+  (if !out_dev = 1 then begin
+     (* the ring: as much of the free part of the RAM disk as there is, up to 32768 words, without making it a file *)
+     (if io_read disk_size_reg = 0 then begin
+        iw_ring := 16384; iw_hon := true; iw_heap := create_bytes (4 * 16384)         (* no RAM disk: 64 KiB of the heap *)
+      end else begin
+        let free = rfs_free () in
+        let r = ((io_read disk_size_reg - free) / 4) / 256 * 256 in
+        iw_ring := (if r > 32768 then 32768 else r);
+        iw_hon := false;
+        iw_base := 0x100000 + free
+      end);
+     iw_flushed := 256; iw_hw := 0;
+     for k = 0 to 1023 do bytes_set iw_first k (char_of_int 0) done;
+     iw_tail := create_bytes 16384; iw_tail_cap := 16384; iw_tail_base := 0
+   end);
   sv_cp := !cp; sv_next := !next_global; sv_globals := !globals;
   sv_lits := !literals; sv_flts := !float_lits;
   globals := []; literals := []; float_lits := []; next_global := 12;   (* 0..11 are the predefined exceptions *)
@@ -4391,6 +4499,7 @@ let img_begin (nm : string) =
   em_reset ();
   emit op_branch; emit 0;                       (* word 0 jumps to main, which comes last *)
   0
+  end
   end
 
 (* CRC-16-CCITT (0x1021, from 0xFFFF), a byte at a time: 16 bits fit an int *)
@@ -4424,6 +4533,7 @@ let img_end (_n : int) =
   let code_words = here () in
   let base = !img_at + 32 in
   let hbase = base + 4 * code_words in
+  iw_tail_base := hbase;
   let hw = ref 0 in
   let ptrs : (int * int) list ref = ref [] in
   (* each string: a header, then its bytes four to a word, the last byte of the
@@ -4482,7 +4592,7 @@ let img_end (_n : int) =
   let nglob = !next_global in
   let gbase = hbase + 4 * !hw in
   let total = gbase + 4 * nglob - !img_at in
-  if !img_at + total > io_read disk_size_reg then begin
+  if !img_dev = 0 && !img_at + total > io_read disk_size_reg then begin
     puts "image too big: "; put_int code_words; puts " code words, "; put_int !hw; puts " heap words, ";
     put_int nglob; puts " globals; "; put_int (!img_at + total); puts " bytes against a disk of "; put_int (io_read disk_size_reg); newline ();
     img_mode := false;
@@ -4497,9 +4607,31 @@ let img_end (_n : int) =
       | [] -> ()
       | (slot, p) :: r -> img_wr32 (gbase + 4 * slot) p; place r in
     place !ptrs;
-    (* the CRC covers every byte after the header *)
+    (* the CRC covers every byte after the header; for a file on a server, the code comes back from there (it is all there once
+       the pieces and the first 256 words have gone) and the heap and globals are in iw_tail *)
     let crc = ref 0xFFFF in
-    for i = base to gbase + 4 * nglob - 1 do crc := crc16_byte !crc (io_read (0x100000 + i)) done;
+    let tail_len = gbase + 4 * nglob - hbase in
+    (if !img_dev <> 0 then begin
+       let w = ref !iw_flushed in
+       while !w < code_words do
+         let n = if code_words - !w > 256 then 256 else code_words - !w in
+         let a = iw_slot !w in
+         (!img_send_hook) (32 + 4 * !w) (4 * n) (fun (i : int) -> iw_b (a + i));
+         w := !w + n
+       done;
+       let n0 = if code_words > 256 then 256 else code_words in
+       (!img_send_hook) 32 (4 * n0) (fun (i : int) -> int_of_char (bytes_get iw_first i));
+       let t = ref 0 in
+       while !t < tail_len do
+         let n = if tail_len - !t > 1024 then 1024 else tail_len - !t in
+         let t0 = !t in
+         (!img_send_hook) (hbase + t0) n (fun (i : int) -> int_of_char (bytes_get !iw_tail (t0 + i)));
+         t := !t + n
+       done;
+       crc := (!img_crc_hook) 32 (4 * code_words) 0xFFFF;
+       for i = 0 to tail_len - 1 do crc := crc16_byte !crc (int_of_char (bytes_get !iw_tail i)) done
+     end else
+       for i = base to gbase + 4 * nglob - 1 do crc := crc16_byte !crc (io_read (0x100000 + i)) done);
     let h = !img_at in
     img_put4 h 0x4F 0x43 0x56 0x4D;                                  (* "OCVM" *)
     img_wr32 (h + 4) 1;
@@ -4509,7 +4641,9 @@ let img_end (_n : int) =
     img_wr32 (h + 20) 0;                                             (* primitive digest: the runtime's own *)
     img_wr32 (h + 24) !crc;
     img_wr32 (h + 28) 0;
+    (if !img_dev <> 0 then (!img_send_hook) 0 32 (fun (i : int) -> int_of_char (bytes_get iw_hdr i)));
     img_mode := false;
+    img_dev := 0;
     cp := !sv_cp; next_global := !sv_next; globals := !sv_globals;
     literals := !sv_lits; float_lits := !sv_flts;
     em_reset ();
@@ -5093,6 +5227,35 @@ let () =
     else begin
       for i = 0 to 63 do bytes_set out_fh i (bytes_get fh_file i) done;
       out_fhlen := !fh_file_len
+    end);
+  img_send_hook := (fun (off : int) (n : int) (get : int -> int) ->
+    if !img_dev = 3 then begin for i = 0 to n - 1 do io_write (0x100000 + !out_at + off + i) (get i) done end
+    else begin
+      nfs_ready "nfs";
+      nfs_launch_wpiece out_fh !out_fhlen off n (fun (i : int) -> get (i - off));
+      nfs_pump ();
+      if !nfs_result <> n then raise (Sys_error "nfs: image write failed")
+    end);
+  img_crc_hook := (fun (from : int) (len : int) (crc0 : int) ->
+    if !img_dev = 3 then begin
+      let crc = ref crc0 in
+      for i = from to from + len - 1 do crc := crc16_byte !crc (io_read (0x100000 + !out_at + i)) done;
+      !crc
+    end else begin
+    nfs_ready "nfs";
+    let crc = ref crc0 and pos = ref from and stop = from + len in
+    nfs_dest_put := (fun (_o : int) (v : int) -> crc := crc16_byte !crc v);
+    nfs_dest_room := (fun (_u : int) -> 0x7FFFFFF);
+    while !pos < stop do
+      nfs_count := (if stop - !pos > 1024 then 1024 else stop - !pos);
+      nfs_launch_piece out_fh !out_fhlen !pos;
+      nfs_pump ();
+      (if !nfs_result <= 0 then raise (Sys_error "nfs: image read-back failed"));
+      pos := !pos + !nfs_result
+    done;
+    nfs_count := nfs_chunk;
+    nfs_dest_to_disk ();
+    !crc
     end);
   nfs_out_send_hook := (fun (off : int) (n : int) ->
     nfs_ready "nfs";
@@ -6226,7 +6389,7 @@ let predefine (src : string) =
 (* ==== MAIN ==== *)
 let () =
   io_write leds 1;
-  net_on := io_read (disk + io_read disk_size_reg - 1) <> 0x4E;
+  net_on := io_read disk_size_reg = 0 || io_read (disk + io_read disk_size_reg - 1) <> 0x4E;
   if not_b (find_doorway ()) then uart_puts "compiler: the doorway is missing\n"
   else begin
     uart_puts "compiler: doorway at "; uart_dec !doorway;

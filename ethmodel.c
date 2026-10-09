@@ -29,6 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 enum {
   RX_BASE = 0x0000, TX_BASE = 0x0800, WINDOW = 0x0800,
@@ -248,6 +251,8 @@ static void host_arp_reply(const uint8_t *req) {
   f->len = 60;
 }
 
+static int reply_sport = TFTP_TID;   // the UDP source port of the host's next datagram: TFTP's, or an NFS service's
+
 // A UDP datagram from the host (TFTP_TID) to the program at `to` (its IP
 // header and ports taken from the program's request).
 static void host_udp(const uint8_t *req, const uint8_t *payload, int n) {
@@ -259,7 +264,7 @@ static void host_udp(const uint8_t *req, const uint8_t *payload, int n) {
   ip[0] = 0x45; put16(ip + 2, 20 + 8 + n); ip[8] = 64; ip[9] = 17;
   memcpy(ip + 12, host_ip, 4); memcpy(ip + 16, rip + 12, 4);
   put16(ip + 10, checksum(ip, 20));
-  put16(udp, TFTP_TID); memcpy(udp + 2, rudp, 2); put16(udp + 4, 8 + n);
+  put16(udp, reply_sport); memcpy(udp + 2, rudp, 2); put16(udp + 4, 8 + n);
   memcpy(udp + 8, payload, n);
   f->len = 14 + 20 + 8 + n < 60 ? 60 : 14 + 20 + 8 + n;
 }
@@ -305,6 +310,115 @@ static void tftp_server(const uint8_t *b, int len) {
     if (block == tftp_last_block_sent && (long)block * TFTP_BLOCK <= tftp_size)
       tftp_send_block(b, block + 1);   // a short (or empty) block ends the file
   }
+}
+
+
+// ---- NFS: ONC RPC over UDP, version 3, as a server on the host (192.168.1.106) for the program's client.
+// $ETHMODEL_NFS_ROOT is the directory that every export maps to (the export name in a MNT is ignored).  Services: portmap
+// (111), mountd (20048) and nfsd (2049).  A file handle is 8 bytes, a table index; operations: GETPORT, MNT, LOOKUP, READ,
+// CREATE (truncating), WRITE.  Attributes are sent only where the client looks at them (LOOKUP's size).
+enum { PMAP_PORT = 111, MOUNT_PORT = 20048, NFSD_PORT = 2049 };
+static char nfs_names[256][240];
+static int nfs_n;
+static uint32_t rd32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
+static int wr32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; return 4; }
+static int nfs_fh(const char *rel) {
+  for (int i = 0; i < nfs_n; i++) if (strcmp(nfs_names[i], rel) == 0) return i;
+  if (nfs_n == 256) return 0;
+  snprintf(nfs_names[nfs_n], sizeof nfs_names[0], "%s", rel);
+  return nfs_n++;
+}
+static void nfs_full(int k, char *out, size_t n) {
+  const char *root = getenv("ETHMODEL_NFS_ROOT");
+  snprintf(out, n, "%s%s%s", root ? root : ".", nfs_names[k][0] ? "/" : "", nfs_names[k]);
+}
+static int nfs_attr(uint8_t *r, const struct stat *st) {   // post_op_attr with fattr3: 4 + 84 bytes
+  int n = 0;
+  n += wr32(r + n, 1);
+  n += wr32(r + n, S_ISDIR(st->st_mode) ? 2 : 1); n += wr32(r + n, 0644); n += wr32(r + n, 1);
+  n += wr32(r + n, 0); n += wr32(r + n, 0);
+  n += wr32(r + n, (uint32_t)((uint64_t)st->st_size >> 32)); n += wr32(r + n, (uint32_t)st->st_size);
+  n += wr32(r + n, 0); n += wr32(r + n, (uint32_t)st->st_size);          // used
+  n += wr32(r + n, 0); n += wr32(r + n, 0);                              // rdev
+  n += wr32(r + n, 0); n += wr32(r + n, 1);                              // fsid
+  n += wr32(r + n, 0); n += wr32(r + n, (uint32_t)st->st_ino);           // fileid
+  for (int i = 0; i < 6; i++) n += wr32(r + n, 0);                       // atime, mtime, ctime
+  return n;
+}
+static void nfs_server(const uint8_t *b, int len) {
+  const uint8_t *ip = b + 14, *udp, *p, *a, *args;
+  int dport, plen, prog, vers, proc;
+  uint8_t r[1400];
+  int n = 0;
+  if (len < 14 + 20 + 8 + 40 || b[12] != 0x08 || b[13] != 0x00 || ip[9] != 17 || memcmp(ip + 16, host_ip, 4) != 0) return;
+  udp = ip + (ip[0] & 15) * 4;
+  dport = (udp[2] << 8) | udp[3];
+  if (dport != PMAP_PORT && dport != MOUNT_PORT && dport != NFSD_PORT) return;
+  p = udp + 8; plen = ((udp[4] << 8) | udp[5]) - 8;
+  if (plen < 40 || rd32(p + 4) != 0) return;
+  prog = rd32(p + 12); vers = rd32(p + 16); proc = rd32(p + 20);
+  (void)vers;
+  a = p + 32 + ((rd32(p + 28) + 3) & ~3u);          // the verifier
+  args = a + 8 + ((rd32(a + 4) + 3) & ~3u);
+  n += wr32(r + n, rd32(p)); n += wr32(r + n, 1); n += wr32(r + n, 0); n += wr32(r + n, 0); n += wr32(r + n, 0); n += wr32(r + n, 0);
+  char path[600], rel[500];
+  struct stat st;
+  if (prog == 100000 && proc == 3) {
+    int want = rd32(args);
+    n += wr32(r + n, want == 100005 ? MOUNT_PORT : want == 100003 ? NFSD_PORT : 0);
+    printf("eth: NFS portmap %d\n", want);
+  } else if (prog == 100005 && proc == 1) {
+    n += wr32(r + n, 0); n += wr32(r + n, 8); n += wr32(r + n, 0); n += wr32(r + n, nfs_fh(""));
+    n += wr32(r + n, 1); n += wr32(r + n, 1);
+    printf("eth: NFS mount\n");
+  } else if (prog == 100003 && proc == 3) {           // LOOKUP dir, name
+    int dir = rd32(args + 8), nl = rd32(args + 12);
+    char name[200]; snprintf(name, sizeof name, "%.*s", nl < 199 ? nl : 199, (const char *)args + 16);
+    snprintf(rel, sizeof rel, "%s%s%s", nfs_names[dir], nfs_names[dir][0] ? "/" : "", name);
+    nfs_full(dir, path, sizeof path); strcat(path, "/"); strcat(path, name);
+    printf("eth: NFS lookup %s\n", rel);
+    if (strstr(name, "..") || stat(path, &st) != 0) { n += wr32(r + n, 2); n += wr32(r + n, 0); }
+    else {
+      n += wr32(r + n, 0); n += wr32(r + n, 8); n += wr32(r + n, 0); n += wr32(r + n, nfs_fh(rel));
+      n += nfs_attr(r + n, &st); n += wr32(r + n, 0);
+    }
+  } else if (prog == 100003 && proc == 6) {          // READ fh, offset, count
+    int k = rd32(args + 8); long off = ((long)rd32(args + 12) << 32) | rd32(args + 16); int cnt = rd32(args + 20);
+    nfs_full(k, path, sizeof path);
+    int fd = open(path, O_RDONLY), got = 0;
+    uint8_t buf[1200];
+    if (cnt > 1100) cnt = 1100;
+    if (fd >= 0) { got = (int)pread(fd, buf, cnt, off); if (got < 0) got = 0; }
+    long size = (fd >= 0 && fstat(fd, &st) == 0) ? (long)st.st_size : 0;
+    if (fd >= 0) close(fd);
+    n += wr32(r + n, 0); n += wr32(r + n, 0); n += wr32(r + n, got); n += wr32(r + n, off + got >= size);
+    n += wr32(r + n, got); memcpy(r + n, buf, got); n += (got + 3) & ~3;
+    printf("eth: NFS read %s %ld+%d\n", nfs_names[k], off, got);
+  } else if (prog == 100003 && proc == 7) {          // WRITE fh, offset, count, stable, data
+    int k = rd32(args + 8); long off = ((long)rd32(args + 12) << 32) | rd32(args + 16); int cnt = rd32(args + 20);
+    nfs_full(k, path, sizeof path);
+    int fd = open(path, O_WRONLY), done = 0;
+    if (fd >= 0) { done = (int)pwrite(fd, args + 32, cnt, off); close(fd); }
+    n += wr32(r + n, done < 0 ? 5 : 0); n += wr32(r + n, 0); n += wr32(r + n, 0);
+    n += wr32(r + n, done < 0 ? 0 : done); n += wr32(r + n, 2); n += wr32(r + n, 0); n += wr32(r + n, 0);
+    printf("eth: NFS write %s %ld+%d\n", nfs_names[k], off, cnt);
+  } else if (prog == 100003 && proc == 8) {          // CREATE dir, name, ...
+    int dir = rd32(args + 8), nl = rd32(args + 12);
+    char name[200]; snprintf(name, sizeof name, "%.*s", nl < 199 ? nl : 199, (const char *)args + 16);
+    snprintf(rel, sizeof rel, "%s%s%s", nfs_names[dir], nfs_names[dir][0] ? "/" : "", name);
+    nfs_full(dir, path, sizeof path); strcat(path, "/"); strcat(path, name);
+    int fd = strstr(name, "..") ? -1 : open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    printf("eth: NFS create %s\n", rel);
+    if (fd < 0) { n += wr32(r + n, 13); n += wr32(r + n, 0); n += wr32(r + n, 0); }
+    else {
+      close(fd);
+      n += wr32(r + n, 0); n += wr32(r + n, 1); n += wr32(r + n, 8); n += wr32(r + n, 0); n += wr32(r + n, nfs_fh(rel));
+      n += wr32(r + n, 0); n += wr32(r + n, 0); n += wr32(r + n, 0);
+    }
+  } else return;
+  reply_sport = dport;
+  host_udp(b, r, n);
+  reply_sport = TFTP_TID;
 }
 
 static void host_arp(const uint8_t *b, int len) {
@@ -361,8 +475,8 @@ static void disk_init(void) {
 
 long ethmodel_read(long a) {
   init();
-  if (a >= DISK_BASE && a < DISK_BASE + DISK_SIZE) { disk_init(); return disk[a - DISK_BASE]; }
-  if (a == DISK_SIZE_REG) return DISK_SIZE;
+  if (a >= DISK_BASE && a < DISK_BASE + DISK_SIZE) { if (getenv("ETHMODEL_NODISK")) return 0; disk_init(); return disk[a - DISK_BASE]; }
+  if (a == DISK_SIZE_REG) return getenv("ETHMODEL_NODISK") ? 0 : DISK_SIZE;
   if (a >= RX_BASE && a < RX_BASE + WINDOW) return rxbuf[a - RX_BASE];
   if (a >= TX_BASE && a < TX_BASE + WINDOW) return txbuf[a - TX_BASE];
   if (a >= STAGE_BASE && a < STAGE_BASE + STAGE_SIZE) return stage[a - STAGE_BASE];
@@ -383,7 +497,7 @@ long ethmodel_read(long a) {
 
 void ethmodel_write(long a, long d) {
   init();
-  if (a >= DISK_BASE && a < DISK_BASE + DISK_SIZE) { disk_init(); disk[a - DISK_BASE] = (uint8_t)d; return; }
+  if (a >= DISK_BASE && a < DISK_BASE + DISK_SIZE) { if (getenv("ETHMODEL_NODISK")) return; disk_init(); disk[a - DISK_BASE] = (uint8_t)d; return; }
   if (a >= TX_BASE && a < TX_BASE + WINDOW) { txbuf[a - TX_BASE] = (uint8_t)d; return; }
   if (a >= STAGE_BASE && a < STAGE_BASE + STAGE_SIZE) { stage[a - STAGE_BASE] = (uint8_t)d; return; }
   switch (a) {
@@ -405,6 +519,7 @@ void ethmodel_write(long a, long d) {
     dhcp_server(txbuf, (int)d);
     host_arp(txbuf, (int)d);
     tftp_server(txbuf, (int)d);
+    nfs_server(txbuf, (int)d);
     if (!rx_valid) load_next_frame();
     break;
   case 0x1010: case 0x1011: case 0x1012: case 0x1013: case 0x1014: case 0x1015:
@@ -451,6 +566,7 @@ void ethmodel_tx_frame(const unsigned char *b, int len) {
   dhcp_server(b, len);
   host_arp(b, len);
   tftp_server(b, len);
+  nfs_server(b, len);
 }
 
 int ethmodel_rx_frame(unsigned char *buf) {
