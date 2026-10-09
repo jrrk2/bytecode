@@ -5,6 +5,7 @@
    2 argument, 3 command, 4 setting (data start: +8 write, +0x10 read, +0x20 four bits), 5 start, 6 run flags, 7 block count, 8 block size, 9 timeout;
    reads 0..3 response, 5 status, 12 card detect (1 = present on the VC707), 14 {finish_data, finish_cmd}.  The 4 KB block buffer is at I/O 0x2000.
    sd_write puts a block back; nothing else here writes the card. *)
+(* >>> io/sd.ml *)
 external io_read : int -> int = "vm_io_read"
 external io_write : int -> int -> unit = "vm_io_write"
 external not : bool -> bool = "%boolnot"
@@ -81,3 +82,4 @@ let sd_put i v = io_write (0x2000 + i) v
    the card's busy after each block, then the card is polled until it is ready for data) *)
 let sd_write_n blk n = sd_xfer (if n = 1 then 24 else 25) blk n 0x2D && sd_ready 1000
 let sd_write blk = sd_write_n blk 1
+(* <<< io/sd.ml *)

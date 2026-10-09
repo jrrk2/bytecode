@@ -50,6 +50,8 @@ external char_of_int : int -> char = "%identity"
 external create_bytes : int -> bytes = "caml_create_bytes"
 external bytes_set : bytes -> int -> char -> unit = "%bytes_unsafe_set"
 external bytes_get : bytes -> int -> char = "%bytes_unsafe_get"
+external bytes_to_string : bytes -> string = "%bytes_to_string"
+external string_equal : string -> string -> bool = "caml_string_equal"
 
 type 'a ref = { mutable contents : 'a }
 external ref : 'a -> 'a ref = "%makemutable"
@@ -262,6 +264,7 @@ let dhcp_parse len =
 
 (* ---- where to boot from ---- *)
 let server_ip = [| 10; 10; 10; 10 |]
+let server_override = ref 0         (* the boot prompt's nfs(N,0) / tftp(N,0): the server's host number on this network *)
 let server_mac = [| 0; 0; 0; 0; 0; 0 |]
 let file_name = [| 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0;
                    0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0; 0 |]
@@ -314,6 +317,7 @@ let handle_dhcp len =
         for i = 0 to 2 do array_set server_ip i (array_get my_ip i) done;
         array_set server_ip 3 dip
       end;
+      (if !server_override <> 0 then array_set server_ip 3 !server_override);
       state := Bound;
       deadline := now () + !lease_s * 500;                      (* T1: half the lease, in ms *)
       uart_puts "dhcp: bound ";
@@ -624,11 +628,230 @@ let nfs_launch export path =
   nfs_step ()
 (* <<< io/nfs.ml *)
 
+(* >>> io/sd.ml *)
+external io_read : int -> int = "vm_io_read"
+external io_write : int -> int -> unit = "vm_io_write"
+external not : bool -> bool = "%boolnot"
+
+let sdw n v = io_write (0x1100 + 2 * n + 1) ((v lsr 16) land 0xFFFF); io_write (0x1100 + 2 * n) (v land 0xFFFF)
+let sdlo n = io_read (0x1100 + 2 * n)
+let sdhi n = io_read (0x1100 + 2 * n + 1)
+let delay n = let i = ref 0 in while !i < n do i := !i + 1 done
+
+(* start a command: the argument as two halves, the setting 0 none / 1 short / 3 long response, + 4 data, + 0x10 read, + 0x20 4 bit (sd_init selects 4 bit; the 1-bit write path of the vendored host does not work) *)
+let sd_start idx hi lo setting =
+  sdw 6 5; sdw 0 0; io_write (0x1100 + 5) hi; io_write (0x1100 + 4) lo;
+  sdw 3 idx; sdw 4 setting; sdw 5 0; sdw 6 7; sdw 9 100000; sdw 5 1
+
+let sd_wait_bit bit =
+  let n = ref 0 in
+  while (sdlo 14) land bit = 0 && !n < 400000 do n := !n + 1 done;
+  !n < 400000
+
+(* a command and its response; true if it finished *)
+let sd_cmd idx hi lo setting = sd_start idx hi lo setting; delay 3000; sd_wait_bit 1
+
+let rec sd_acmd41 n =
+  if n = 0 then false
+  else begin
+    let _ = sd_cmd 55 0 0 1 in
+    let _ = sd_cmd 41 0x40FF 0x8000 1 in
+    if (sdhi 0) land 0x8000 <> 0 then true else sd_acmd41 (n - 1)
+  end
+
+let sd_rca = ref 0
+
+(* power up at 400 kHz and bring an SDHC card to the transfer state; 0 if it did, else the step that failed *)
+let sd_init () =
+  sdw 1 77; sdw 6 5; delay 20000;
+  if (sdlo 12) land 1 = 0 then 1                 (* the VC707's detect pin is high with a card in the slot *)
+  else if not (sd_cmd 0 0 0 0) then 2
+  else if not (sd_cmd 8 0 0x1AA 1) || sdlo 0 <> 0x1AA then 3
+  else if not (sd_acmd41 200) then 4
+  else if not (sd_cmd 2 0 0 3) then 5
+  else if not (sd_cmd 3 0 0 1) then 6
+  else begin
+    sd_rca := sdhi 0;
+    if not (sd_cmd 7 !sd_rca 0 1) then 7
+    else if not (sd_cmd 55 !sd_rca 0 1) || not (sd_cmd 6 0 2 1) then 8      (* ACMD6: four data lines from here on *)
+    else begin sdw 1 1; 0 end                                                (* then 15.6 MHz, under the 25 MHz of default speed *)
+  end
+
+(* n blocks (1..8: the buffer holds 4 KB) starting at block blk into the buffer at I/O 0x2000; true if the data arrived and checked.
+   Several blocks are one CMD18 with the count given first by CMD23 (the card stops itself); a card that refuses CMD23 gets a CMD12 after. *)
+let sd_xfer cmd blk n setting =
+  sdw 7 n; sdw 8 512;
+  let preset = n = 1 || (sd_cmd 23 0 n 1 && ((sdhi 0) land 0x40) = 0) in
+  sd_start cmd (blk lsr 16) (blk land 0xFFFF) setting;
+  delay 3000;
+  let ok = sd_wait_bit 1 && sd_wait_bit 2 in
+  if not preset then (let _ = sd_cmd 12 0 0 1 in ());
+  ok
+
+let sd_read_n blk n = sd_xfer (if n = 1 then 17 else 18) blk n 0x35 && (sdlo 5) land 64 <> 0
+let sd_read blk = sd_read_n blk 1
+
+let sd_byte i = io_read (0x2000 + i)
+
+(* poll CMD13 until the card is back in the transfer state and ready for data (bit 8 of the status): it can still be programming a block just written *)
+let rec sd_ready n =
+  if n = 0 then false
+  else if sd_cmd 13 !sd_rca 0 1 && ((sdlo 0) land 0x100) <> 0 then true
+  else sd_ready (n - 1)
+
+let sd_put i v = io_write (0x2000 + i) v
+
+(* the buffer at I/O 0x2000 (filled with sd_put) to n blocks from blk; true if the card took them (CMD24, or CMD25 after CMD23; the host waits out
+   the card's busy after each block, then the card is polled until it is ready for data) *)
+let sd_write_n blk n = sd_xfer (if n = 1 then 24 else 25) blk n 0x2D && sd_ready 1000
+let sd_write blk = sd_write_n blk 1
+(* <<< io/sd.ml *)
+(* >>> io/fat.ml *)
+external int_of_char : char -> int = "%identity"
+external char_of_int : int -> char = "%identity"
+external string_get : string -> int -> char = "%string_safe_get"
+let putc c = io_write 0x1005 (int_of_char c)
+external string_length : string -> int = "%string_length"
+let puts s = for i = 0 to string_length s - 1 do putc (string_get s i) done
+let newline () = putc (char_of_int 13); putc (char_of_int 10)
+let rec put_int n = if n >= 10 then put_int (n / 10); putc (char_of_int (48 + n mod 10))
+let b16 o = (sd_byte o) + 256 * (sd_byte (o + 1))
+let b32 o = (b16 o) + 65536 * (b16 (o + 2))
+
+let fat_lba = ref 0
+let data_lba = ref 0
+let fat_spc = ref 0
+let fat_root = ref 0
+let fat_part = ref 0      (* which of the four MBR partitions *)
+
+(* 0 if the card holds a FAT32 volume in partition fat_part (0..3) and it is mounted, else the step that failed *)
+let fat_mount () =
+  if not (sd_read 0) then 1
+  else if (sd_byte 510) <> 0x55 then 2
+  else begin
+    let part = b32 (454 + 16 * !fat_part) in
+    if (sd_byte (450 + 16 * !fat_part)) = 0 then 5
+    else if not (sd_read part) then 3
+    else if b16 11 <> 512 then 4
+    else begin
+      fat_spc := sd_byte 13;
+      fat_lba := part + b16 14;
+      data_lba := !fat_lba + (sd_byte 16) * (b32 36);
+      fat_root := b32 44;
+      0
+    end
+  end
+
+let clus_lba c = !data_lba + (c - 2) * !fat_spc
+
+(* the cluster after c in its chain; >= 0x0FFFFFF8 ends it *)
+let fat_next c =
+  if not (sd_read (!fat_lba + c / 128)) then 0x0FFFFFFF
+  else (b32 ((c mod 128) * 4)) land 0x0FFFFFFF
+
+let put_name o = for i = 0 to 10 do putc (char_of_int (sd_byte (o + i))) done
+
+(* list directory cluster c: name, size, first cluster *)
+let fat_ls c0 =
+  let c = ref c0 and fin = ref false in
+  while not !fin && !c >= 2 && !c < 0x0FFFFFF8 do
+    let s = ref 0 in
+    while not !fin && !s < !fat_spc do
+      if not (sd_read (clus_lba !c + !s)) then fin := true
+      else begin
+        let e = ref 0 in
+        while not !fin && !e < 16 do
+          let o = !e * 32 in
+          let first = sd_byte o and attr = sd_byte (o + 11) in
+          if first = 0 then fin := true
+          else if first <> 0xE5 && attr <> 0x0F then begin
+            put_name o; puts " "; put_int (b32 (o + 28)); puts " @"; put_int ((b16 (o + 20)) * 65536 + b16 (o + 26)); newline ()
+          end;
+          e := !e + 1
+        done
+      end;
+      s := !s + 1
+    done;
+    if not !fin then c := fat_next !c
+  done
+
+(* the first cluster of the root-directory entry whose 11 name bytes are get 0 .. get 10, or 0; its size in fat_size *)
+let fat_size = ref 0
+let fat_find_by (get : int -> int) =
+  let c = ref !fat_root and found = ref 0 and fin = ref false in
+  while not !fin && !found = 0 && !c >= 2 && !c < 0x0FFFFFF8 do
+    let s = ref 0 in
+    while not !fin && !found = 0 && !s < !fat_spc do
+      if not (sd_read (clus_lba !c + !s)) then fin := true
+      else begin
+        let e = ref 0 in
+        while not !fin && !found = 0 && !e < 16 do
+          let o = !e * 32 in
+          if sd_byte o = 0 then fin := true
+          else begin
+            let same = ref true in
+            for i = 0 to 10 do if sd_byte (o + i) <> get i then same := false done;
+            if !same then begin found := (b16 (o + 20)) * 65536 + b16 (o + 26); fat_size := b32 (o + 28) end
+          end;
+          e := !e + 1
+        done
+      end;
+      s := !s + 1
+    done;
+    if not !fin && !found = 0 then c := fat_next !c
+  done;
+  !found
+
+(* by a name written as it is on the disk: "DISK    RFS" *)
+let fat_find name = fat_find_by (fun (i : int) -> int_of_char (string_get name i))
+
+(* by a name as typed, "vm.img": upper case, the name and then the extension padded with blanks *)
+let upper c = if c >= 97 && c <= 122 then c - 32 else c
+let fat_dot s =
+  let n = string_length s in
+  let d = ref n in
+  for i = n - 1 downto 0 do if string_get s i = '.' then d := i done;
+  !d
+let fat_user_char s (d : int) (i : int) =
+  let n = string_length s in
+  if i < 8 then (if i < d then upper (int_of_char (string_get s i)) else 32)
+  else (let j = d + 1 + (i - 8) in if j < n then upper (int_of_char (string_get s j)) else 32)
+let fat_find_user s = let d = fat_dot s in fat_find_by (fun (i : int) -> fat_user_char s d i)
+
+(* where the bytes of a file read go (offset in the file, byte), and how many the place can take *)
+let fat_put = ref (fun (_o : int) (_v : int) -> ())
+let fat_limit = ref 0x7FFFFFF
+
+(* read the file found by get through fat_put; its length, -1 if it is not there or a block failed, -2 if it does not fit.
+   A cluster goes in one multi-block transfer (up to 8 blocks at a time). *)
+let fat_read_by (get : int -> int) =
+  let c = ref (fat_find_by get) in
+  let size = !fat_size and pos = ref 0 and ok = ref (!c >= 2) in
+  if !ok && size > !fat_limit then 0 - 2
+  else begin
+    while !ok && !pos < size && !c >= 2 && !c < 0x0FFFFFF8 do
+      let s = ref 0 in
+      while !ok && !s < !fat_spc && !pos < size do
+        let n = if !fat_spc - !s > 8 then 8 else !fat_spc - !s in
+        if not (sd_read_n (clus_lba !c + !s) n) then ok := false
+        else begin
+          let m = if size - !pos < 512 * n then size - !pos else 512 * n in
+          for i = 0 to m - 1 do (!fat_put) (!pos + i) (sd_byte i) done;
+          pos := !pos + m
+        end;
+        s := !s + n
+      done;
+      if !ok && !pos < size then c := fat_next !c
+    done;
+    if !ok && !pos = size then size else 0 - 1
+  end
+(* <<< io/fat.ml *)
+
 (* The export, and the files below it: bytecode/ and then one directory for each board, named by its MAC as the TFTP root's were.  Keep
    nfs_dir the same as my_mac.  tools/ and docs/NFS_README.md say how to export it. *)
 let nfs_root = "/srv/nfs/vc707"
-let nfs_image = "bytecode/02:00:00:4d:47:33/vm.img"
-let nfs_disk_file = "bytecode/02:00:00:4d:47:33/disk.img"
+let nfs_image = ref "bytecode/02:00:00:4d:47:33/vm.img"        (* boot: nfs(0,0)path replaces it *)
+let nfs_disk_file = ref "bytecode/02:00:00:4d:47:33/disk.img"
 
 (* where the fetched file goes: the staging RAM, or the RAM disk *)
 let nfs_base = ref 0x10000
@@ -769,11 +992,13 @@ let describe code heap globals code_at heap_at globals_at =
   io_write 0x1010 code; io_write 0x1011 heap; io_write 0x1012 globals;
   io_write 0x1013 code_at; io_write 0x1014 heap_at; io_write 0x1015 globals_at
 
+let started = ref false        (* BOOT has been written: the machine is about to be replaced *)
 let start_it code heap globals =
   uart_puts "boot: ";
   uart_dec code; uart_puts " code, ";
   uart_dec heap; uart_puts " heap, ";
   uart_dec globals; uart_puts " globals words: starting it\n";
+  started := true;
   io_write boot_reg 1
 
 (* ---- a bytecode executable, stripped where it lies ----
@@ -1037,14 +1262,15 @@ let tftp_data len =
   end
 
 let try_tftp = ref false     (* NFS did not answer: the next attempt is by TFTP *)
+let net_pref = ref 0         (* 0 NFS and then TFTP, 1 NFS only, 2 TFTP only: what the boot prompt asked for *)
 
 let boot_tick () =
   if bound () then
     match !boot_state with
     | Waiting ->
       if now () > !boot_deadline then begin
-        if !try_tftp then begin try_tftp := false; start_boot () end
-        else begin nfs_begin nfs_image stage stage_size; boot_state := NfsImage end
+        if !try_tftp || !net_pref = 2 then begin try_tftp := false; start_boot () end
+        else begin nfs_begin !nfs_image stage stage_size; boot_state := NfsImage end
       end
     | NfsImage ->
       if !nfs_result >= 0 then begin
@@ -1053,12 +1279,12 @@ let boot_tick () =
           uart_puts "boot: RAM disk kept\n";
           boot_state := Checking
         end else begin
-          nfs_begin nfs_disk_file disk_ram (io_read 0x100d);
+          nfs_begin !nfs_disk_file disk_ram (io_read 0x100d);
           boot_state := NfsDisk
         end
       end else if !nfs_result = 0 - 2 then begin
-        uart_puts "boot: nfs failed, trying tftp\n";
-        try_tftp := true;
+        uart_puts (if !net_pref = 0 then "boot: nfs failed, trying tftp\n" else "boot: nfs failed\n");
+        try_tftp := (!net_pref = 0);
         boot_state := Waiting;
         boot_deadline := now ()
       end
@@ -1208,13 +1434,172 @@ let serial_window () =
    power-up: the image from offset 0, and at 0x3FFF0 "PREL" and its length (3 bytes, little-endian).  The loader boots it before
    it looks at the network.  A button held down skips it, and so does an image that does not check out. *)
 let preload_at = 0x3FFF0
-let try_preload () =
+let try_preload (force : bool) =
   if byte preload_at = 0x50 && byte (preload_at + 1) = 0x52 && byte (preload_at + 2) = 0x45 && byte (preload_at + 3) = 0x4C
-     && io_read buttons land 0x1F = 0 then begin
+     && (force || io_read buttons land 0x1F = 0) then begin
     img_len := small (preload_at + 4);
     uart_puts "boot: preloaded image, "; uart_dec !img_len; uart_puts " bytes\n";
     check_and_boot ()
   end
+
+
+(* ---- the boot prompt ----
+   In the manner of the 1970s: device(unit,part)file, typed after "boot:" within ten seconds of reset.
+     sd(0,P)vm.img      the SD card's FAT volume in MBR partition P (0..3); vm.img, and DISK.RFS for the RAM disk
+     nfs(N,0)path       NFS from the boot server (host number N on this network, 0: the DHCP / DIP-switch choice);
+                        path below the export, and the RAM disk from disk.img beside it
+     tftp(N,0)file      TFTP likewise
+     mem(0,0)           the image preloaded in the staging RAM (tools/preload.py)
+   A bare file name means the default devices with that file; Enter, or nothing typed for a few seconds, means the default:
+   the card, then the preloaded image, then the network (NFS, then TFTP).  A line that is not understood, or a device that
+   does not boot, asks again.  Ctrl-A (the serial boot's 0x01) is still the host's way to push an image over the UART. *)
+let line = create_bytes 96
+let line_len = ref 0
+let lch i = int_of_char (bytes_get line i)
+let cur = ref 0                       (* the parser's cursor in line *)
+
+let str_sub a b =
+  let r = create_bytes (b - a) in
+  for i = a to b - 1 do bytes_set r (i - a) (bytes_get line i) done;
+  bytes_to_string r
+
+let str_cat x y =
+  let nx = string_length x and ny = string_length y in
+  let r = create_bytes (nx + ny) in
+  for i = 0 to nx - 1 do bytes_set r i (string_get x i) done;
+  for i = 0 to ny - 1 do bytes_set r (nx + i) (string_get y i) done;
+  bytes_to_string r
+
+(* up to and including the last '/' *)
+let dir_of path =
+  let n = string_length path in
+  let d = ref 0 in
+  for i = 0 to n - 1 do if string_get path i = '/' then d := i + 1 done;
+  let r = create_bytes !d in
+  for i = 0 to !d - 1 do bytes_set r i (string_get path i) done;
+  bytes_to_string r
+
+let help () =
+  uart_puts "  sd(0,P)file    SD card, partition P (0..3)       nfs(N,0)path   NFS (server host N, 0 = default)\n";
+  uart_puts "  tftp(N,0)file  TFTP                              mem(0,0)       the preloaded image\n";
+  uart_puts "  Enter: sd, then mem, then nfs, then tftp.  Ctrl-A: serial boot.\n"
+
+(* collect a line from the UART; nothing typed for 10 s (the first byte) or 60 s (after it) gives an empty one *)
+let read_line () =
+  line_len := 0;
+  let fin = ref false and t0 = ref (now ()) and limit = ref 10000 in
+  while not !fin do
+    let c = io_read uart_rx in
+    if c < 0 then begin
+      if now () - !t0 > !limit then begin line_len := 0; fin := true end
+    end else if c = 1 && !line_len = 0 then begin
+      serial_boot (); uart_puts "boot: "; t0 := now ()
+    end else if c = 13 || c = 10 then fin := true
+    else if (c = 8 || c = 127) then begin
+      if !line_len > 0 then begin line_len := !line_len - 1; uart_puts "\b \b" end
+    end else if c >= 32 && !line_len < 95 then begin
+      bytes_set line !line_len (char_of_int c); line_len := !line_len + 1; uart_putc (char_of_int c);
+      t0 := now (); limit := 60000
+    end
+  done;
+  uart_putc '\n'
+
+(* number at the cursor; -1 if none *)
+let parse_num () =
+  let v = ref 0 and any = ref false in
+  while !cur < !line_len && lch !cur >= 48 && lch !cur <= 57 do
+    v := !v * 10 + (lch !cur - 48); cur := !cur + 1; any := true
+  done;
+  if !any then !v else 0 - 1
+
+let dev = ref 0                       (* 0 the default chain, 1 sd, 2 mem, 3 nfs, 4 tftp *)
+let unit_no = ref 0
+let part_no = ref 0
+let path = ref ""
+
+(* line -> dev, unit_no, part_no, path; false if it is not understood *)
+let parse_line () =
+  cur := 0; dev := 0; unit_no := 0; part_no := 0; path := "";
+  let open_p = ref (0 - 1) in
+  for i = !line_len - 1 downto 0 do if lch i = 40 then open_p := i done;
+  if !open_p < 0 then begin path := str_sub 0 !line_len; true end
+  else begin
+    let name = str_sub 0 !open_p in
+    cur := !open_p + 1;
+    let u = parse_num () in
+    let ok1 = u >= 0 && !cur < !line_len && lch !cur = 44 in
+    cur := !cur + 1;
+    let pt = parse_num () in
+    let ok2 = pt >= 0 && !cur < !line_len && lch !cur = 41 in
+    cur := !cur + 1;
+    unit_no := u; part_no := pt;
+    path := str_sub !cur !line_len;
+    dev := (if string_equal name "sd" then 1 else if string_equal name "mem" then 2
+            else if string_equal name "nfs" then 3 else if string_equal name "tftp" then 4 else 0 - 1);
+    ok1 && ok2 && !dev > 0
+  end
+
+let sd_up = ref false
+let sd_ready_ok () =
+  if !sd_up then true
+  else if sd_init () = 0 then begin sd_up := true; true end
+  else begin uart_puts "sd: no card\n"; false end
+
+let stage_put (o : int) (v : int) = io_write (stage + o) v
+let disk_put (o : int) (v : int) = io_write (disk_ram + o) v
+
+(* load vm.img (or the file asked for) from the card into the staging RAM, DISK.RFS into the RAM disk unless it already has a
+   file system, and boot it; returns if anything is wrong *)
+let boot_sd unit pt file =
+  if unit <> 0 then uart_puts "sd: only unit 0\n"
+  else if sd_ready_ok () then begin
+    fat_part := pt;
+    let r = fat_mount () in
+    if r <> 0 then begin uart_puts "sd: no FAT volume in partition "; uart_dec pt; uart_putc '\n' end
+    else begin
+      let f = if string_length file = 0 then "vm.img" else file in
+      fat_put := stage_put; fat_limit := stage_size;
+      let n = fat_read_by (fun (i : int) -> fat_user_char f (fat_dot f) i) in
+      if n < 0 then begin uart_puts "sd: no "; uart_puts f; uart_puts (if n = 0 - 2 then " (too big)\n" else "\n") end
+      else begin
+        uart_puts "sd: "; uart_puts f; uart_putc ' '; uart_dec n; uart_puts " bytes\n";
+        img_len := n; received := n;
+        if disk_formatted () then uart_puts "boot: RAM disk kept\n"
+        else begin
+          fat_put := disk_put; fat_limit := io_read 0x100d;
+          let m = fat_read_by (fun (i : int) -> int_of_char (string_get "DISK    RFS" i)) in
+          if m >= 0 then (uart_puts "sd: DISK.RFS "; uart_dec m; uart_puts " bytes\n")
+          else uart_puts "sd: no DISK.RFS\n"
+        end;
+        check_and_boot ();
+        if !started then while true do () done
+      end
+    end
+  end
+
+let set_net which =
+  net_pref := which;
+  server_override := !unit_no;
+  if which = 1 then begin
+    (if string_length !path > 0 then begin nfs_image := !path; nfs_disk_file := str_cat (dir_of !path) "disk.img" end)
+  end else begin
+    if string_length !path > 0 then begin
+      file_len := string_length !path;
+      for i = 0 to !file_len - 1 do if i < 31 then array_set file_name i (int_of_char (string_get !path i)) done
+    end
+  end
+
+(* returns when the prompt is done and the network loop should take over (after the card and the preloaded image have had their turn) *)
+let rec boot_prompt () =
+  uart_puts "boot [sd(0,0)vm.img] (sd nfs tftp mem, ? for help): ";
+  read_line ();
+  if !line_len = 1 && lch 0 = 63 then begin help (); boot_prompt () end
+  else if !line_len = 0 then begin boot_sd 0 0 ""; try_preload false end
+  else if not (parse_line ()) then begin uart_puts "?\n"; boot_prompt () end
+  else if !dev = 0 then begin boot_sd 0 0 !path; try_preload false end
+  else if !dev = 1 then begin boot_sd !unit_no !part_no !path; boot_prompt () end
+  else if !dev = 2 then begin try_preload true; uart_puts "mem: nothing preloaded\n"; boot_prompt () end
+  else set_net (if !dev = 3 then 1 else 2)
 
 let () =
   io_write leds 1;
@@ -1223,8 +1608,7 @@ let () =
   uart_puts " phy=";
   uart_hex16 (io_read eth_status_phy);
   uart_putc '\n';
-  serial_window ();
-  try_preload ();
+  boot_prompt ();
   let pkts = ref 0 in
   while true do
     dhcp_tick ();
