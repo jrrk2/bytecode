@@ -178,3 +178,17 @@ Target: a bitstream at 100 MHz with the heap at 256K words and the code RAM at 1
 ## Tooling
 * `tools/regress.sh` at the board's sizes (stack 32K, heap 64K words) now that they are the RTL defaults.
 * Commit the repository to a remote; there is none.
+
+## INTCODE on the Sonata (`fpga/intcode`)
+
+- **Reach the whole 32 MB software flash.**  The SPI engine uses the 3-byte-address commands (READ 0x03, page program 0x02, sector erase 0x20), so the file
+  system can only live below 16 MiB (`FS_AT` = 0xA20000, about 6.8 MB of append-only space).  Switch to the 4-byte-address commands (READ 0x13, page program 0x12,
+  sector erase 0x21, or put the chip in 4-byte mode with 0xB7), carry 32-bit addresses through the micro-operations (`f_addr`, `cur`, `wp`, `fl_base`), and let the
+  boot copier read the program from slot 3 (20 MiB) as well; then the file system can start at slot 3 and use the other 10 MiB.  The UF2 for a file system there is a
+  separate contiguous run (the Sonata ignores a UF2 with an address gap), so `monitor_sonata.sh` would write two UF2s or keep the run contiguous with the program.
+- **Free flash space.**  Records are append-only (`COPY`, every compile's OCODE and INTCODE, each `RUN`'s ARGS and STDIN link): only a host reflash starts afresh.  A
+  `PACK` command that rewrites the live (newest) records into a clean region, or erasing a sector run when everything in it is stale, would remove that limit.
+- **Chaining.**  `RUN ST x.b` then `RUN CG` are two commands because `exec` replaces the monitor; a next-program name in the `INTD` header (or `RUN a b c`) would run a
+  pipeline in one go.
+- **16-bit INTCODE** (the shipped INTCODE assumes 32-bit words and four characters to a word; a 16-bit core needs the libraries, the assembler (`ASM`) and the
+  bootstrap redone at that width), and variants with 16K/64K of memory for a "recover civilisation" seed.

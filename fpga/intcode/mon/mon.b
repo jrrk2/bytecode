@@ -1,5 +1,5 @@
 // INTCODE monitor: runs from the flash at reset and after any program run from the file system halts.
-// DIR  lists the files; CAT n  shows one; PUT n  stores what is typed up to ^D; COPY a b; RUN n  loads and starts the program in file n.
+// DIR  lists the files; CAT n  shows one; PUT n  stores what is typed up to ^D; COPY a b; LINK a b (a is another name for b); RUN n args  starts the program in file n.
 GET "LIBHDR"
 
 GLOBAL $( EXEC:88 $)
@@ -90,14 +90,25 @@ $( LET O = FINDOUTPUT(NAME)
    WRITES("OK*N")
 $)
 
-// RUN name args: the arguments (the rest of the line) go into the file ARGS, and then the program is started
-AND DORUN(NAME, LINE, P) BE
+// LINK name target: the file name now stands for the file target (a record whose text is LNK: and the target's name), at no cost in copying
+AND DOLINK(NAME, TARGET) BE
+$( LET O = FINDOUTPUT(NAME)
+   IF O = 0 DO $( WRITES("CANNOT CREATE*N"); RETURN $)
+   SELECTOUTPUT(O)
+   WRITES("LNK:"); WRITES(TARGET); WRCH('*N')
+   ENDWRITE()
+$)
+
+// RUN name args: the arguments (the rest of the line) go into the file ARGS, the first one also becomes the standard input (STDIN is a link to it), and then
+// the program is started
+AND DORUN(NAME, W3, LINE, P) BE
 $( LET O = FINDOUTPUT("ARGS")
    IF O \= 0 DO
    $( SELECTOUTPUT(O)
       FOR I = P + 1 TO GETBYTE(LINE, 0) DO WRCH(GETBYTE(LINE, I))
       WRCH('*N')
       ENDWRITE()  $)
+   IF GETBYTE(W3, 0) > 0 DO DOLINK("STDIN", W3)
    IF EXEC(NAME) = 0 DO WRITES("NO SUCH PROGRAM*N")
 $)
 
@@ -123,7 +134,7 @@ $( LET LINE = VEC 21
    LET W1 = VEC 7
    LET W2 = VEC 7
    LET W3 = VEC 7
-   WRITES("*NINTCODE MONITOR  DIR CAT PUT COPY RUN HELP*N")
+   WRITES("*NINTCODE MONITOR  DIR CAT PUT COPY LINK RUN HELP*N")
    $( LET P = 0
       LET Q = 0
       WRCH('>')
@@ -137,7 +148,8 @@ $( LET LINE = VEC 21
       OR TEST SAME(W1, "CAT") THEN DOCAT(W2)
       OR TEST SAME(W1, "PUT") THEN DOPUT(W2)
       OR TEST SAME(W1, "COPY") THEN DOCOPY(W2, W3)
-      OR TEST SAME(W1, "RUN") THEN DORUN(W2, LINE, Q)
-      OR WRITES("DIR  CAT n  PUT n  COPY a b  RUN n args*N")
+      OR TEST SAME(W1, "LINK") THEN DOLINK(W2, W3)
+      OR TEST SAME(W1, "RUN") THEN DORUN(W2, W3, LINE, Q)
+      OR WRITES("DIR  CAT n  PUT n  COPY a b  LINK a b  RUN n args*N")
    $) REPEAT
 $)

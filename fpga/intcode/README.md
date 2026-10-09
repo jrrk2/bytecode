@@ -105,7 +105,7 @@ All of this runs on the Sonata, with no files crossing the serial line while a c
 * **Monitor** (`mon/mon.b`, built by `monitor_sonata.sh`): slot 2's program, run at reset and after any program started with `RUN` halts.  `DIR`, `CAT n`, `PUT n` (text up
   to ^D), `COPY a b`, `RUN n args` (the arguments go to the file `ARGS`).  `RUN` is `exec` (operate code 48): load the named program file and restart the machine with it.
 * **Toolchain on the board**: `ST` (syntax + translation) reads `STDIN` and writes `OCODE`; `CG` reads `OCODE` and writes `INTCODE`; `ASM` (`mon/asm.b`, a BCPL port of
-  icint's assembler) turns INTCODE text into a program file: `RUN ASM out [-STDINNAME] iclib.i blib.i prog.i`.  `COPY blib.b stdin`, `RUN ST`, `RUN CG`, `CAT INTCODE`.
+  icint's assembler) turns INTCODE text into a program file: `RUN ASM out [-STDINNAME] iclib.i blib.i prog.i`.  `RUN ST blib.b`, `RUN CG`, `CAT INTCODE` (`RUN` links the first argument as STDIN, so no copy of the source is made; `LINK a b` makes a another name for b).
 * **Results on the board**: blib/syn/trn/cg compile in 2-6 s each (over serial it was 12-320 s), all identical to the kit compiler (`mon_chain.py`); `mon_bootstrap.py` does the
   whole bootstrap on the FPGA in 48 s -- compile, assemble ST1/CG1 from the result, compile again -- and stage 1, stage 2 and the C-hosted compiler agree byte for byte.
   The kit's own `cg.i` is stale (it was built from a `cg.b` with `VEC 4000`; the source has 8000), so references are made by running the kit compiler on the sources.

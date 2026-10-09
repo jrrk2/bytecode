@@ -209,7 +209,7 @@ module intcode_sys #(
 	           FE_C = 14, FE_O1 = 15, FE_O2 = 16, FE_L = 17, FE_OPEN = 18, FE_NF = 19, FR0 = 20, FR1 = 21, FR2 = 22, FE_NX = 23,
 	           WO0 = 24, WO2 = 25, WO3 = 26, WO4 = 27, WO5 = 28, WO6 = 29, WO7 = 30,
 	           PB0 = 31, PB1 = 32, PB2 = 33, SW0 = 34, SW1 = 35, SP0 = 36, SP1 = 37, SP2 = 38, SP3 = 39, SE0 = 40, SE1 = 41, SE2 = 42, SE3 = 43,
-	           SG0 = 44, SG1 = 45, SG2 = 46, SG3 = 47, SG4 = 48, SL0 = 49, SL1 = 50, SL2 = 51, SL3 = 52, SL4 = 53, CL0 = 54, CL1 = 55, CL2 = 56, CL3 = 57;
+	           SG0 = 44, SG1 = 45, SG2 = 46, SG3 = 47, SG4 = 48, SL0 = 49, SL1 = 50, SL2 = 51, SL3 = 52, SL4 = 53, CL0 = 54, CL1 = 55, CL2 = 56, CL3 = 57, LK1 = 59, LK2 = 60, LK3 = 61, LK4 = 62, LK5 = 63;
 	reg [5:0] st = IDLE;
 	reg [3:0] dbg_n = 4'd0; reg [31:0] dbg_w = 32'd0, dbg_sh = 32'd0; reg dbg_f = 1'b0;
 	wire [3:0] dbg_nib = dbg_sh[31:28];
@@ -225,7 +225,7 @@ module intcode_sys #(
 	reg [2:0]  fl_open = 3'd0;
 	reg [1:0]  fsel = 2'd0;                       // the selected input stream: 0 the console, else 1 + the file slot
 	reg [1:0]  stdin_fs = 2'd0;                   // the file STDIN, if there is one, is the program's standard input: 1 + its slot
-	reg        stdin_chk = 1'b0, stdin_scan = 1'b0, kname = 1'b0, isw = 1'b0, found = 1'b0, wsel = 1'b0;
+	reg        klink = 1'b0, stdin_chk = 1'b0, stdin_scan = 1'b0, kname = 1'b0, isw = 1'b0, found = 1'b0, wsel = 1'b0;
 	reg [5:0]  fret = 6'd0, rs0 = 6'd0, rs1 = 6'd0, pr = 6'd0, cl_ret = 6'd0;
 	reg [2:0]  ei = 3'd0;                         // the name word being compared
 	reg [11:0] ecount = 12'd0;                    // records seen
@@ -234,7 +234,15 @@ module intcode_sys #(
 	reg        match = 1'b0;
 	reg [WIDTH-1:0] nm_cur = {WIDTH{1'b0}};
 	reg [23:0] cur = 24'd0, fs_end = 24'd0, f_dat = 24'd0, f_ln = 24'd0, e_len = 24'd0;
-	reg        e_open = 1'b0, inhdr = 1'b0, isexec = 1'b0, rawfs = 1'b0;
+	reg        e_open = 1'b0, inhdr = 1'b0, isexec = 1'b0, rawfs = 1'b0, peeked = 1'b0;
+	// A link: a record whose data starts "LNK:" and then a file name (ended by a space or newline) stands for that file.  Opening it, the scan is run again for the name.
+	reg [7:0]  lnk [0:23];
+	reg [2:0]  lc = 3'd0, ldepth = 3'd0;
+	reg [4:0]  ln_len;
+	integer    li;
+	always @* begin ln_len = 5'd23; for (li = 22; li >= 0; li = li - 1) if (lnk[li] <= 8'h20) ln_len = li; end
+	wire [31:0] lw0 = {3'd0, ln_len, lnk[0], lnk[1], lnk[2]}, lw1 = {lnk[3], lnk[4], lnk[5], lnk[6]}, lw2 = {lnk[7], lnk[8], lnk[9], lnk[10]},
+	            lw3 = {lnk[11], lnk[12], lnk[13], lnk[14]}, lw4 = {lnk[15], lnk[16], lnk[17], lnk[18]}, lw5 = {lnk[19], lnk[20], lnk[21], lnk[22]};
 	// writing
 	reg [7:0]  pbuf [0:255];
 	reg [23:0] wp = 24'd0, hdr = 24'd0, ea = 24'd0, pa = 24'd0;
@@ -288,12 +296,12 @@ module intcode_sys #(
 	always @(posedge clk) begin
 		io_ack <= 1'b0;
 		if (rst) begin st <= IDLE; out_file <= 1'b0; wmark <= 1'b0; f_req_t <= 1'b0; fl_open <= 3'd0; fsel <= 2'd0; stdin_fs <= 2'd0; stdin_chk <= 1'b0; stdin_scan <= 1'b0;
-			kname <= 1'b0; isw <= 1'b0; wsel <= 1'b0; w_open <= 1'b0; inhdr <= 1'b0; isexec <= 1'b0; rawfs <= 1'b0; end
+			kname <= 1'b0; isw <= 1'b0; wsel <= 1'b0; w_open <= 1'b0; inhdr <= 1'b0; isexec <= 1'b0; rawfs <= 1'b0; klink <= 1'b0; peeked <= 1'b0; end
 		else case (st)
 			IDLE: if (io_req) begin
 					op <= io_op;
 					if (FS_WRITE != 0 && WIDTH == 32 && !stdin_chk) begin                // first request: is there a file STDIN?
-						stdin_scan <= 1'b1; kname <= 1'b1; isw <= 1'b0; nlen <= sname0[31:24]; nmw <= sname0[31:26] + 3'd1; ei <= 3'd0; ecount <= 12'd0; match <= 1'b1; found <= 1'b0;
+						stdin_scan <= 1'b1; kname <= 1'b1; klink <= 1'b0; ldepth <= 3'd0; peeked <= 1'b0; isw <= 1'b0; nlen <= sname0[31:24]; nmw <= sname0[31:26] + 3'd1; ei <= 3'd0; ecount <= 12'd0; match <= 1'b1; found <= 1'b0;
 						cur <= FS_AT; f_op <= 3'd0; f_addr <= FS_AT; f_req_t <= ~f_req_t; fret <= FE_W; st <= FW;
 					end else st <= GOT;
 				end
@@ -335,7 +343,7 @@ module intcode_sys #(
 			NM0: st <= NM1;
 			NM1: begin nm_w0 <= m_rdata_w; st <= NM2; end
 			NM2: begin
-				nm_w1 <= m_rdata_w; nlen <= nm0_32[31:24]; nmw <= nm0_32[31:26] + 3'd1; ei <= 3'd0; ecount <= 12'd0; match <= 1'b1; found <= 1'b0; cur <= FS_AT;
+				nm_w1 <= m_rdata_w; klink <= 1'b0; ldepth <= 3'd0; peeked <= 1'b0; nlen <= nm0_32[31:24]; nmw <= nm0_32[31:26] + 3'd1; ei <= 3'd0; ecount <= 12'd0; match <= 1'b1; found <= 1'b0; cur <= FS_AT;
 				rawfs <= (WIDTH == 32 && !isw && !isexec && nm0_32 == 32'h0624464C && (m_rdata_w & 32'hFFFFFF00) == 32'h41534800);     // "$FLASH": the whole file system as one file
 				if (WIDTH == 32 && (isw || isexec ? 1'b1 : fany) && nm0_32[31:24] <= 8'd23) begin f_op <= 3'd0; f_addr <= FS_AT; f_req_t <= ~f_req_t; fret <= FE_W; st <= FW; end
 				else st <= FE_NF;
@@ -347,7 +355,7 @@ module intcode_sys #(
 				else begin nm_cur <= {WIDTH{1'b0}}; st <= FE_R; end
 			end
 			FE_N0: st <= FE_N1;
-			FE_N1: begin nm_cur <= kname ? (ei == 3'd0 ? sname0 : ei == 3'd1 ? sname1 : ei == 3'd2 ? sname2 : ei == 3'd3 ? sname3 : ei == 3'd4 ? sname4 : sname5) : m_rdata_w; st <= inhdr ? WO2 : FE_R; end      // STDIN, or the name from the store
+			FE_N1: begin nm_cur <= klink ? (ei == 3'd0 ? lw0 : ei == 3'd1 ? lw1 : ei == 3'd2 ? lw2 : ei == 3'd3 ? lw3 : ei == 3'd4 ? lw4 : lw5) : kname ? (ei == 3'd0 ? sname0 : ei == 3'd1 ? sname1 : ei == 3'd2 ? sname2 : ei == 3'd3 ? sname3 : ei == 3'd4 ? sname4 : sname5) : m_rdata_w; st <= inhdr ? WO2 : FE_R; end      // STDIN, or the name from the store
 			FE_R: `FOP(3'd1, FE_C)
 			FE_C: begin
 				if (ei == 3'd0 && cur == FS_AT) dbg_w <= f_data;
@@ -382,12 +390,27 @@ module intcode_sys #(
 				end else if (isw) begin
 					if (wopen_ok && !w_open) begin wp <= fs_end; hdr <= fs_end; pstart <= fs_end[7:0]; ei <= 3'd0; inhdr <= 1'b1; st <= WO0; end
 					else begin io_res <= {WIDTH{1'b0}}; st <= FIN; end
+				end else if (found && !rawfs && !peeked && f_ln >= 24'd5 && ldepth < 3'd4 && fany) begin                // is it a link?
+					f_op <= 3'd0; f_addr <= f_dat; f_req_t <= ~f_req_t; fret <= LK1; st <= FW;
 				end else if ((found || rawfs) && fany) begin
+					peeked <= 1'b0;
 					fl_base[fslot] <= rawfs ? FS_AT : f_dat; fl_pos[fslot] <= 24'd0; fl_len[fslot] <= rawfs ? (fs_end - FS_AT) : f_ln; fl_open[fslot] <= 1'b1; rawfs <= 1'b0;
 					if (stdin_scan) begin if (DEBUG_FS != 0) begin dbg_n <= 4'd10; dbg_sh <= dbg_w; dbg_f <= 1'b1; end stdin_fs <= {1'b0, 1'b1} + fslot; fsel <= {1'b0, 1'b1} + fslot; stdin_chk <= 1'b1; stdin_scan <= 1'b0; kname <= 1'b0; st <= GOT; end
 					else begin io_res <= {{(WIDTH-3){1'b0}}, 3'd5 + {1'b0, fslot}}; st <= FIN; end
 				end else if (stdin_scan) begin if (DEBUG_FS != 0) begin dbg_n <= 4'd10; dbg_sh <= dbg_w; dbg_f <= 1'b0; end stdin_chk <= 1'b1; stdin_scan <= 1'b0; kname <= 1'b0; st <= GOT; end
 				else st <= FE_NF;
+			end
+			LK1: `FOP(3'd1, LK2)
+			LK2: if (f_data == 32'h3A4B4E4C) begin lc <= 3'd0; `FOP(3'd1, LK3) end                         // "LNK:"
+			     else begin peeked <= 1'b1; `FOP(3'd3, FE_OPEN) end
+			LK3: begin
+				lnk[{lc, 2'd0}] <= f_data[7:0]; lnk[{lc, 2'd1}] <= f_data[15:8]; lnk[{lc, 2'd2}] <= f_data[23:16]; lnk[{lc, 2'd3}] <= f_data[31:24];
+				if (lc == 3'd5) `FOP(3'd3, LK5) else begin lc <= lc + 3'd1; `FOP(3'd1, LK3) end
+			end
+			LK5: begin                                               // scan again for the name in the link
+				klink <= 1'b1; ldepth <= ldepth + 3'd1; peeked <= 1'b0;
+				nlen <= {3'd0, ln_len}; nmw <= ln_len[4:2] + 3'd1; ei <= 3'd0; ecount <= 12'd0; match <= 1'b1; found <= 1'b0; cur <= FS_AT;
+				f_op <= 3'd0; f_addr <= FS_AT; f_req_t <= ~f_req_t; fret <= FE_W; st <= FW;
 			end
 			FE_NF: begin
 				isexec <= 1'b0;
