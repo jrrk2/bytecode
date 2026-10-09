@@ -5,11 +5,11 @@
 external int_of_char : char -> int = "%identity"
 external char_of_int : int -> char = "%identity"
 external string_get : string -> int -> char = "%string_safe_get"
-let putc c = io_write 0x1005 (int_of_char c)
+let fat_putc c = io_write 0x1005 (int_of_char c)
 external string_length : string -> int = "%string_length"
-let puts s = for i = 0 to string_length s - 1 do putc (string_get s i) done
-let newline () = putc (char_of_int 13); putc (char_of_int 10)
-let rec put_int n = if n >= 10 then put_int (n / 10); putc (char_of_int (48 + n mod 10))
+let fat_puts s = for i = 0 to string_length s - 1 do fat_putc (string_get s i) done
+let fat_newline () = fat_putc (char_of_int 13); fat_putc (char_of_int 10)
+let rec fat_put_int n = if n >= 10 then fat_put_int (n / 10); fat_putc (char_of_int (48 + n mod 10))
 let b16 o = (sd_byte o) + 256 * (sd_byte (o + 1))
 let b32 o = (b16 o) + 65536 * (b16 (o + 2))
 
@@ -44,7 +44,7 @@ let fat_next c =
   if not (sd_read (!fat_lba + c / 128)) then 0x0FFFFFFF
   else (b32 ((c mod 128) * 4)) land 0x0FFFFFFF
 
-let put_name o = for i = 0 to 10 do putc (char_of_int (sd_byte (o + i))) done
+let put_name o = for i = 0 to 10 do fat_putc (char_of_int (sd_byte (o + i))) done
 
 (* list directory cluster c: name, size, first cluster *)
 let fat_ls c0 =
@@ -60,7 +60,7 @@ let fat_ls c0 =
           let first = sd_byte o and attr = sd_byte (o + 11) in
           if first = 0 then fin := true
           else if first <> 0xE5 && attr <> 0x0F then begin
-            put_name o; puts " "; put_int (b32 (o + 28)); puts " @"; put_int ((b16 (o + 20)) * 65536 + b16 (o + 26)); newline ()
+            put_name o; fat_puts " "; fat_put_int (b32 (o + 28)); fat_puts " @"; fat_put_int ((b16 (o + 20)) * 65536 + b16 (o + 26)); fat_newline ()
           end;
           e := !e + 1
         done

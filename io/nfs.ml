@@ -147,7 +147,9 @@ let nfs_ce = ref 0
 let nfs_result = ref (0 - 1)     (* -1 running, -2 failed, else the length *)
 (* writing a file: nfs_launch_write creates the leaf of the path (the part after the last '/') in the directory the rest names
    and writes nfs_src_len bytes, nfs_src_get i being byte i of them *)
-let nfs_mode = ref 0             (* 0 read, 1 write *)
+let nfs_mode = ref 0             (* 0 read the file, 1 write it, 2 read one piece of an open file, 3 open (handle and size only) *)
+let nfs_count = ref nfs_chunk    (* bytes asked for by each READ *)
+let nfs_size = ref 0             (* a file's size, from the LOOKUP that opened it *)
 let nfs_leaf = ref 0             (* where the leaf name starts in nfs_path *)
 let nfs_src_len = ref 0
 let nfs_src_get = ref (fun (_i : int) -> 0)
@@ -202,7 +204,7 @@ let send_read () =
   rpc_call rpc_nfs 3 6;
   xfh fh_file !fh_file_len;
   x32 0; x32 !nfs_off;        (* a 64-bit offset, high word first *)
-  x32 nfs_chunk;
+  x32 !nfs_count;
   nfs_send !nfsd_port
 
 (* a post_op_attr: a flag, and the 84 bytes of attributes if it is set *)
@@ -265,6 +267,10 @@ let nfs_reply len =
         nfs_cs := !nfs_ce + 1;
         nfs_find_end ();
         send_lookup (); nfs_step ()
+      end else if !nfs_mode = 3 then begin
+        (* LOOKUP3resok: the handle, then post_op_attr; fattr3's size follows type, mode, nlink, uid and gid *)
+        (if r32 () = 1 then begin rp := !rp + 20; let _hi = r32 () in nfs_size := r32 () end else nfs_size := 0);
+        nfs_state := nfs_idle; nfs_result := !nfs_size
       end else begin
         nfs_off := 0;
         (!nfs_dest_begin) 0;
@@ -286,7 +292,8 @@ let nfs_reply len =
           (!nfs_dest_put) (!nfs_off + i) (rx (!rp + i))
         done;
         nfs_off := !nfs_off + n;
-        if eof <> 0 || n = 0 then begin
+        if !nfs_mode = 2 then begin nfs_state := nfs_idle; nfs_result := n end
+        else if eof <> 0 || n = 0 then begin
           nfs_state := nfs_idle;
           if not_b ((!nfs_dest_finish) !nfs_off) then
             nfs_fail "disk full"
@@ -373,5 +380,21 @@ let nfs_launch_write export path =
   nfs_result := 0 - 1;
   nfs_state := nfs_arping;
   nfs_arp_request ();
+  nfs_step ()
+
+(* open export + path for reading, repeatedly: the mount and the lookups are done, nfs_result is the size and the file's handle
+   is in fh_file / fh_file_len for the host to keep *)
+let nfs_launch_open export path =
+  nfs_launch export path;
+  nfs_mode := 3
+
+(* one READ of nfs_count bytes at off from the file whose handle is fh (n bytes), reaching the host through nfs_dest_put (absolute
+   offsets); the server, its ports and the MAC are those of the open before; nfs_result is the bytes read *)
+let nfs_launch_piece (fh : bytes) (n : int) (off : int) =
+  for i = 0 to 63 do bytes_set fh_file i (bytes_get fh i) done;
+  fh_file_len := n;
+  nfs_mode := 2; nfs_off := off; nfs_result := 0 - 1;
+  nfs_state := nfs_reading;
+  send_read ();
   nfs_step ()
 (* <<< io/nfs.ml *)

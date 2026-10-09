@@ -61,6 +61,21 @@ reader, `DISK.RFS` read and written in place, the loader's `sd(0,P)file` boot.  
   (mkdir, remove, rename).
 * NFS over TCP, and NFSv4, if a server ever refuses v3 over UDP.
 
+## Free the RAM disk and staging blocks
+The RAM disk (128 RAMB36 tiles, 512 KiB) and the staging RAM (64 tiles, 256 KiB) hold files and a loaded image, and 192 tiles is a good
+part of the device: block RAM spent on storage that the card and the network provide, when the machine is short of code RAM and heap.
+Files by device name (`sd(U,P)`, `nfs(U,P)`; see docs/NFS_README.md) are the first step: the compiler reads its source from them in
+place.  To finish:
+* Output to the card and to NFS in place (an NFS write channel that sends as its buffer fills; FAT file creation and growth), then
+  `image_begin` on a device name.  The image builder patches earlier words (branches, the header), so it needs the file open for
+  random writes, or a small write-back cache, or two passes.
+* What the RAM disk does that nothing else does: it survives a chain load, so one image can leave files for the next.  A card or NFS
+  file does the same; check each use (`boot_file`, the loader's "RAM disk kept", `image2.input`, the preloaded disc).
+* Boot without the staging RAM: the loader strips a bytecode file and builds its heap image in staging before the sequencer copies
+  both into code RAM, heap and globals.  Stream it from the card or the network into the sequencer's load port instead.
+* Then shrink the RAM disk to a scratch size (or none) and spend the tiles: code RAM to 128K words (64 more tiles), a bigger heap, deeper
+  stack, URAM-style big cache for the DDR3 disk.  Keep a small RAM disk for the preloaded-bitstream case (`tools/preload.py`).
+
 ## Code RAM: 128K words
 **Why.**  The compiler compiled by itself no longer fits.  `io/comp.ml` self-compiled (host runner, `#image`) is 67,532 code
 words against a code RAM of 65,535, and the REPL needs room above the image for the phrases it compiles.  By commit of `io/comp.ml`:

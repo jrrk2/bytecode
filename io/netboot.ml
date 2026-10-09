@@ -464,6 +464,8 @@ let nfs_mounting = 3
 let nfs_pmap_nfs = 4
 let nfs_looking = 5
 let nfs_reading = 6
+let nfs_creating = 7
+let nfs_writing = 8
 
 let nfs_state = ref nfs_idle
 let nfs_deadline = ref 0
@@ -476,6 +478,14 @@ let nfs_path = ref ""            (* "dir/dir/file" below the export *)
 let nfs_cs = ref 0               (* the component being looked up: nfs_path from nfs_cs to nfs_ce *)
 let nfs_ce = ref 0
 let nfs_result = ref (0 - 1)     (* -1 running, -2 failed, else the length *)
+(* writing a file: nfs_launch_write creates the leaf of the path (the part after the last '/') in the directory the rest names
+   and writes nfs_src_len bytes, nfs_src_get i being byte i of them *)
+let nfs_mode = ref 0             (* 0 read the file, 1 write it, 2 read one piece of an open file, 3 open (handle and size only) *)
+let nfs_count = ref nfs_chunk    (* bytes asked for by each READ *)
+let nfs_size = ref 0             (* a file's size, from the LOOKUP that opened it *)
+let nfs_leaf = ref 0             (* where the leaf name starts in nfs_path *)
+let nfs_src_len = ref 0
+let nfs_src_get = ref (fun (_i : int) -> 0)
 
 let nfs_find_end () =
   let e = ref !nfs_cs in
@@ -499,11 +509,35 @@ let send_lookup () =
   xname !nfs_path !nfs_cs !nfs_ce;
   nfs_send !nfsd_port
 
+(* CREATE of the leaf, UNCHECKED (an existing file is truncated to nothing), mode 0644, as uid 0 *)
+let send_create () =
+  rpc_call rpc_nfs 3 8;
+  xfh fh_root !fh_root_len;
+  xname !nfs_path !nfs_leaf (string_length !nfs_path);
+  x32 0;                                       (* createmode3 UNCHECKED *)
+  x32 1; x32 420;                              (* sattr3: mode 0644 *)
+  x32 0; x32 0;                                (* uid, gid: unchanged *)
+  x32 1; x32 0; x32 0;                         (* size 0 *)
+  x32 0; x32 0;                                (* atime, mtime: unchanged *)
+  nfs_send !nfsd_port
+
+(* WRITE of the next piece at nfs_off, FILE_SYNC *)
+let send_write () =
+  let n = if !nfs_src_len - !nfs_off > nfs_chunk then nfs_chunk else !nfs_src_len - !nfs_off in
+  rpc_call rpc_nfs 3 7;
+  xfh fh_file !fh_file_len;
+  x32 0; x32 !nfs_off;
+  x32 n; x32 2;
+  x32 n;
+  for i = 0 to n - 1 do tx (!xp + i) ((!nfs_src_get) (!nfs_off + i)) done;
+  xpad n;
+  nfs_send !nfsd_port
+
 let send_read () =
   rpc_call rpc_nfs 3 6;
   xfh fh_file !fh_file_len;
   x32 0; x32 !nfs_off;        (* a 64-bit offset, high word first *)
-  x32 nfs_chunk;
+  x32 !nfs_count;
   nfs_send !nfsd_port
 
 (* a post_op_attr: a flag, and the 84 bytes of attributes if it is set *)
@@ -545,13 +579,20 @@ let nfs_reply len =
   else if !nfs_state = nfs_pmap_nfs then begin
     let p = r32 () in
     nfsd_port := (if p = 0 then 2049 else p);
-    nfs_state := nfs_looking; send_lookup (); nfs_step ()
+    if !nfs_mode = 1 && !nfs_leaf = 0 then begin nfs_state := nfs_creating; send_create (); nfs_step () end
+    else begin nfs_state := nfs_looking; send_lookup (); nfs_step () end
   end
   else if !nfs_state = nfs_looking then begin
     if r32 () <> 0 then nfs_fail "no such file"
     else begin
       fh_file_len := take_fh fh_file;
       if !fh_file_len = 0 then nfs_fail "bad handle"
+      else if !nfs_mode = 1 then begin
+        for i = 0 to 63 do bytes_set fh_root i (bytes_get fh_file i) done;
+        fh_root_len := !fh_file_len;
+        if !nfs_ce + 1 >= !nfs_leaf then begin nfs_state := nfs_creating; send_create (); nfs_step () end
+        else begin nfs_cs := !nfs_ce + 1; nfs_find_end (); send_lookup (); nfs_step () end
+      end
       else if !nfs_ce < string_length !nfs_path then begin
         (* a directory on the way: it becomes the one to look in, and the next component is looked up *)
         for i = 0 to 63 do bytes_set fh_root i (bytes_get fh_file i) done;
@@ -559,6 +600,10 @@ let nfs_reply len =
         nfs_cs := !nfs_ce + 1;
         nfs_find_end ();
         send_lookup (); nfs_step ()
+      end else if !nfs_mode = 3 then begin
+        (* LOOKUP3resok: the handle, then post_op_attr; fattr3's size follows type, mode, nlink, uid and gid *)
+        (if r32 () = 1 then begin rp := !rp + 20; let _hi = r32 () in nfs_size := r32 () end else nfs_size := 0);
+        nfs_state := nfs_idle; nfs_result := !nfs_size
       end else begin
         nfs_off := 0;
         (!nfs_dest_begin) 0;
@@ -580,7 +625,8 @@ let nfs_reply len =
           (!nfs_dest_put) (!nfs_off + i) (rx (!rp + i))
         done;
         nfs_off := !nfs_off + n;
-        if eof <> 0 || n = 0 then begin
+        if !nfs_mode = 2 then begin nfs_state := nfs_idle; nfs_result := n end
+        else if eof <> 0 || n = 0 then begin
           nfs_state := nfs_idle;
           if not_b ((!nfs_dest_finish) !nfs_off) then
             nfs_fail "disk full"
@@ -589,6 +635,33 @@ let nfs_reply len =
             uart_puts "nfs: "; uart_dec !nfs_off; uart_puts " bytes\n"
           end
         end else begin send_read (); nfs_step () end
+      end
+    end
+  end
+  else if !nfs_state = nfs_creating then begin
+    if r32 () <> 0 then nfs_fail "create refused"
+    else if r32 () = 0 then nfs_fail "no handle for the new file"
+    else begin
+      fh_file_len := take_fh fh_file;
+      nfs_off := 0;
+      if !fh_file_len = 0 then nfs_fail "bad handle"
+      else if !nfs_src_len = 0 then begin nfs_state := nfs_idle; nfs_result := 0 end
+      else begin nfs_state := nfs_writing; send_write (); nfs_step () end
+    end
+  end
+  else if !nfs_state = nfs_writing then begin
+    if r32 () <> 0 then nfs_fail "write refused"
+    else begin
+      (if r32 () = 1 then rp := !rp + 24);         (* wcc_data: pre_op_attr, then post_op_attr *)
+      skip_attr ();
+      let count = r32 () in
+      if count = 0 then nfs_fail "short write"
+      else begin
+        nfs_off := !nfs_off + count;
+        if !nfs_off >= !nfs_src_len then begin
+          nfs_state := nfs_idle; nfs_result := !nfs_off;
+          uart_puts "nfs: "; uart_dec !nfs_off; uart_puts " bytes written\n"
+        end else begin send_write (); nfs_step () end
       end
     end
   end
@@ -603,6 +676,8 @@ let nfs_tick () =
        else if !nfs_state = nfs_mounting then send_mnt ()
        else if !nfs_state = nfs_pmap_nfs then send_getport rpc_nfs 3
        else if !nfs_state = nfs_looking then send_lookup ()
+       else if !nfs_state = nfs_creating then send_create ()
+       else if !nfs_state = nfs_writing then send_write ()
        else send_read ());
       nfs_deadline := now () + 1500
     end
@@ -620,11 +695,40 @@ let nfs_arp_reply len =
 
 (* start fetching export + path, the server being nfs_ip; the host has checked it can *)
 let nfs_launch export path =
+  nfs_mode := 0;
   nfs_export := export; nfs_path := path;
   nfs_cs := 0; nfs_find_end ();
   nfs_result := 0 - 1;
   nfs_state := nfs_arping;
   nfs_arp_request ();
+  nfs_step ()
+
+(* the same, to create path (truncating it) and write nfs_src_len bytes from nfs_src_get *)
+let nfs_launch_write export path =
+  let leaf = ref 0 in
+  for i = 0 to string_length path - 1 do if string_get path i = '/' then leaf := i + 1 done;
+  nfs_mode := 1; nfs_leaf := !leaf;
+  nfs_export := export; nfs_path := path;
+  nfs_cs := 0; nfs_find_end ();
+  nfs_result := 0 - 1;
+  nfs_state := nfs_arping;
+  nfs_arp_request ();
+  nfs_step ()
+
+(* open export + path for reading, repeatedly: the mount and the lookups are done, nfs_result is the size and the file's handle
+   is in fh_file / fh_file_len for the host to keep *)
+let nfs_launch_open export path =
+  nfs_launch export path;
+  nfs_mode := 3
+
+(* one READ of nfs_count bytes at off from the file whose handle is fh (n bytes), reaching the host through nfs_dest_put (absolute
+   offsets); the server, its ports and the MAC are those of the open before; nfs_result is the bytes read *)
+let nfs_launch_piece (fh : bytes) (n : int) (off : int) =
+  for i = 0 to 63 do bytes_set fh_file i (bytes_get fh i) done;
+  fh_file_len := n;
+  nfs_mode := 2; nfs_off := off; nfs_result := 0 - 1;
+  nfs_state := nfs_reading;
+  send_read ();
   nfs_step ()
 (* <<< io/nfs.ml *)
 
@@ -710,11 +814,11 @@ let sd_write blk = sd_write_n blk 1
 external int_of_char : char -> int = "%identity"
 external char_of_int : int -> char = "%identity"
 external string_get : string -> int -> char = "%string_safe_get"
-let putc c = io_write 0x1005 (int_of_char c)
+let fat_putc c = io_write 0x1005 (int_of_char c)
 external string_length : string -> int = "%string_length"
-let puts s = for i = 0 to string_length s - 1 do putc (string_get s i) done
-let newline () = putc (char_of_int 13); putc (char_of_int 10)
-let rec put_int n = if n >= 10 then put_int (n / 10); putc (char_of_int (48 + n mod 10))
+let fat_puts s = for i = 0 to string_length s - 1 do fat_putc (string_get s i) done
+let fat_newline () = fat_putc (char_of_int 13); fat_putc (char_of_int 10)
+let rec fat_put_int n = if n >= 10 then fat_put_int (n / 10); fat_putc (char_of_int (48 + n mod 10))
 let b16 o = (sd_byte o) + 256 * (sd_byte (o + 1))
 let b32 o = (b16 o) + 65536 * (b16 (o + 2))
 
@@ -749,7 +853,7 @@ let fat_next c =
   if not (sd_read (!fat_lba + c / 128)) then 0x0FFFFFFF
   else (b32 ((c mod 128) * 4)) land 0x0FFFFFFF
 
-let put_name o = for i = 0 to 10 do putc (char_of_int (sd_byte (o + i))) done
+let put_name o = for i = 0 to 10 do fat_putc (char_of_int (sd_byte (o + i))) done
 
 (* list directory cluster c: name, size, first cluster *)
 let fat_ls c0 =
@@ -765,7 +869,7 @@ let fat_ls c0 =
           let first = sd_byte o and attr = sd_byte (o + 11) in
           if first = 0 then fin := true
           else if first <> 0xE5 && attr <> 0x0F then begin
-            put_name o; puts " "; put_int (b32 (o + 28)); puts " @"; put_int ((b16 (o + 20)) * 65536 + b16 (o + 26)); newline ()
+            put_name o; fat_puts " "; fat_put_int (b32 (o + 28)); fat_puts " @"; fat_put_int ((b16 (o + 20)) * 65536 + b16 (o + 26)); fat_newline ()
           end;
           e := !e + 1
         done

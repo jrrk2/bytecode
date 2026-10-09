@@ -6,7 +6,7 @@ reports whether the copies are current.  Neither the REPL (io/comp.ml) nor the l
 by itself with run_file; the loader takes the same text."""
 import re, sys
 root = __file__.rsplit("/tools/", 1)[0] if "/tools/" in __file__ else "."
-USERS = {"io/nfs.ml": ["io/comp.ml", "io/netboot.ml"], "io/sd.ml": ["io/netboot.ml"], "io/fat.ml": ["io/netboot.ml"]}
+USERS = {"io/nfs.ml": ["io/comp.ml", "io/netboot.ml"], "io/sd.ml": ["io/comp.ml", "io/netboot.ml"], "io/fat.ml": ["io/comp.ml", "io/netboot.ml"]}
 bad = 0
 for src, targets in USERS.items():
     pat = re.compile(r"(\(\* >>> " + re.escape(src) + r" \*\)\n).*?(\(\* <<< " + re.escape(src) + r" \*\)\n)", re.S)

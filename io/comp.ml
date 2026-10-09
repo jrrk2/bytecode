@@ -3799,6 +3799,264 @@ let rfs_add nm len =
   if at + len > io_read disk_size_reg then 0 - 1
   else rfs_commit nm at len
 
+(* The SD card: its driver and a FAT32 reader, the text of io/sd.ml and io/fat.ml (also files the REPL can run; the loader has them
+   too), so that a file of the card can be a channel.  tools/nfs_splice.py keeps the copies current. *)
+(* >>> io/sd.ml *)
+external io_read : int -> int = "vm_io_read"
+external io_write : int -> int -> unit = "vm_io_write"
+external not : bool -> bool = "%boolnot"
+
+let sdw n v = io_write (0x1100 + 2 * n + 1) ((v lsr 16) land 0xFFFF); io_write (0x1100 + 2 * n) (v land 0xFFFF)
+let sdlo n = io_read (0x1100 + 2 * n)
+let sdhi n = io_read (0x1100 + 2 * n + 1)
+let delay n = let i = ref 0 in while !i < n do i := !i + 1 done
+
+(* start a command: the argument as two halves, the setting 0 none / 1 short / 3 long response, + 4 data, + 0x10 read, + 0x20 4 bit (sd_init selects 4 bit; the 1-bit write path of the vendored host does not work) *)
+let sd_start idx hi lo setting =
+  sdw 6 5; sdw 0 0; io_write (0x1100 + 5) hi; io_write (0x1100 + 4) lo;
+  sdw 3 idx; sdw 4 setting; sdw 5 0; sdw 6 7; sdw 9 100000; sdw 5 1
+
+let sd_wait_bit bit =
+  let n = ref 0 in
+  while (sdlo 14) land bit = 0 && !n < 400000 do n := !n + 1 done;
+  !n < 400000
+
+(* a command and its response; true if it finished *)
+let sd_cmd idx hi lo setting = sd_start idx hi lo setting; delay 3000; sd_wait_bit 1
+
+let rec sd_acmd41 n =
+  if n = 0 then false
+  else begin
+    let _ = sd_cmd 55 0 0 1 in
+    let _ = sd_cmd 41 0x40FF 0x8000 1 in
+    if (sdhi 0) land 0x8000 <> 0 then true else sd_acmd41 (n - 1)
+  end
+
+let sd_rca = ref 0
+
+(* power up at 400 kHz and bring an SDHC card to the transfer state; 0 if it did, else the step that failed *)
+let sd_init () =
+  sdw 1 77; sdw 6 5; delay 20000;
+  if (sdlo 12) land 1 = 0 then 1                 (* the VC707's detect pin is high with a card in the slot *)
+  else if not (sd_cmd 0 0 0 0) then 2
+  else if not (sd_cmd 8 0 0x1AA 1) || sdlo 0 <> 0x1AA then 3
+  else if not (sd_acmd41 200) then 4
+  else if not (sd_cmd 2 0 0 3) then 5
+  else if not (sd_cmd 3 0 0 1) then 6
+  else begin
+    sd_rca := sdhi 0;
+    if not (sd_cmd 7 !sd_rca 0 1) then 7
+    else if not (sd_cmd 55 !sd_rca 0 1) || not (sd_cmd 6 0 2 1) then 8      (* ACMD6: four data lines from here on *)
+    else begin sdw 1 1; 0 end                                                (* then 15.6 MHz, under the 25 MHz of default speed *)
+  end
+
+(* n blocks (1..8: the buffer holds 4 KB) starting at block blk into the buffer at I/O 0x2000; true if the data arrived and checked.
+   Several blocks are one CMD18 with the count given first by CMD23 (the card stops itself); a card that refuses CMD23 gets a CMD12 after. *)
+let sd_xfer cmd blk n setting =
+  sdw 7 n; sdw 8 512;
+  let preset = n = 1 || (sd_cmd 23 0 n 1 && ((sdhi 0) land 0x40) = 0) in
+  sd_start cmd (blk lsr 16) (blk land 0xFFFF) setting;
+  delay 3000;
+  let ok = sd_wait_bit 1 && sd_wait_bit 2 in
+  if not preset then (let _ = sd_cmd 12 0 0 1 in ());
+  ok
+
+let sd_read_n blk n = sd_xfer (if n = 1 then 17 else 18) blk n 0x35 && (sdlo 5) land 64 <> 0
+let sd_read blk = sd_read_n blk 1
+
+let sd_byte i = io_read (0x2000 + i)
+
+(* poll CMD13 until the card is back in the transfer state and ready for data (bit 8 of the status): it can still be programming a block just written *)
+let rec sd_ready n =
+  if n = 0 then false
+  else if sd_cmd 13 !sd_rca 0 1 && ((sdlo 0) land 0x100) <> 0 then true
+  else sd_ready (n - 1)
+
+let sd_put i v = io_write (0x2000 + i) v
+
+(* the buffer at I/O 0x2000 (filled with sd_put) to n blocks from blk; true if the card took them (CMD24, or CMD25 after CMD23; the host waits out
+   the card's busy after each block, then the card is polled until it is ready for data) *)
+let sd_write_n blk n = sd_xfer (if n = 1 then 24 else 25) blk n 0x2D && sd_ready 1000
+let sd_write blk = sd_write_n blk 1
+(* <<< io/sd.ml *)
+(* >>> io/fat.ml *)
+external int_of_char : char -> int = "%identity"
+external char_of_int : int -> char = "%identity"
+external string_get : string -> int -> char = "%string_safe_get"
+let fat_putc c = io_write 0x1005 (int_of_char c)
+external string_length : string -> int = "%string_length"
+let fat_puts s = for i = 0 to string_length s - 1 do fat_putc (string_get s i) done
+let fat_newline () = fat_putc (char_of_int 13); fat_putc (char_of_int 10)
+let rec fat_put_int n = if n >= 10 then fat_put_int (n / 10); fat_putc (char_of_int (48 + n mod 10))
+let b16 o = (sd_byte o) + 256 * (sd_byte (o + 1))
+let b32 o = (b16 o) + 65536 * (b16 (o + 2))
+
+let fat_lba = ref 0
+let data_lba = ref 0
+let fat_spc = ref 0
+let fat_root = ref 0
+let fat_part = ref 0      (* which of the four MBR partitions *)
+
+(* 0 if the card holds a FAT32 volume in partition fat_part (0..3) and it is mounted, else the step that failed *)
+let fat_mount () =
+  if not (sd_read 0) then 1
+  else if (sd_byte 510) <> 0x55 then 2
+  else begin
+    let part = b32 (454 + 16 * !fat_part) in
+    if (sd_byte (450 + 16 * !fat_part)) = 0 then 5
+    else if not (sd_read part) then 3
+    else if b16 11 <> 512 then 4
+    else begin
+      fat_spc := sd_byte 13;
+      fat_lba := part + b16 14;
+      data_lba := !fat_lba + (sd_byte 16) * (b32 36);
+      fat_root := b32 44;
+      0
+    end
+  end
+
+let clus_lba c = !data_lba + (c - 2) * !fat_spc
+
+(* the cluster after c in its chain; >= 0x0FFFFFF8 ends it *)
+let fat_next c =
+  if not (sd_read (!fat_lba + c / 128)) then 0x0FFFFFFF
+  else (b32 ((c mod 128) * 4)) land 0x0FFFFFFF
+
+let put_name o = for i = 0 to 10 do fat_putc (char_of_int (sd_byte (o + i))) done
+
+(* list directory cluster c: name, size, first cluster *)
+let fat_ls c0 =
+  let c = ref c0 and fin = ref false in
+  while not !fin && !c >= 2 && !c < 0x0FFFFFF8 do
+    let s = ref 0 in
+    while not !fin && !s < !fat_spc do
+      if not (sd_read (clus_lba !c + !s)) then fin := true
+      else begin
+        let e = ref 0 in
+        while not !fin && !e < 16 do
+          let o = !e * 32 in
+          let first = sd_byte o and attr = sd_byte (o + 11) in
+          if first = 0 then fin := true
+          else if first <> 0xE5 && attr <> 0x0F then begin
+            put_name o; fat_puts " "; fat_put_int (b32 (o + 28)); fat_puts " @"; fat_put_int ((b16 (o + 20)) * 65536 + b16 (o + 26)); fat_newline ()
+          end;
+          e := !e + 1
+        done
+      end;
+      s := !s + 1
+    done;
+    if not !fin then c := fat_next !c
+  done
+
+(* the first cluster of the root-directory entry whose 11 name bytes are get 0 .. get 10, or 0; its size in fat_size *)
+let fat_size = ref 0
+let fat_find_by (get : int -> int) =
+  let c = ref !fat_root and found = ref 0 and fin = ref false in
+  while not !fin && !found = 0 && !c >= 2 && !c < 0x0FFFFFF8 do
+    let s = ref 0 in
+    while not !fin && !found = 0 && !s < !fat_spc do
+      if not (sd_read (clus_lba !c + !s)) then fin := true
+      else begin
+        let e = ref 0 in
+        while not !fin && !found = 0 && !e < 16 do
+          let o = !e * 32 in
+          if sd_byte o = 0 then fin := true
+          else begin
+            let same = ref true in
+            for i = 0 to 10 do if sd_byte (o + i) <> get i then same := false done;
+            if !same then begin found := (b16 (o + 20)) * 65536 + b16 (o + 26); fat_size := b32 (o + 28) end
+          end;
+          e := !e + 1
+        done
+      end;
+      s := !s + 1
+    done;
+    if not !fin && !found = 0 then c := fat_next !c
+  done;
+  !found
+
+(* by a name written as it is on the disk: "DISK    RFS" *)
+let fat_find name = fat_find_by (fun (i : int) -> int_of_char (string_get name i))
+
+(* by a name as typed, "vm.img": upper case, the name and then the extension padded with blanks *)
+let upper c = if c >= 97 && c <= 122 then c - 32 else c
+let fat_dot s =
+  let n = string_length s in
+  let d = ref n in
+  for i = n - 1 downto 0 do if string_get s i = '.' then d := i done;
+  !d
+let fat_user_char s (d : int) (i : int) =
+  let n = string_length s in
+  if i < 8 then (if i < d then upper (int_of_char (string_get s i)) else 32)
+  else (let j = d + 1 + (i - 8) in if j < n then upper (int_of_char (string_get s j)) else 32)
+let fat_find_user s = let d = fat_dot s in fat_find_by (fun (i : int) -> fat_user_char s d i)
+
+(* where the bytes of a file read go (offset in the file, byte), and how many the place can take *)
+let fat_put = ref (fun (_o : int) (_v : int) -> ())
+let fat_limit = ref 0x7FFFFFF
+
+(* read the file found by get through fat_put; its length, -1 if it is not there or a block failed, -2 if it does not fit.
+   A cluster goes in one multi-block transfer (up to 8 blocks at a time). *)
+let fat_read_by (get : int -> int) =
+  let c = ref (fat_find_by get) in
+  let size = !fat_size and pos = ref 0 and ok = ref (!c >= 2) in
+  if !ok && size > !fat_limit then 0 - 2
+  else begin
+    while !ok && !pos < size && !c >= 2 && !c < 0x0FFFFFF8 do
+      let s = ref 0 in
+      while !ok && !s < !fat_spc && !pos < size do
+        let n = if !fat_spc - !s > 8 then 8 else !fat_spc - !s in
+        if not (sd_read_n (clus_lba !c + !s) n) then ok := false
+        else begin
+          let m = if size - !pos < 512 * n then size - !pos else 512 * n in
+          for i = 0 to m - 1 do (!fat_put) (!pos + i) (sd_byte i) done;
+          pos := !pos + m
+        end;
+        s := !s + n
+      done;
+      if !ok && !pos < size then c := fat_next !c
+    done;
+    if !ok && !pos = size then size else 0 - 1
+  end
+(* <<< io/fat.ml *)
+
+(* Device names, in the manner of the loader's boot prompt: nfs(U,P)path and sd(U,P)path.  dev_split says which (1 NFS, 2 the card,
+   0 neither: a file of the RAM disk) and leaves the unit, the partition and the path in dev_unit, dev_part and dev_rel. *)
+let dev_unit = ref 0
+let dev_part = ref 0
+let dev_rel = ref ""
+
+let dev_digit (nm : string) (i : int) =
+  i < string_length nm && int_of_char (string_get nm i) >= 48 && int_of_char (string_get nm i) <= 57
+
+let dev_split (nm : string) =
+  let n = string_length nm in
+  let d = if n > 4 && string_get nm 0 = 'n' && string_get nm 1 = 'f' && string_get nm 2 = 's' && string_get nm 3 = '(' then 1
+          else if n > 3 && string_get nm 0 = 's' && string_get nm 1 = 'd' && string_get nm 2 = '(' then 2
+          else 0 in
+  if d = 0 then 0
+  else begin
+    let i = ref (if d = 1 then 4 else 3) and u = ref 0 and pt = ref 0 in
+    while dev_digit nm !i do u := !u * 10 + (int_of_char (string_get nm !i) - 48); i := !i + 1 done;
+    if !i >= n || string_get nm !i <> ',' then 0
+    else begin
+      i := !i + 1;
+      while dev_digit nm !i do pt := !pt * 10 + (int_of_char (string_get nm !i) - 48); i := !i + 1 done;
+      if !i >= n || string_get nm !i <> ')' then 0
+      else begin
+        i := !i + 1;
+        let r = create_bytes (n - !i) in
+        for k = !i to n - 1 do bytes_set r (k - !i) (string_get nm k) done;
+        dev_unit := !u; dev_part := !pt; dev_rel := bytes_to_string r;
+        d
+      end
+    end
+  end
+
+(* The NFS side of an input channel, set where the NFS client is: open the file (its handle and size), and fetch 512 bytes of it *)
+let nfs_open_hook = ref (fun (_nm : string) (_h : int) -> ())
+let nfs_fill_hook = ref (fun (_h : int) (_b : int) (_buf : bytes) -> ())
+
 (* ---- channels ----
    open_in and open_out as the standard library has them, over the files of the RAM disk, and the disk
    itself, raw.  A file is a run of bytes in the disk with a directory entry (name, offset, length);
@@ -3819,6 +4077,20 @@ let in_off = [| 0; 0; 0; 0; 0; 0; 0; 0 |]      (* the file's data, as a disk off
 let in_len = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
 let in_pos = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
 let in_live = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+(* a channel on a device: 0 the RAM disk, 1 NFS, 2 the card; the file's handle (NFS) or first cluster (card) and where the last read
+   left the cluster walk; and two 512-byte blocks of the file, kept so that a reader looking a few bytes ahead and back does not
+   fetch the same block twice *)
+let in_dev = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+let in_fh = [| create_bytes 64; create_bytes 64; create_bytes 64; create_bytes 64; create_bytes 64; create_bytes 64; create_bytes 64; create_bytes 64 |]
+let in_fhlen = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+let in_cl0 = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+let in_cur = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+let in_curcl = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+let in_b0 = [| create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0 |]
+let in_b1 = [| create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0; create_bytes 0 |]
+let in_base0 = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+let in_base1 = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
+let in_vic = [| 0; 0; 0; 0; 0; 0; 0; 0 |]
 
 let out_live = ref false
 let out_ent = ref 0                             (* its directory entry *)
@@ -3826,59 +4098,119 @@ let out_at = ref 0                              (* its data, as a disk offset *)
 let out_pos = ref 0                             (* where the next byte goes, from the start of the file *)
 let out_len = ref 0                             (* how far the file reaches *)
 
-let open_in (nm : string) =
-  let nm = (!nfs_in_hook) nm in
-  let _ = rfs_ready () in
-  let k = rfs_find nm in
-  if k < 0 then raise (Sys_error (nm ^^ ": No such file or directory"))
+(* the block at b (a multiple of 512) of a channel on a device, into buf *)
+let sd_chan_fill (h : int) (b : int) (buf : bytes) =
+  let s = b / 512 in
+  let idx = s / !fat_spc in
+  (if idx < array_get in_cur h then begin array_set in_cur h 0; array_set in_curcl h (array_get in_cl0 h) end);
+  while array_get in_cur h < idx do
+    array_set in_curcl h (fat_next (array_get in_curcl h));
+    array_set in_cur h (array_get in_cur h + 1)
+  done;
+  let c = array_get in_curcl h in
+  if c >= 2 && c < 0x0FFFFFF8 && sd_read (clus_lba c + s mod !fat_spc) then
+    for i = 0 to 511 do bytes_set buf i (char_of_int (sd_byte i)) done
+  else raise (Sys_error "sd: read error")
+
+let in_byte (h : int) (p : int) =
+  if array_get in_dev h = 0 then db (array_get in_off h + p)
   else begin
-    let h = ref (0 - 1) and i = ref 0 in
-    while !h < 0 && !i < max_in do
-      (if array_get in_live !i = 0 then h := !i);
-      i := !i + 1
-    done;
-    if !h < 0 then raise (Sys_error "Too many open files")
+    let b = p - p mod 512 in
+    if array_get in_base0 h = b then int_of_char (bytes_get (array_get in_b0 h) (p - b))
+    else if array_get in_base1 h = b then int_of_char (bytes_get (array_get in_b1 h) (p - b))
     else begin
+      let v = array_get in_vic h in
+      let buf = if v = 0 then array_get in_b0 h else array_get in_b1 h in
+      (if array_get in_dev h = 1 then (!nfs_fill_hook) h b buf else sd_chan_fill h b buf);
+      (if v = 0 then array_set in_base0 h b else array_set in_base1 h b);
+      array_set in_vic h (1 - v);
+      int_of_char (bytes_get buf (p - b))
+    end
+  end
+
+let sd_up = ref false
+
+(* the card, then the file: partition and name from dev_part / dev_rel *)
+let sd_chan_open (nm : string) (h : int) =
+  (if not_b !sd_up then begin
+     (if sd_init () <> 0 then raise (Sys_error (nm ^^ ": no card")));
+     sd_up := true
+   end);
+  fat_part := !dev_part;
+  if fat_mount () <> 0 then raise (Sys_error (nm ^^ ": no FAT volume"))
+  else begin
+    let c = fat_find_user !dev_rel in
+    if c < 2 then raise (Sys_error (nm ^^ ": No such file or directory"))
+    else begin
+      array_set in_cl0 h c; array_set in_curcl h c; array_set in_cur h 0;
+      array_set in_len h !fat_size
+    end
+  end
+
+let open_in (nm : string) =
+  let d = dev_split nm in
+  let h = ref (0 - 1) and i = ref 0 in
+  while !h < 0 && !i < max_in do
+    (if array_get in_live !i = 0 then h := !i);
+    i := !i + 1
+  done;
+  if !h < 0 then raise (Sys_error "Too many open files")
+  else if d = 0 then begin
+    let _ = rfs_ready () in
+    let k = rfs_find nm in
+    if k < 0 then raise (Sys_error (nm ^^ ": No such file or directory"))
+    else begin
+      array_set in_dev !h 0;
       array_set in_off !h (rfs_offset k); array_set in_len !h (rfs_length k);
       array_set in_pos !h 0; array_set in_live !h 1;
       !h
     end
+  end else begin
+    (if d = 1 then (!nfs_open_hook) nm !h else sd_chan_open nm !h);
+    array_set in_dev !h d;
+    array_set in_base0 !h (0 - 1); array_set in_base1 !h (0 - 1); array_set in_vic !h 0;
+    array_set in_b0 !h (create_bytes 512); array_set in_b1 !h (create_bytes 512);
+    array_set in_pos !h 0; array_set in_live !h 1;
+    !h
   end
 
 let in_chk (h : int) =
   if h < 0 || h >= max_in || array_get in_live h = 0 then raise (Sys_error "Bad file descriptor")
 
-let close_in (h : int) = in_chk h; array_set in_live h 0
+let close_in (h : int) =
+  in_chk h;
+  array_set in_live h 0;
+  (if array_get in_dev h <> 0 then begin array_set in_b0 h (create_bytes 0); array_set in_b1 h (create_bytes 0) end)
 
 let input_char (h : int) =
   in_chk h;
   let p = array_get in_pos h in
   if p >= array_get in_len h then raise End_of_file
-  else begin array_set in_pos h (p + 1); db (array_get in_off h + p) end
+  else begin array_set in_pos h (p + 1); in_byte h p end
 
 (* up to the next newline, which is read and not returned; End_of_file only if there was nothing to read *)
 let input_line (h : int) =
   in_chk h;
-  let p = array_get in_pos h and len = array_get in_len h and off = array_get in_off h in
+  let p = array_get in_pos h and len = array_get in_len h in
   if p >= len then raise End_of_file
   else begin
     let e = ref p in
-    while !e < len && db (off + !e) <> 10 do e := !e + 1 done;
+    while !e < len && in_byte h !e <> 10 do e := !e + 1 done;
     let n = !e - p in
     let b = create_bytes n in
-    for i = 0 to n - 1 do bytes_set b i (char_of_int (db (off + p + i))) done;
+    for i = 0 to n - 1 do bytes_set b i (char_of_int (in_byte h (p + i))) done;
     array_set in_pos h (if !e < len then !e + 1 else !e);
     bytes_to_string b
   end
 
 let really_input_string (h : int) (n : int) =
   in_chk h;
-  let p = array_get in_pos h and off = array_get in_off h in
+  let p = array_get in_pos h in
   if n < 0 then raise (Invalid_argument "really_input_string")
   else if p + n > array_get in_len h then raise End_of_file
   else begin
     let b = create_bytes n in
-    for i = 0 to n - 1 do bytes_set b i (char_of_int (db (off + p + i))) done;
+    for i = 0 to n - 1 do bytes_set b i (char_of_int (in_byte h (p + i))) done;
     array_set in_pos h (p + n);
     bytes_to_string b
   end
@@ -4343,7 +4675,9 @@ let nfs_ce = ref 0
 let nfs_result = ref (0 - 1)     (* -1 running, -2 failed, else the length *)
 (* writing a file: nfs_launch_write creates the leaf of the path (the part after the last '/') in the directory the rest names
    and writes nfs_src_len bytes, nfs_src_get i being byte i of them *)
-let nfs_mode = ref 0             (* 0 read, 1 write *)
+let nfs_mode = ref 0             (* 0 read the file, 1 write it, 2 read one piece of an open file, 3 open (handle and size only) *)
+let nfs_count = ref nfs_chunk    (* bytes asked for by each READ *)
+let nfs_size = ref 0             (* a file's size, from the LOOKUP that opened it *)
 let nfs_leaf = ref 0             (* where the leaf name starts in nfs_path *)
 let nfs_src_len = ref 0
 let nfs_src_get = ref (fun (_i : int) -> 0)
@@ -4398,7 +4732,7 @@ let send_read () =
   rpc_call rpc_nfs 3 6;
   xfh fh_file !fh_file_len;
   x32 0; x32 !nfs_off;        (* a 64-bit offset, high word first *)
-  x32 nfs_chunk;
+  x32 !nfs_count;
   nfs_send !nfsd_port
 
 (* a post_op_attr: a flag, and the 84 bytes of attributes if it is set *)
@@ -4461,6 +4795,10 @@ let nfs_reply len =
         nfs_cs := !nfs_ce + 1;
         nfs_find_end ();
         send_lookup (); nfs_step ()
+      end else if !nfs_mode = 3 then begin
+        (* LOOKUP3resok: the handle, then post_op_attr; fattr3's size follows type, mode, nlink, uid and gid *)
+        (if r32 () = 1 then begin rp := !rp + 20; let _hi = r32 () in nfs_size := r32 () end else nfs_size := 0);
+        nfs_state := nfs_idle; nfs_result := !nfs_size
       end else begin
         nfs_off := 0;
         (!nfs_dest_begin) 0;
@@ -4482,7 +4820,8 @@ let nfs_reply len =
           (!nfs_dest_put) (!nfs_off + i) (rx (!rp + i))
         done;
         nfs_off := !nfs_off + n;
-        if eof <> 0 || n = 0 then begin
+        if !nfs_mode = 2 then begin nfs_state := nfs_idle; nfs_result := n end
+        else if eof <> 0 || n = 0 then begin
           nfs_state := nfs_idle;
           if not_b ((!nfs_dest_finish) !nfs_off) then
             nfs_fail "disk full"
@@ -4570,18 +4909,34 @@ let nfs_launch_write export path =
   nfs_state := nfs_arping;
   nfs_arp_request ();
   nfs_step ()
+
+(* open export + path for reading, repeatedly: the mount and the lookups are done, nfs_result is the size and the file's handle
+   is in fh_file / fh_file_len for the host to keep *)
+let nfs_launch_open export path =
+  nfs_launch export path;
+  nfs_mode := 3
+
+(* one READ of nfs_count bytes at off from the file whose handle is fh (n bytes), reaching the host through nfs_dest_put (absolute
+   offsets); the server, its ports and the MAC are those of the open before; nfs_result is the bytes read *)
+let nfs_launch_piece (fh : bytes) (n : int) (off : int) =
+  for i = 0 to 63 do bytes_set fh_file i (bytes_get fh i) done;
+  fh_file_len := n;
+  nfs_mode := 2; nfs_off := off; nfs_result := 0 - 1;
+  nfs_state := nfs_reading;
+  send_read ();
+  nfs_step ()
 (* <<< io/nfs.ml *)
 
 (* the file goes to the RAM disk, as a file of that name *)
 let nfs_at = ref 0               (* where its bytes are going on the disk *)
 let nfs_name = ref ""             (* and the name it is to have there *)
-let () =
+
+(* where a fetched file goes (nfs_fetch): the RAM disk *)
+let nfs_dest_to_disk () =
   nfs_dest_begin := (fun (_u : int) -> nfs_at := rfs_free ());
   nfs_dest_room := (fun (_u : int) -> io_read disk_size_reg - !nfs_at);
-  (* straight to the disk: no copy in staging, and nothing to move afterwards -- the bytes are already where the file will live *)
   nfs_dest_put := (fun (o : int) (v : int) -> db_set (!nfs_at + o) v);
   nfs_dest_finish := (fun (n : int) -> rfs_commit !nfs_name !nfs_at n >= 0)
-
 (* what the language sees *)
 (* "192.168.1.106" as one argument: the compiler applies at most two at a
    time, so four octets could not be passed even though they would read
@@ -4612,45 +4967,21 @@ let nfs_start export f =
   else begin
     let _ = rfs_ready () in
     nfs_name := f;
+    nfs_dest_to_disk ();
     nfs_launch export f;
     1
   end
 
 (* ---- NFS files by name: nfs(U,P)dir/file ----
    U is the server's host number on this network (0: the address nfs_server gave), P is ignored; the path is below the
-   export nfs_root names.  open_in fetches the file into the RAM disk, under its last component, and opens that; open_out
-   writes a scratch file of that name and close_out creates the file on the server and sends it.  The wait is for the replies
-   in this very call, so it is only done in a session on the UART: in a network session the TX window holds the reply being
-   built and the receive window the command being run. *)
-let nfs_unit = ref 0
-let nfs_rel = ref ""
+   export nfs_root names.  open_in on such a name looks the file up and keeps its handle, and the channel then fetches 512 bytes
+   at a time as they are wanted, so a file is read where it is and nothing is copied to the RAM disk (run_file reads its source
+   this way).  open_out writes a scratch file of the last component's name on the RAM disk, and close_out creates the file on
+   the server and sends it.  The wait is for the replies in this very call, so it is only done in a session on the UART: in a
+   network session the TX window holds the reply being built and the receive window the command being run. *)
 let nfs_root = ref "/srv/nfs/vc707"
 
-let nfs_digit (nm : string) (i : int) =
-  i < string_length nm && int_of_char (string_get nm i) >= 48 && int_of_char (string_get nm i) <= 57
-
-let nfs_parse (nm : string) =
-  let n = string_length nm in
-  if n < 7 || string_get nm 0 <> 'n' || string_get nm 1 <> 'f' || string_get nm 2 <> 's' || string_get nm 3 <> '(' then false
-  else begin
-    let i = ref 4 and u = ref 0 in
-    while nfs_digit nm !i do u := !u * 10 + (int_of_char (string_get nm !i) - 48); i := !i + 1 done;
-    if !i >= n || string_get nm !i <> ',' then false
-    else begin
-      i := !i + 1;
-      while nfs_digit nm !i do i := !i + 1 done;
-      if !i >= n || string_get nm !i <> ')' then false
-      else begin
-        i := !i + 1;
-        let r = create_bytes (n - !i) in
-        for k = !i to n - 1 do bytes_set r (k - !i) (string_get nm k) done;
-        nfs_unit := !u; nfs_rel := bytes_to_string r;
-        true
-      end
-    end
-  end
-
-(* the last component, which names the file on the RAM disk *)
+(* the last component, which names the scratch file on the RAM disk *)
 let nfs_base (path : string) =
   let n = string_length path in
   let b = ref 0 in
@@ -4683,38 +5014,43 @@ let nfs_ready (nm : string) =
   else if !to_net then raise (Sys_error (nm ^^ ": NFS files need a session on the UART"))
   else if !nfs_state <> nfs_idle then raise (Sys_error (nm ^^ ": an NFS transfer is running"))
   else begin
-    (if !nfs_unit > 0 then begin
+    (if !dev_unit > 0 then begin
        for i = 0 to 2 do array_set nfs_ip i (ip i) done;
-       array_set nfs_ip 3 !nfs_unit;
+       array_set nfs_ip 3 !dev_unit;
        for i = 0 to 5 do array_set nfs_mac i 0 done
      end);
     if array_get nfs_ip 0 = 0 then raise (Sys_error (nm ^^ ": no server (nfs_server, or nfs(N,0))"))
   end
 
 let () =
-  nfs_in_hook := (fun (nm : string) ->
-    if not_b (nfs_parse nm) then nm
+  nfs_open_hook := (fun (nm : string) (h : int) ->
+    nfs_ready nm;
+    nfs_launch_open !nfs_root !dev_rel;
+    nfs_pump ();
+    if !nfs_result < 0 then raise (Sys_error (nm ^^ ": No such file or directory"))
     else begin
-      nfs_ready nm;
-      let base = nfs_base !nfs_rel in
-      if string_length base = 0 || string_length base > rfs_name_max then raise (Sys_error (nm ^^ ": Invalid argument"))
-      else begin
-        let _ = rfs_ready () in
-        nfs_name := base;
-        nfs_launch !nfs_root !nfs_rel;
-        nfs_pump ();
-        if !nfs_result < 0 then raise (Sys_error (nm ^^ ": No such file or directory"))
-        else base
-      end
+      array_set in_len h !nfs_size;
+      for i = 0 to 63 do bytes_set (array_get in_fh h) i (bytes_get fh_file i) done;
+      array_set in_fhlen h !fh_file_len
     end);
+  nfs_fill_hook := (fun (h : int) (b : int) (buf : bytes) ->
+    nfs_ready "nfs";
+    nfs_count := 512;
+    nfs_dest_put := (fun (o : int) (v : int) -> bytes_set buf (o - b) (char_of_int v));
+    nfs_dest_room := (fun (_u : int) -> 0x7FFFFFF);
+    nfs_launch_piece (array_get in_fh h) (array_get in_fhlen h) b;
+    nfs_pump ();
+    nfs_count := nfs_chunk;
+    nfs_dest_to_disk ();
+    if !nfs_result < 0 then raise (Sys_error "nfs: read failed"));
   nfs_out_hook := (fun (nm : string) ->
     nfs_out_cand := "";
-    if not_b (nfs_parse nm) then nm
+    if dev_split nm <> 1 then nm
     else begin
       nfs_ready nm;
-      let base = nfs_base !nfs_rel in
+      let base = nfs_base !dev_rel in
       if string_length base = 0 || string_length base > rfs_name_max then raise (Sys_error (nm ^^ ": Invalid argument"))
-      else begin nfs_out_cand := !nfs_rel; base end
+      else begin nfs_out_cand := !dev_rel; base end
     end);
   nfs_close_hook := (fun (_u : int) ->
     if string_length !nfs_out_target > 0 then begin
@@ -5176,7 +5512,7 @@ let () = fs_ls := (fun (_ : int) ->
    exception, open or module begins the next phrase.  Each phrase is compiled as though it
    had been typed, from a buffer big enough for it. *)
 (* byte i of what an in channel reads, whatever its position *)
-let inch (ic : int) i = char_of_int (db (array_get in_off ic + i))
+let inch (ic : int) i = char_of_int (in_byte ic i)
 
 let starts_phrase (ic : int) i =
   let n = array_get in_len ic in
@@ -5895,7 +6231,7 @@ let () =
     install_fn "disk_set" (magic (fun (i : int) (v : int) -> disk_set i v; 0));
     install_fn "image_begin" (magic (fun (a : string) -> img_begin a));
     install_fn "image_end" (magic (fun (n : int) -> img_end n));
-    predefine "let help = \"mini-ML on the OCaml processor: type an expression or a let and press Enter (;; ends a phrase early).\\n  1 + 2        let sq x = x * x        sq 12        let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\\nFiles live on the RAM disk and survive a chain load:  files 0   read_file \\\"a.ml\\\"   write_file \\\"a.ml\\\" \\\"text\\\"   run_file \\\"a.ml\\\"\\nOn an NFS server (from the UART session):  nfs_server \\\"192.168.1.106\\\"   nfs_root \\\"/srv/nfs/vc707\\\"   then names nfs(0,0)dir/a.ml\\n  work with open_in, open_out, read_file, write_file and run_file; reading fetches the file, close_out sends it.  Or nfs_fetch / nfs_done.\\nThe SD card:  run_file \\\"sd.ml\\\"   run_file \\\"fat.ml\\\"   sd_init ()   fat_mount ()   fat_ls !fat_root   fat_load \\\"COMP    BC \\\" 0\\nMore on the board: telnet to its address (port 23) or UDP 7777.  After a reset the loader asks boot: and takes\\n  sd(0,0)vm.img   nfs(0,0)path   tftp(0,0)file   mem(0,0)   or nothing for the default; ? lists them.  help prints this again.\""
+    predefine "let help = \"mini-ML on the OCaml processor: type an expression or a let and press Enter (;; ends a phrase early).\\n  1 + 2        let sq x = x * x        sq 12        let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\\nFiles: a plain name is on the RAM disk (survives a chain load):  files 0   read_file \\\"a.ml\\\"   write_file \\\"a.ml\\\" \\\"text\\\"   run_file \\\"a.ml\\\"\\n  sd(0,0)name is on the SD card, nfs(0,0)dir/name on the server (nfs_server \\\"192.168.1.106\\\", nfs_root \\\"/srv/nfs/vc707\\\"; UART session):\\n  run_file \\\"sd(0,0)comp.ml\\\"   read_file \\\"nfs(0,0)bytecode/a.txt\\\"   write_file \\\"nfs(0,0)bytecode/b.txt\\\" \\\"text\\\".  nfs_fetch / nfs_done copy a file in.\\nMore SD: run_file \\\"sd.ml\\\"; run_file \\\"fat.ml\\\"; sd_init (); fat_mount (); fat_ls !fat_root.   More on the board: telnet (port 23) or UDP 7777.\\nAfter a reset the loader asks boot: and takes  sd(0,0)vm.img   nfs(0,0)path   tftp(0,0)file   mem(0,0)   or nothing for the default; ? lists them.\\nhelp prints this again.\""
   end;
   puts "OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build ";
   uart_build ();
