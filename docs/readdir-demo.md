@@ -28,6 +28,14 @@ A session in the self-compiled compiler on the VM simulator (three files on the 
     # [1; 2; 3]
     - : int list = [1; 2; 3]
 
+On the board (spec24, the card in the slot, stage10 image):
+
+    # Sys.readdir "/sd"
+    - : string array = [|"disk.rfs"; "comp.bc"|]   (83 ms)
+
+The card's root directory holds `DISK.RFS` and `COMP.BC` (and the volume label, which is skipped).  `/` and `.` were checked in the simulator only; `.` has
+nothing to list on spec24, which has no RAM disk.
+
 ## What it exposed
 
 * **No `Array.make`.**  The VM has no `caml_make_vect`, so an array whose length is known only at run time cannot be built.  `Sys.readdir` picks a literal array of
