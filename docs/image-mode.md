@@ -74,3 +74,7 @@ code into the 128K-word code RAM, spec24, no RAM disk), and stage 1 compiles `co
 (`#image nfs(0,0)bytecode/stage7.img nfs(0,0)bytecode/comp.ml`, 707 phrases): stage 2's image is identical to stage 1's.  That is the fixed point.
 It needed tail calls in the code generator (the self-compiled compiler's tail-recursive loops overflowed the stack) and the compiler's session
 globals to start above the image's own.  The collector's debug letters (`G`, `D`) still appear on the console during a compile.
+
+On spec25 (2026-10-09, later): the self-compiled compiler with tail calls, `Array.make`, `[||]`, `Sys.readdir` (RAM disk, `/`, `/sd`, `/nfs/dir`) and the `/nfs`, `/sd` names, `stage11.img`
+(327,988 bytes, 78,477 code words), booted from NFS and recompiled `comp.ml` on the board (`#image /nfs/bytecode/stage12.img /nfs/bytecode/comp.ml`, 729 phrases): the result
+is byte-identical to `stage11.img`.  The console showed only the compiler's dots; the collector's activity was on the LEDs (LED6 toggling at each collection).
