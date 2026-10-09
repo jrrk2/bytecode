@@ -196,7 +196,7 @@ module intcode_core #(
 							4:  begin st <= S_X4A; instr_done <= 1'b0; end
 							22: begin halted <= 1'b1; result <= 0; st <= S_HALT; end
 							23: begin st <= S_SW0; instr_done <= 1'b0; end
-							24, 25, 26, 27, 28, 29, 33, 34, 38, 39: begin st <= S_IO; instr_done <= 1'b0; end
+							24, 25, 26, 27, 28, 29, 33, 34, 38, 39, 48: begin st <= S_IO; instr_done <= 1'b0; end
 							30: begin halted <= 1'b1; result <= A; st <= S_HALT; end
 							31: begin st <= S_X31; instr_done <= 1'b0; end
 							32: begin P <= A; C <= B; end
@@ -262,7 +262,7 @@ module intcode_core #(
 			// ---- stream operations: one request, one answer ----
 			S_IO:  st <= S_IOW;
 			S_IOW: if (io_ack) begin
-				if (D[5:0] == 26 || D[5:0] == 28 || D[5:0] == 29 || D[5:0] == 38 || D[5:0] == 39) A <= io_res;
+				if (D[5:0] == 26 || D[5:0] == 28 || D[5:0] == 29 || D[5:0] == 38 || D[5:0] == 39 || D[5:0] == 48) A <= io_res;
 				instr_done <= 1'b1; st <= S_F0;
 			end
 			default: ;                                                       // S_HALT

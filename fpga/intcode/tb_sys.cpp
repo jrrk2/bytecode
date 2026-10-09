@@ -32,7 +32,9 @@ int main(int argc, char **argv) {
     uint64_t clocks = 0; unsigned chars = 0;
     uint64_t halted_at = 0;
     int credit = 96;                                             // CREDIT=1: type only what the board has asked for (ENQ gives 32 more)
-    while (clocks < max && !(halted_at && clocks > halted_at + 40ULL * 10 * div)) {      // after the halt, long enough for the UART to finish
+    uint64_t grace = getenv("GRACE") ? strtoull(getenv("GRACE"), nullptr, 0) : 40ULL * 10 * div;      // GRACE: clocks to wait after a halt (a program run from the file system returns to the monitor after 3 M)
+    while (clocks < max && !(halted_at && clocks > halted_at + grace)) {      // after the halt, long enough for the UART to finish
+        if (!(top->led & 2)) halted_at = 0;
         if ((top->led & 2) && !halted_at) halted_at = clocks;
         top->clk = 0; top->eval(); top->clk = 1; top->eval(); clocks++;
         // the flash slave

@@ -79,6 +79,10 @@ module intcode_sys #(
 	reg [15:0] nwords = 16'd0, wcnt = 16'd0;
 	reg [31:0] hc = 32'd0, hp = 32'd0, hg = 32'd0;
 	reg        have = 1'b0;
+	reg [23:0] boot_at = FLASH_AT;                  // where the program is read from: the monitor at FLASH_AT, or a program started by exec
+	reg        exec_t = 1'b0, exec_ack = 1'b0;      // exec asks for a restart from a file: toggle (not reset: both sides keep step)
+	reg [23:0] exec_at = 24'd0;
+	wire       exec_go = (exec_t != exec_ack);
 	reg        hasname = 1'b0;                     // the program's header carries the name of its standard input (magic INTD)
 	reg [31:0] sname0 = 32'h05535444, sname1 = 32'h494E0000, sname2 = 32'd0, sname3 = 32'd0, sname4 = 32'd0, sname5 = 32'd0;     // STDIN unless it says otherwise
 	reg        w_open = 1'b0;
@@ -96,13 +100,14 @@ module intcode_sys #(
 	// A program loaded from the flash that halts is started afresh from the flash after about 120 ms (at 25 MHz; the UART has finished sending by then): the board
 	// behaves like a command-line tool, run again for each job.  The receive FIFO keeps what the host has already sent.
 	reg [22:0] hcnt = 23'd0;
-	wire warm = have && halted && (hcnt == 23'd3000000) && !w_open && !any_w;
+	wire warm = have && halted && (hcnt == 23'd3000000) && !w_open && (!any_w || boot_at != FLASH_AT);   // a program run by exec returns to the monitor
 	always @(posedge clk) begin
 		if (!halted) hcnt <= 23'd0; else if (hcnt != 23'h7FFFFF) hcnt <= hcnt + 23'd1;
 	end
 	always @(posedge clk) begin
 		ld_we <= 1'b0; xdone <= 1'b0;
-		if (sys_rst || warm) begin
+		if (sys_rst || warm || exec_go) begin
+			boot_at <= exec_go ? exec_at : FLASH_AT; if (exec_go) exec_ack <= exec_t;
 			bst <= B_R1; boot_run <= 1'b1; cs_q <= 1'b1; sck_q <= 1'b0; xfer <= 1'b0; gap <= 16'd0; have <= 1'b0; widx <= 4'd0; f_ack_t <= 1'b0; fbusy <= 1'b0; hasname <= 1'b0;
 			sname0 <= 32'h05535444; sname1 <= 32'h494E0000; sname2 <= 32'd0; sname3 <= 32'd0; sname4 <= 32'd0; sname5 <= 32'd0;
 		end else begin
@@ -122,7 +127,7 @@ module intcode_sys #(
 				B_R2: begin cs_q <= 1'b0; if (!xfer && !xdone) begin txsh <= {8'h99, 24'd0}; nbits <= 6'd8; xfer <= 1'b1; ph <= 4'd0; end else if (xdone) begin cs_q <= 1'b1; gap <= 16'd0; bst <= B_G2; end end
 				B_G2: begin gap <= gap + 16'd1; if (gap == 16'd5000) bst <= B_CMD; end         // the flash needs about 30 us after a reset
 				B_CMD: begin cs_q <= 1'b0;
-					if (!xfer && !xdone) begin txsh <= {8'h03, FLASH_AT}; nbits <= 6'd32; xfer <= 1'b1; ph <= 4'd0; end
+					if (!xfer && !xdone) begin txsh <= {8'h03, boot_at}; nbits <= 6'd32; xfer <= 1'b1; ph <= 4'd0; end
 					else if (xdone) begin widx <= 4'd0; bst <= B_WORD; end
 				end
 				B_WORD: begin
@@ -229,7 +234,7 @@ module intcode_sys #(
 	reg        match = 1'b0;
 	reg [WIDTH-1:0] nm_cur = {WIDTH{1'b0}};
 	reg [23:0] cur = 24'd0, fs_end = 24'd0, f_dat = 24'd0, f_ln = 24'd0, e_len = 24'd0;
-	reg        e_open = 1'b0, inhdr = 1'b0;
+	reg        e_open = 1'b0, inhdr = 1'b0, isexec = 1'b0, rawfs = 1'b0;
 	// writing
 	reg [7:0]  pbuf [0:255];
 	reg [23:0] wp = 24'd0, hdr = 24'd0, ea = 24'd0, pa = 24'd0;
@@ -283,7 +288,7 @@ module intcode_sys #(
 	always @(posedge clk) begin
 		io_ack <= 1'b0;
 		if (rst) begin st <= IDLE; out_file <= 1'b0; wmark <= 1'b0; f_req_t <= 1'b0; fl_open <= 3'd0; fsel <= 2'd0; stdin_fs <= 2'd0; stdin_chk <= 1'b0; stdin_scan <= 1'b0;
-			kname <= 1'b0; isw <= 1'b0; wsel <= 1'b0; w_open <= 1'b0; inhdr <= 1'b0; end
+			kname <= 1'b0; isw <= 1'b0; wsel <= 1'b0; w_open <= 1'b0; inhdr <= 1'b0; isexec <= 1'b0; rawfs <= 1'b0; end
 		else case (st)
 			IDLE: if (io_req) begin
 					op <= io_op;
@@ -300,6 +305,8 @@ module intcode_sys #(
 				27: if (wsel) begin pbyte <= io_a[7:0]; pr <= FIN; st <= PB0; end
 				    else begin wmark <= 1'b0; st <= WR; end                // wrch
 				28: begin maddr <= io_a[15:0]; isw <= 1'b0; kname <= 1'b0; st <= NM0; end   // findinput: look the name up; if it is not a file, the console serves it (the host sends it), except OPTIONS
+				48: if (WIDTH == 32) begin maddr <= io_a[15:0]; isw <= 1'b0; isexec <= 1'b1; kname <= 1'b0; st <= NM0; end                // exec: restart the machine with the program in the named file
+				    else begin io_res <= 0; st <= FIN; end
 				29: if (FS_WRITE != 0 && WIDTH == 32) begin maddr <= io_a[15:0]; isw <= 1'b1; kname <= 1'b0; st <= NM0; end   // findoutput: a new file at the end of the chain
 				    else begin io_res <= 4; st <= FIN; end                // or stream 4, the console between STX and ETX
 				25: if (FS_WRITE != 0 && WIDTH == 32) begin wsel <= (io_a == 8) && w_open; st <= FIN; end                  // selectoutput
@@ -329,7 +336,8 @@ module intcode_sys #(
 			NM1: begin nm_w0 <= m_rdata_w; st <= NM2; end
 			NM2: begin
 				nm_w1 <= m_rdata_w; nlen <= nm0_32[31:24]; nmw <= nm0_32[31:26] + 3'd1; ei <= 3'd0; ecount <= 12'd0; match <= 1'b1; found <= 1'b0; cur <= FS_AT;
-				if (WIDTH == 32 && (isw ? 1'b1 : fany) && nm0_32[31:24] <= 8'd23) begin f_op <= 3'd0; f_addr <= FS_AT; f_req_t <= ~f_req_t; fret <= FE_W; st <= FW; end
+				rawfs <= (WIDTH == 32 && !isw && !isexec && nm0_32 == 32'h0624464C && (m_rdata_w & 32'hFFFFFF00) == 32'h41534800);     // "$FLASH": the whole file system as one file
+				if (WIDTH == 32 && (isw || isexec ? 1'b1 : fany) && nm0_32[31:24] <= 8'd23) begin f_op <= 3'd0; f_addr <= FS_AT; f_req_t <= ~f_req_t; fret <= FE_W; st <= FW; end
 				else st <= FE_NF;
 			end
 			FW: if (f_req_t == f_ack_t) st <= fret;
@@ -367,18 +375,23 @@ module intcode_sys #(
 				else begin f_op <= 3'd0; f_addr <= next_rec; f_req_t <= ~f_req_t; fret <= FE_W; st <= FW; end
 			end
 			FE_OPEN: begin                                           // the end of the chain has been reached
-				if (isw) begin
+				if (isexec) begin
+					isexec <= 1'b0;
+					if (found) begin exec_at <= f_dat; exec_t <= ~exec_t; end
+					io_res <= found ? 32'd1 : 32'd0; st <= FIN;
+				end else if (isw) begin
 					if (wopen_ok && !w_open) begin wp <= fs_end; hdr <= fs_end; pstart <= fs_end[7:0]; ei <= 3'd0; inhdr <= 1'b1; st <= WO0; end
 					else begin io_res <= {WIDTH{1'b0}}; st <= FIN; end
-				end else if (found && fany) begin
-					fl_base[fslot] <= f_dat; fl_pos[fslot] <= 24'd0; fl_len[fslot] <= f_ln; fl_open[fslot] <= 1'b1;
+				end else if ((found || rawfs) && fany) begin
+					fl_base[fslot] <= rawfs ? FS_AT : f_dat; fl_pos[fslot] <= 24'd0; fl_len[fslot] <= rawfs ? (fs_end - FS_AT) : f_ln; fl_open[fslot] <= 1'b1; rawfs <= 1'b0;
 					if (stdin_scan) begin if (DEBUG_FS != 0) begin dbg_n <= 4'd10; dbg_sh <= dbg_w; dbg_f <= 1'b1; end stdin_fs <= {1'b0, 1'b1} + fslot; fsel <= {1'b0, 1'b1} + fslot; stdin_chk <= 1'b1; stdin_scan <= 1'b0; kname <= 1'b0; st <= GOT; end
 					else begin io_res <= {{(WIDTH-3){1'b0}}, 3'd5 + {1'b0, fslot}}; st <= FIN; end
 				end else if (stdin_scan) begin if (DEBUG_FS != 0) begin dbg_n <= 4'd10; dbg_sh <= dbg_w; dbg_f <= 1'b0; end stdin_chk <= 1'b1; stdin_scan <= 1'b0; kname <= 1'b0; st <= GOT; end
 				else st <= FE_NF;
 			end
 			FE_NF: begin
-				io_res <= (isw) ? {WIDTH{1'b0}} : (WIDTH == 32 && nm_w0 == 32'h074F5054 && nm_w1 == 32'h494F4E53) ? {WIDTH{1'b0}} : 3;
+				isexec <= 1'b0;
+				io_res <= {WIDTH{1'b0}};                                     // no such file (OPTIONS is one of these, as under icint)
 				st <= FIN;
 			end
 			FR0: begin                                               // rdch from a file: a READ at its position
