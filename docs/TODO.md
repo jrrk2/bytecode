@@ -136,6 +136,9 @@ Target: a bitstream at 100 MHz with the heap at 256K words and the code RAM at 1
 ## Compiler
 * Tail calls (`APPTERM`) in `io/comp.ml`: deep tail recursion overflows the stack at about 4000 levels, and it would save
   code words.
+* The compiler starts its own global slots (builtins, literals, definitions) at a fixed 2048, above the running image's: the self-compiled image
+  has about 1100 globals and the old fixed start of 1024 let a builtin's argument overwrite the prompt string.  Have the core say how many globals
+  the running image has (a register beside 0x100c) and start from that, with a message when the image has outgrown the margin.
 * Code density: the self-compiled `comp.ml` is 67,532 words against ocamlc's ~46K (see Code RAM above).  Where it goes is unmeasured:
   count code words per top-level phrase in `#image` mode and look at the largest, and at closure creation and field access sequences.
 * Move the NFS client out of the resident compiler into a library loaded with `run_file` (about 4K words), if the code RAM is not widened.

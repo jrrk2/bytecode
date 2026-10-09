@@ -2172,6 +2172,10 @@ let op_push_retaddr = 31
 let op_apply = 32
 let op_envacc = 25
 let op_restart = 41
+let op_appterm = 36
+let op_appterm1 = 37
+let op_appterm2 = 38
+let op_appterm3 = 39
 (* 117..119 are XORINT, LSLINT, LSRINT: getting these wrong emits a shift
    where a trap frame belongs, and the machine halts on the first raise *)
 let op_pushtrap = 89
@@ -2400,8 +2404,12 @@ let rec tyvars_of te acc = match te with
   | TETuple l -> tyvars_list l acc
 and tyvars_list l acc = match l with [] -> acc | t :: r -> tyvars_list r (tyvars_of t acc)
 
-let globals_max = 4096
-let next_global = ref 1024
+(* The globals array has 8192 slots (GLOBALS_AW 13).  The running program's own globals are the first of them -- ocamlc's build of this file
+   has about 560, this file compiled by itself over 1100 and growing -- and the session's builtins, definitions and literals come after.
+   They used to start at 1024, which the self-compiled image outgrew: its literals (the prompt "# " among them) were overwritten by the
+   first builtin's argument.  2048 leaves a margin; the proper fix is for the core to say how many the running image has (TODO). *)
+let globals_max = 8192
+let next_global = ref 2048
 let doorway = ref (0 - 1)
 
 (* ---- the emitter ----
@@ -2768,7 +2776,16 @@ let float_prim1 f =
   else if string_equal f "abs_float" then prim_abs_float
   else 0 - 1
 
-let rec comp env e = match e with
+(* Tail position.  tail_now is set by the code that is about to compile an expression whose value is the function's result, and read
+   (and cleared) at the entry of comp, comp_match and comp_letrecs: a call there is made with APPTERM, which reuses the caller's frame,
+   instead of APPLY followed by RETURN.  Only the constructs whose child is in tail position pass it on (if, let, let rec, the arms of a
+   match); a try body, an argument, a condition and the rest compile with it clear. *)
+let tail_now = ref false
+
+let rec comp env e =
+  let t = !tail_now in
+  tail_now := false;
+  match e with
   | Int n -> emit op_constint; emit n; true
   | Bool b -> emit op_constint; emit (if b then 1 else 0); true
   | Float f ->
@@ -2805,21 +2822,21 @@ let rec comp env e = match e with
     if not_b (comp env c) then false
     else begin
       emit op_branchifnot; let p1 = here () in emit 0;
-      if not_b (comp env a) then false
+      if not_b (tail_now := t; comp env a) then false
       else begin
         emit op_branch; let p2 = here () in emit 0;
         patch_branch p1 (here ());
-        if not_b (comp env b) then false
+        if not_b (tail_now := t; comp env b) then false
         else begin patch_branch p2 (here ()); true end
       end
     end
-  | Let (true, x, bound, body) -> comp env (LetRecs ([(x, bound)], body))
-  | LetRecs (bs, body) -> comp_letrecs env bs body
+  | Let (true, x, bound, body) -> tail_now := t; comp env (LetRecs ([(x, bound)], body))
+  | LetRecs (bs, body) -> tail_now := t; comp_letrecs env bs body
   | Let (_, x, bound, body) ->
     if not_b (comp env bound) then false
     else begin
       emit op_push;
-      if not_b (comp (x :: env) body) then false
+      if not_b (tail_now := t; comp (x :: env) body) then false
       else begin emit op_pop; emit 1; true end
     end
   | Fun (_, _) ->
@@ -2894,7 +2911,7 @@ let rec comp env e = match e with
        has to put one there first, and it is three words, so the
        compile-time stack grows by three as well or every local under it
        is read from the wrong slot. *)
-    let big = n > 3 in
+    let big = n > 3 && not_b t in
     let ra = ref 0 in
     let e2 = ref env and ok = ref true in
     if big then begin
@@ -2912,7 +2929,16 @@ let rec comp env e = match e with
     if not_b !ok then false
     else if not_b (comp !e2 f) then false
     else begin
-      (if n = 1 then emit op_apply1
+      (if t then begin
+         (* a tail call: the n arguments just pushed replace the whole frame (slots counts it, them included) *)
+         let rec depth l = match l with [] -> 0 | _ :: r -> 1 + depth r in
+         let slots = depth !e2 in
+         if n = 1 then begin emit op_appterm1; emit slots end
+         else if n = 2 then begin emit op_appterm2; emit slots end
+         else if n = 3 then begin emit op_appterm3; emit slots end
+         else begin emit op_appterm; emit n; emit slots end
+       end
+       else if n = 1 then emit op_apply1
        else if n = 2 then emit op_apply2
        else if n = 3 then emit op_apply3
        else begin emit op_apply; emit n end);
@@ -2928,7 +2954,7 @@ let rec comp env e = match e with
   | Con (c, args) -> comp_con env c args
   | Tuple es -> comp_block env 0 es
   | ArrLit es -> comp_block env 0 es
-  | Match (scrut, arms) -> comp_match env scrut arms
+  | Match (scrut, arms) -> tail_now := t; comp_match env scrut arms
   | Field (b, f) ->
     let idx = field_index (rec_field_names (rec_type_of_field f)) f 0 in
     if idx < 0 then begin comp_err := "unknown field " ^^ f; false end
@@ -3258,7 +3284,10 @@ and label_of i labels = match labels with
   | (k, p) :: r -> if k = i then p else label_of i r
 
 and comp_match env scrut arms =
+  let t = !tail_now in
+  tail_now := false;
   let (nc, nb) = dispatch_shape arms in
+  tail_now := t;
   if nc >= 0 then comp_match_switch env scrut arms nc nb
   else comp_match_chain env scrut arms
 
@@ -3266,6 +3295,8 @@ and comp_match env scrut arms =
    or guard cannot match goes on to the next arm that could take the same constructor.  Nothing
    matching leaves 0, as in the chain below. *)
 and comp_match_switch env scrut arms nc nb =
+  let t = !tail_now in
+  tail_now := false;
   if not_b (comp env scrut) then false
   else begin
     emit op_push;
@@ -3301,7 +3332,7 @@ and comp_match_switch env scrut arms nc nb =
                   if not_b (comp env2 g) then false
                   else begin emit op_branchifnot; gfail := here (); emit 0; true end in
               if not_b guard_ok then ok := false
-              else if not_b (comp env2 body) then ok := false
+              else if not_b (tail_now := t; comp env2 body) then ok := false
               else begin
                 (if pushed > 0 then begin emit op_pop; emit pushed end);
                 emit op_branch; ends := here () :: !ends; emit 0;
@@ -3355,6 +3386,8 @@ and comp_match_switch env scrut arms nc nb =
   end
 
 and comp_match_chain env scrut arms =
+  let t = !tail_now in
+  tail_now := false;
   if not_b (comp env scrut) then false
   else begin
     emit op_push;
@@ -3383,7 +3416,7 @@ and comp_match_chain env scrut arms =
                 if not_b (comp env2 g) then false
                 else begin emit op_branchifnot; gfail := here (); emit 0; true end in
             if not_b guard_ok then ok := false
-            else if not_b (comp env2 body) then ok := false
+            else if not_b (tail_now := t; comp env2 body) then ok := false
             else begin
               (if pushed > 0 then begin emit op_pop; emit pushed end);
               emit op_branch; ends := here () :: !ends; emit 0;
@@ -3463,7 +3496,7 @@ and comp_pending () =
     (if n > 1 then begin emit op_grab; emit (n - 1) end);
     let saved = !cap in
     cap := caps;
-    let r = comp ps body in
+    let r = (tail_now := true; comp ps body) in
     cap := saved;
     if not_b r then begin pending_bodies := []; false end
     else begin emit op_return; emit n; comp_pending () end
@@ -3473,6 +3506,8 @@ and comp_pending () =
    slot a closure captured is patched, in the closure, to the closure it stands for.  The names
    are then ordinary locals of the body. *)
 and comp_letrecs env bs body =
+  let t = !tail_now in
+  tail_now := false;
   let rec count l = match l with [] -> 0 | _ :: r -> 1 + count r in
   let n = count bs in
   let rec dummies l e = match l with
@@ -3515,7 +3550,7 @@ and comp_letrecs env bs body =
         go caps 0;
         patch_fns r in
     patch_fns !made;
-    if not_b (comp env2 body) then false
+    if not_b (tail_now := t; comp env2 body) then false
     else begin emit op_pop; emit n; true end
   end
 
