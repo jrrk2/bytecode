@@ -83,9 +83,15 @@ G are no longer constants in the logic: with `boot_store` the core reads them at
 also writes the store image.  Checked on the board: the base held an echo that prints a banner on start; `patch_sonata.sh echo3.int` replaced it with a program that waits
 for a key and then prints `PATCHED VIA FASM`, and typed text came back in capitals.  The convert step dominates the 26 s (the UF2 is the whole 4.4 MB bitstream).
 
+Reading the program from the software SPI flash at reset (`intcode_sys.v`, the `spi_*` ports; Sonata pins D10 cs, A8 clk, C11/C10 data, A10/A9 held high): after the flash's
+reset command (0x66, 0x99) it READs (0x03) from slot 2 (10 MiB, `FLASH_AT`) a header of five little-endian words -- magic `INTC`, N, C, P, G -- and N words, into the store, holding the core;
+without the magic the bitstream's own program runs.  `intcode_send.py prog.int --uf2 out.uf2 --slot 2` makes the software UF2 (family 0x6CE29E60; the slot is chosen by the target address, 0 / 0x10000000 /
+0x20000000, as in the Sonata release procedure) and `--flash` the raw image.  Simulated (`tb_sys` with an SPI flash slave): a blank flash runs the built-in program; with a flash image the design
+reads exactly the 4,312 bytes of the image and runs that instead.  **Not yet confirmed on the board** (2026-10-09): the first attempt got no UART reply from the new design, nor from the previously working
+FASM-patched image copied back afterwards -- see the notes in the commit.  (The SONATA drive is 15 MB: each 4.4 MB UF2 left on it has to be deleted before the next.)
+
 Two other routes, not built: `loader.int` is a 121-word UART loader (assembled at 26000, `W aaaaaaaa dddddddd` and `G pppppppp` commands) with `intcode_send.py --port`
-as the sender, tested in the assembler but not yet in the system simulation; and reading the program at reset from the Sonata's software SPI flash (pins D10 cs, A8 clk,
-C11/C10/A10/A9 data), written by dropping a small UF2 on the SONATA drive with no bitstream change at all.
+as the sender, tested in the assembler but not yet in the system simulation; 
 
 ## Not done
 

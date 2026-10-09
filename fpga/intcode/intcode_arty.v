@@ -7,7 +7,8 @@ module intcode_arty #(parameter WIDTH = 32) (
 	output wire [3:0] led
 );
 	wire [7:0] l;
-	intcode_sys #(.WIDTH(WIDTH), .DIV(868)) sys (.clk(clk), .uart_rx_in(uart_rx_in), .uart_tx_out(uart_tx_out), .led(l));
+	intcode_sys #(.WIDTH(WIDTH), .DIV(868)) sys (.clk(clk), .uart_rx_in(uart_rx_in), .uart_tx_out(uart_tx_out), .led(l),
+		.spi_cs_n(), .spi_clk(), .spi_mosi(), .spi_miso(1'b1), .spi_wp_n(), .spi_hold_n());
 	assign led = l[3:0];
 endmodule
 `default_nettype wire
