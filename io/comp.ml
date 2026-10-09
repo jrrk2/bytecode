@@ -1522,13 +1522,6 @@ and env = (string * value) list
 
 (* set once the disk and the evaluator are both in scope *)
 let fs_put = ref (fun (_ : string) (_ : string) -> 0)
-(* names of the form nfs(U,P)path are files on an NFS server: the hooks below (set where the NFS client is) turn one into a
-   file of the RAM disk -- fetched for reading, or the scratch file whose contents close_out sends -- and hand back its name *)
-let nfs_in_hook = ref (fun (nm : string) -> nm)
-let nfs_out_hook = ref (fun (nm : string) -> nm)
-let nfs_close_hook = ref (fun (_u : int) -> ())
-let nfs_out_cand = ref ""        (* what nfs_out_hook decided: the path to create on close, or "" *)
-let nfs_out_target = ref ""      (* the same, once the file is open *)
 let fs_get = ref (fun (_ : string) -> Err "no filing system")
 let fs_run = ref (fun (_ : string) -> 0)
 let fs_ls = ref (fun (_ : int) -> 0)
@@ -4222,11 +4215,28 @@ let seek_in (h : int) (p : int) =
   if p < 0 || p > array_get in_len h then raise (Sys_error "Invalid argument")
   else array_set in_pos h p
 
+(* an output channel on NFS: the file is created when it is opened, and what is written is sent in pieces of 1024 bytes as the buffer
+   fills (and by flush and close_out), so nothing is kept on the RAM disk *)
+let out_dev = ref 0
+let out_fh = create_bytes 64
+let out_fhlen = ref 0
+let out_buf = ref (create_bytes 0)
+let out_base = ref 0                            (* the file offset of the buffer's first byte *)
+let nfs_out_open_hook = ref (fun (_nm : string) -> ())
+let nfs_out_send_hook = ref (fun (_off : int) (_n : int) -> ())
+
 let open_out (nm : string) =
-  let nm = (!nfs_out_hook) nm in
+  let d = dev_split nm in
   let _ = rfs_ready () in
   let n = string_length nm in
   if !out_live then raise (Sys_error "Too many open output files")
+  else if d = 2 then raise (Sys_error (nm ^^ ": writing to the card is not done"))
+  else if d = 1 then begin
+    (!nfs_out_open_hook) nm;
+    out_dev := 1; out_buf := create_bytes 1024; out_base := 0;
+    out_pos := 0; out_len := 0; out_live := true;
+    1
+  end
   else if n = 0 || n > rfs_name_max then raise (Sys_error (nm ^^ ": Invalid argument"))
   else begin
     let k = rfs_find nm and cnt = rfs_count () in
@@ -4239,8 +4249,8 @@ let open_out (nm : string) =
        if at < 0 then raise (Sys_error (nm ^^ ": No space left on device"))
        else begin out_ent := cnt; out_at := at end
      end);
+    out_dev := 0;
     out_pos := 0; out_len := 0; out_live := true;
-    nfs_out_target := !nfs_out_cand;
     1
   end
 
@@ -4248,12 +4258,23 @@ let out_chk (h : int) =
   if h <> 1 || not !out_live then raise (Sys_error "Bad file descriptor")
 
 let out_room (n : int) =
-  if !out_at + !out_pos + n > io_read disk_size_reg then raise (Sys_error "No space left on device")
+  if !out_dev = 0 && !out_at + !out_pos + n > io_read disk_size_reg then raise (Sys_error "No space left on device")
+
+let out_send () =
+  let n = !out_pos - !out_base in
+  if n > 0 then begin (!nfs_out_send_hook) !out_base n; out_base := !out_pos end
 
 let out_byte (c : int) =
-  db_set (!out_at + !out_pos) c;
-  out_pos := !out_pos + 1;
-  if !out_pos > !out_len then out_len := !out_pos
+  if !out_dev = 0 then begin
+    db_set (!out_at + !out_pos) c;
+    out_pos := !out_pos + 1;
+    if !out_pos > !out_len then out_len := !out_pos
+  end else begin
+    bytes_set !out_buf (!out_pos - !out_base) (char_of_int c);
+    out_pos := !out_pos + 1;
+    (if !out_pos > !out_len then out_len := !out_pos);
+    if !out_pos - !out_base = 1024 then out_send ()
+  end
 
 let output_char (h : int) (c : int) = out_chk h; out_room 1; out_byte c
 
@@ -4265,21 +4286,23 @@ let output_string (h : int) (s : string) =
 
 let flush (h : int) =
   out_chk h;
-  d32_set (rfs_dir + !out_ent * rfs_ent + rfs_name_max + 4) !out_len;
-  d32_set 8 (rfs_next !out_at !out_len)
+  if !out_dev = 1 then out_send ()
+  else begin
+    d32_set (rfs_dir + !out_ent * rfs_ent + rfs_name_max + 4) !out_len;
+    d32_set 8 (rfs_next !out_at !out_len)
+  end
 
-let close_out (h : int) = flush h; out_live := false; (!nfs_close_hook) 0
+let close_out (h : int) = flush h; out_live := false; out_buf := create_bytes 0
 
 (* give a file up unwritten: its entry goes, and the space with it *)
 let discard_out (h : int) =
   out_chk h;
-  d32_set 4 !out_ent; d32_set 8 !out_at;
-  nfs_out_target := "";
+  (if !out_dev = 0 then begin d32_set 4 !out_ent; d32_set 8 !out_at end);
   out_live := false
 
 let seek_out (h : int) (p : int) =
   out_chk h;
-  if p < 0 then raise (Sys_error "Invalid argument") else out_pos := p
+  if p < 0 || (!out_dev = 1 && p <> !out_pos) then raise (Sys_error "Invalid argument") else out_pos := p
 
 let pos_out (h : int) = out_chk h; !out_pos
 let out_channel_length (h : int) = out_chk h; !out_len
@@ -4678,6 +4701,7 @@ let nfs_result = ref (0 - 1)     (* -1 running, -2 failed, else the length *)
 let nfs_mode = ref 0             (* 0 read the file, 1 write it, 2 read one piece of an open file, 3 open (handle and size only) *)
 let nfs_count = ref nfs_chunk    (* bytes asked for by each READ *)
 let nfs_size = ref 0             (* a file's size, from the LOOKUP that opened it *)
+let nfs_keep = ref false         (* a streamed write: stop after the CREATE (keeping the handle), and after each piece *)
 let nfs_leaf = ref 0             (* where the leaf name starts in nfs_path *)
 let nfs_src_len = ref 0
 let nfs_src_get = ref (fun (_i : int) -> 0)
@@ -4840,7 +4864,7 @@ let nfs_reply len =
       fh_file_len := take_fh fh_file;
       nfs_off := 0;
       if !fh_file_len = 0 then nfs_fail "bad handle"
-      else if !nfs_src_len = 0 then begin nfs_state := nfs_idle; nfs_result := 0 end
+      else if !nfs_keep || !nfs_src_len = 0 then begin nfs_state := nfs_idle; nfs_result := 0 end
       else begin nfs_state := nfs_writing; send_write (); nfs_step () end
     end
   end
@@ -4853,7 +4877,8 @@ let nfs_reply len =
       if count = 0 then nfs_fail "short write"
       else begin
         nfs_off := !nfs_off + count;
-        if !nfs_off >= !nfs_src_len then begin
+        if !nfs_keep then begin nfs_state := nfs_idle; nfs_result := count end
+        else if !nfs_off >= !nfs_src_len then begin
           nfs_state := nfs_idle; nfs_result := !nfs_off;
           uart_puts "nfs: "; uart_dec !nfs_off; uart_puts " bytes written\n"
         end else begin send_write (); nfs_step () end
@@ -4890,7 +4915,7 @@ let nfs_arp_reply len =
 
 (* start fetching export + path, the server being nfs_ip; the host has checked it can *)
 let nfs_launch export path =
-  nfs_mode := 0;
+  nfs_mode := 0; nfs_keep := false;
   nfs_export := export; nfs_path := path;
   nfs_cs := 0; nfs_find_end ();
   nfs_result := 0 - 1;
@@ -4902,7 +4927,7 @@ let nfs_launch export path =
 let nfs_launch_write export path =
   let leaf = ref 0 in
   for i = 0 to string_length path - 1 do if string_get path i = '/' then leaf := i + 1 done;
-  nfs_mode := 1; nfs_leaf := !leaf;
+  nfs_mode := 1; nfs_keep := false; nfs_leaf := !leaf;
   nfs_export := export; nfs_path := path;
   nfs_cs := 0; nfs_find_end ();
   nfs_result := 0 - 1;
@@ -4924,6 +4949,23 @@ let nfs_launch_piece (fh : bytes) (n : int) (off : int) =
   nfs_mode := 2; nfs_off := off; nfs_result := 0 - 1;
   nfs_state := nfs_reading;
   send_read ();
+  nfs_step ()
+
+(* create path (truncating it) and keep its handle (fh_file / fh_file_len) for the host: nfs_result is 0 *)
+let nfs_launch_create export path =
+  nfs_launch_write export path;
+  nfs_keep := true
+
+(* one WRITE of len bytes at off into the file whose handle is fh (n bytes), the bytes being nfs_src_get at (off + 0 .. off + len - 1);
+   nfs_result is the count the server took *)
+let nfs_launch_wpiece (fh : bytes) (n : int) (off : int) (len : int) (get : int -> int) =
+  for i = 0 to 63 do bytes_set fh_file i (bytes_get fh i) done;
+  fh_file_len := n;
+  nfs_mode := 1; nfs_keep := true;
+  nfs_src_len := off + len; nfs_src_get := get; nfs_off := off;
+  nfs_result := 0 - 1;
+  nfs_state := nfs_writing;
+  send_write ();
   nfs_step ()
 (* <<< io/nfs.ml *)
 
@@ -5043,25 +5085,21 @@ let () =
     nfs_count := nfs_chunk;
     nfs_dest_to_disk ();
     if !nfs_result < 0 then raise (Sys_error "nfs: read failed"));
-  nfs_out_hook := (fun (nm : string) ->
-    nfs_out_cand := "";
-    if dev_split nm <> 1 then nm
+  nfs_out_open_hook := (fun (nm : string) ->
+    nfs_ready nm;
+    nfs_launch_create !nfs_root !dev_rel;
+    nfs_pump ();
+    if !nfs_result < 0 then raise (Sys_error (nm ^^ ": cannot be created"))
     else begin
-      nfs_ready nm;
-      let base = nfs_base !dev_rel in
-      if string_length base = 0 || string_length base > rfs_name_max then raise (Sys_error (nm ^^ ": Invalid argument"))
-      else begin nfs_out_cand := !dev_rel; base end
+      for i = 0 to 63 do bytes_set out_fh i (bytes_get fh_file i) done;
+      out_fhlen := !fh_file_len
     end);
-  nfs_close_hook := (fun (_u : int) ->
-    if string_length !nfs_out_target > 0 then begin
-      let path = !nfs_out_target in
-      nfs_out_target := "";
-      nfs_src_len := !out_len;
-      nfs_src_get := (fun (i : int) -> db (!out_at + i));
-      nfs_launch_write !nfs_root path;
-      nfs_pump ();
-      if !nfs_result < 0 then raise (Sys_error (path ^^ ": could not be written over NFS"))
-    end)
+  nfs_out_send_hook := (fun (off : int) (n : int) ->
+    nfs_ready "nfs";
+    let b = !out_buf in
+    nfs_launch_wpiece out_fh !out_fhlen off n (fun (i : int) -> int_of_char (bytes_get b (i - off)));
+    nfs_pump ();
+    if !nfs_result < 0 then raise (Sys_error "nfs: write failed"))
 
 (* ---- evaluating a line, whichever way it came ---- *)
 (* Printing a double, without caml_format_float -- which this processor does

@@ -130,9 +130,9 @@ The channel functions take a device in the file name, as the loader's boot promp
 * **NFS.**  U is the server's host number on the board's network (0: the address `nfs_server` set), P is ignored, the path is below
   the export `nfs_root` names (default `/srv/nfs/vc707`).  Reading looks the file up and keeps its handle; the channel then fetches
   512 bytes at a time as they are wanted (two blocks are kept, so a reader that looks a few bytes ahead does not fetch twice).  Nothing is
-  copied to the RAM disk: `run_file "nfs(0,0)bytecode/comp.ml"` compiles the source where it lies.  Writing goes to a scratch file on
-  the RAM disk named by the last component, and `close_out` creates the file on the server (mode 0644, an existing one is truncated)
-  and sends it in 1 KiB FILE_SYNC WRITEs; `flush` alone sends nothing.  The calls wait for the replies inside the call, which is only
+  copied to the RAM disk: `run_file "nfs(0,0)bytecode/comp.ml"` compiles the source where it lies.  Writing creates the file when the channel is opened (mode 0644, an existing one is truncated) and sends
+  what is written in 1 KiB FILE_SYNC WRITEs as a buffer fills and on `flush` and `close_out`; nothing is kept on the RAM disk.  An output
+  channel on the server is sequential: `seek_out` to anywhere but the current position raises `Sys_error`.  The calls wait for the replies inside the call, which is only
   safe in a UART session (the TX window holds a network session's reply and the receive window its command), so in a telnet or UDP
   session they raise `Sys_error`; `nfs_fetch` still works there.  Writes are made as uid 0: the export needs `no_root_squash`.
 * **SD.**  U must be 0, P is the MBR partition (0..3), the path is a name in the root directory of its FAT32 volume ("vm.img"; 8.3,

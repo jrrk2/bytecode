@@ -150,6 +150,7 @@ let nfs_result = ref (0 - 1)     (* -1 running, -2 failed, else the length *)
 let nfs_mode = ref 0             (* 0 read the file, 1 write it, 2 read one piece of an open file, 3 open (handle and size only) *)
 let nfs_count = ref nfs_chunk    (* bytes asked for by each READ *)
 let nfs_size = ref 0             (* a file's size, from the LOOKUP that opened it *)
+let nfs_keep = ref false         (* a streamed write: stop after the CREATE (keeping the handle), and after each piece *)
 let nfs_leaf = ref 0             (* where the leaf name starts in nfs_path *)
 let nfs_src_len = ref 0
 let nfs_src_get = ref (fun (_i : int) -> 0)
@@ -312,7 +313,7 @@ let nfs_reply len =
       fh_file_len := take_fh fh_file;
       nfs_off := 0;
       if !fh_file_len = 0 then nfs_fail "bad handle"
-      else if !nfs_src_len = 0 then begin nfs_state := nfs_idle; nfs_result := 0 end
+      else if !nfs_keep || !nfs_src_len = 0 then begin nfs_state := nfs_idle; nfs_result := 0 end
       else begin nfs_state := nfs_writing; send_write (); nfs_step () end
     end
   end
@@ -325,7 +326,8 @@ let nfs_reply len =
       if count = 0 then nfs_fail "short write"
       else begin
         nfs_off := !nfs_off + count;
-        if !nfs_off >= !nfs_src_len then begin
+        if !nfs_keep then begin nfs_state := nfs_idle; nfs_result := count end
+        else if !nfs_off >= !nfs_src_len then begin
           nfs_state := nfs_idle; nfs_result := !nfs_off;
           uart_puts "nfs: "; uart_dec !nfs_off; uart_puts " bytes written\n"
         end else begin send_write (); nfs_step () end
@@ -362,7 +364,7 @@ let nfs_arp_reply len =
 
 (* start fetching export + path, the server being nfs_ip; the host has checked it can *)
 let nfs_launch export path =
-  nfs_mode := 0;
+  nfs_mode := 0; nfs_keep := false;
   nfs_export := export; nfs_path := path;
   nfs_cs := 0; nfs_find_end ();
   nfs_result := 0 - 1;
@@ -374,7 +376,7 @@ let nfs_launch export path =
 let nfs_launch_write export path =
   let leaf = ref 0 in
   for i = 0 to string_length path - 1 do if string_get path i = '/' then leaf := i + 1 done;
-  nfs_mode := 1; nfs_leaf := !leaf;
+  nfs_mode := 1; nfs_keep := false; nfs_leaf := !leaf;
   nfs_export := export; nfs_path := path;
   nfs_cs := 0; nfs_find_end ();
   nfs_result := 0 - 1;
@@ -396,5 +398,22 @@ let nfs_launch_piece (fh : bytes) (n : int) (off : int) =
   nfs_mode := 2; nfs_off := off; nfs_result := 0 - 1;
   nfs_state := nfs_reading;
   send_read ();
+  nfs_step ()
+
+(* create path (truncating it) and keep its handle (fh_file / fh_file_len) for the host: nfs_result is 0 *)
+let nfs_launch_create export path =
+  nfs_launch_write export path;
+  nfs_keep := true
+
+(* one WRITE of len bytes at off into the file whose handle is fh (n bytes), the bytes being nfs_src_get at (off + 0 .. off + len - 1);
+   nfs_result is the count the server took *)
+let nfs_launch_wpiece (fh : bytes) (n : int) (off : int) (len : int) (get : int -> int) =
+  for i = 0 to 63 do bytes_set fh_file i (bytes_get fh i) done;
+  fh_file_len := n;
+  nfs_mode := 1; nfs_keep := true;
+  nfs_src_len := off + len; nfs_src_get := get; nfs_off := off;
+  nfs_result := 0 - 1;
+  nfs_state := nfs_writing;
+  send_write ();
   nfs_step ()
 (* <<< io/nfs.ml *)
