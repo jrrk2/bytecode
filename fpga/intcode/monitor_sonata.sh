@@ -3,6 +3,7 @@
 # The monitor (mon/mon.b, compiled here with the kit's own compiler) is the program in slot 2; it runs at reset and again whenever a program started with RUN halts.
 # The file system after it (intcode_fs.py) holds ST and CG (the compiler's phases, as programs: ST reads the file STDIN and writes OCODE, CG reads OCODE and
 # writes INTCODE), the compiler's headers and sources from the kit, and any files named on the command line.  Program and file system go out as one contiguous UF2.
+# IMAGE=dir  only write the image there (flash.bin: the whole flash from slot 2 on; software.uf2; fs.bin; the files as listed by intcode_fs.py --list), do not touch the board.
 # At the console (115200 8N1): DIR, CAT name, PUT name (then the text, ended with ^D), COPY a b, RUN name.  E.g.  COPY BLIB.B STDIN  RUN ST  RUN CG  CAT INTCODE
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -10,7 +11,7 @@ KIT=${KIT:-$HOME/bcplkit-0.9.7/src}
 BASE=${BASE:-$HOME/bytecode-work/sonata/base}
 DRIVE=${DRIVE:-/mnt/sonata}
 W=${W:-/tmp/intcode_monitor}; mkdir -p "$W/files"
-mountpoint -q "$DRIVE" && [ -w "$DRIVE" ] || { echo "the SONATA drive is not mounted writable at $DRIVE (it re-enumerates: check lsblk)"; exit 1; }
+[ -n "$IMAGE" ] || mountpoint -q "$DRIVE" && [ -w "$DRIVE" ] || [ -n "$IMAGE" ] || { echo "the SONATA drive is not mounted writable at $DRIVE (it re-enumerates: check lsblk)"; exit 1; }
 cd "$W"
 cp "$KIT"/LIBHDR "$KIT"/st.int "$KIT"/cg.int "$KIT"/iclib.i "$KIT"/blib.i . ; cp "$HERE/mon/mon.b" "$HERE/mon/exec.i" .
 "$KIT/icint" st.int < mon.b | grep -a -E "ERROR|COMPILATION" && exit 1 || true
@@ -21,6 +22,9 @@ python3 "$HERE/intcode_send.py" "$KIT/st.int" --flash files/ST --stdin STDIN | t
 python3 "$HERE/intcode_send.py" "$KIT/cg.int" --flash files/CG --stdin OCODE | tail -1
 for f in LIBHDR SYNHDR TRNHDR CGHDR; do cp "$KIT/$f" files/$f; done
 for f in blib syn trn cg; do cp "$KIT/$f.b" files/$(echo $f | tr a-z A-Z).B; done
+# the compiler in INTCODE (what the C compiler made of the sources, for the assembler), the interpreter's source, an example, and the monitor's own source
+for f in iclib blib syn trn cg hello; do cp "$KIT/$f.i" files/$(echo $f | tr a-z A-Z).I; done
+cp "$KIT/hello.b" files/HELLO.B; cp "$KIT/icint.b" files/ICINT.B; cp "$HERE/mon/mon.b" files/MON.B
 for f in "$@"; do cp "$f" files/; done
 python3 "$HERE/intcode_fs.py" fs.bin files/* | tail -1
 HERE="$HERE" python3 - <<'PY'
@@ -30,8 +34,10 @@ from intcode_fs import uf2_blocks
 prog = open("MON.prog", "rb").read(); fs = open("fs.bin", "rb").read()
 assert len(prog) < 0x20000
 open("software.uf2", "wb").write(uf2_blocks(prog + b"\xff" * (0x20000 - len(prog)) + fs, 0x10000000))
+open("flash.bin", "wb").write(prog + b"\xff" * (0x20000 - len(prog)) + fs)
 print("%d bytes of flash image" % (0x20000 + len(fs)))
 PY
+if [ -n "$IMAGE" ]; then mkdir -p "$IMAGE"; cp flash.bin software.uf2 fs.bin MON.prog "$IMAGE"/; python3 "$HERE/intcode_fs.py" --list fs.bin > "$IMAGE/CONTENTS.txt"; cat "$IMAGE/CONTENTS.txt"; echo "image written to $IMAGE"; exit 0; fi
 cp software.uf2 "$DRIVE/software.uf2" && sync
 cp "$BASE/intcode_sonata.slot1.uf2" "$DRIVE/fpga.uf2" && sync
 echo "copied software.uf2 and fpga.uf2 to $DRIVE; open /dev/ttyUSB5 (115200) and type HELP once the FPGA has restarted"
