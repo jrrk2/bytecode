@@ -11,7 +11,8 @@ module intcode_sys #(
 	parameter WIDTH = 32,
 	parameter DIV   = 868,                 // clocks per UART bit: 100 MHz / 115200 (simpleuart takes the divider as bit period - 2)
 	parameter [23:0] FLASH_AT = 24'hA00000, // where the program is in the software flash: slot 2 of the Sonata (10 MiB)
-	parameter [23:0] FS_AT = 24'hE00000,    // the read-only file system (intcode_fs.py): 4 MiB into slot 2 of the Sonata, after the program (a 24-bit READ reaches 16 MiB)
+	parameter [23:0] FS_AT = 24'hA20000,    // the file system (intcode_fs.py): 128 KiB into slot 2 of the Sonata, after the program, so that one contiguous UF2 carries both (24-bit READ)
+	parameter DEBUG_FS = 0,                 // 1: after the lookup of STDIN print the first header word read from the flash (hex), F or N for found or not, and a newline
 	parameter FS_WRITE = 1,                 // findoutput creates files in the flash file system (append-only); 0: the console between STX and ETX, as before
 	parameter SPI_HALF = 2                  // clocks in half a period of the SPI clock
 ) (
@@ -80,7 +81,8 @@ module intcode_sys #(
 	reg        have = 1'b0;
 	reg        hasname = 1'b0;                     // the program's header carries the name of its standard input (magic INTD)
 	reg [31:0] sname0 = 32'h05535444, sname1 = 32'h494E0000, sname2 = 32'd0, sname3 = 32'd0, sname4 = 32'd0, sname5 = 32'd0;     // STDIN unless it says otherwise
-	reg        w_open = 1'b0;                      // a file is open for writing in the flash file system
+	reg        w_open = 1'b0;
+	reg        any_w = 1'b0;                       // a file has been written since the FPGA was configured: the program is not run again after it halts                      // a file is open for writing in the flash file system
 	// micro-operations for the file system, asked for by the I/O state machine below with a toggle (f_req_t != f_ack_t) once the boot copy is done:
 	// 0 start a READ (0x03) at f_addr, 1 read a 32-bit word into f_data (little-endian), 2 read a byte, 3 end (chip select high),
 	// 4 start the command f_cmd with the address f_addr (page program, sector erase), 5 send the byte f_tx, 6 start the command f_cmd alone (write enable, read status).
@@ -94,7 +96,7 @@ module intcode_sys #(
 	// A program loaded from the flash that halts is started afresh from the flash after about 120 ms (at 25 MHz; the UART has finished sending by then): the board
 	// behaves like a command-line tool, run again for each job.  The receive FIFO keeps what the host has already sent.
 	reg [22:0] hcnt = 23'd0;
-	wire warm = have && halted && (hcnt == 23'd3000000) && !w_open;
+	wire warm = have && halted && (hcnt == 23'd3000000) && !w_open && !any_w;
 	always @(posedge clk) begin
 		if (!halted) hcnt <= 23'd0; else if (hcnt != 23'h7FFFFF) hcnt <= hcnt + 23'd1;
 	end
@@ -190,19 +192,23 @@ module intcode_sys #(
 	wire        rxf_empty = (rxw == rxr);
 	wire        rxf_full  = (rxw + 7'd1 == rxr);
 	wire        u_valid;
-	wire [31:0] u_di = {24'd0, (st == ENQ) ? 8'h05 : wmark ? wbyte : io_a[7:0]};
+	wire [31:0] u_di = {24'd0, (st == DBG) ? dbg_ch : (st == ENQ) ? 8'h05 : wmark ? wbyte : io_a[7:0]};
 	wire        u_wait;
 	simpleuart #(.DEFAULT_DIV(DIV - 2)) uart (
 		.clk(clk), .resetn(~sys_rst), .ser_tx(uart_tx_out), .ser_rx(uart_rx_in),
 		.reg_div_we(4'b0), .reg_div_di(32'd0), .reg_div_do(),
 		.reg_dat_we(u_we), .reg_dat_re(u_re), .reg_dat_di(u_di), .reg_dat_do(u_do), .reg_dat_wait(u_wait));
 
+	localparam DBG = 58;
 	localparam IDLE = 0, GOT = 1, RD = 2, WR = 3, FIN = 4, NM0 = 5, NM1 = 6, NM2 = 7, ENQ = 8, FW = 9, FE_W = 10, FE_N0 = 11, FE_N1 = 12, FE_R = 13,
 	           FE_C = 14, FE_O1 = 15, FE_O2 = 16, FE_L = 17, FE_OPEN = 18, FE_NF = 19, FR0 = 20, FR1 = 21, FR2 = 22, FE_NX = 23,
 	           WO0 = 24, WO2 = 25, WO3 = 26, WO4 = 27, WO5 = 28, WO6 = 29, WO7 = 30,
 	           PB0 = 31, PB1 = 32, PB2 = 33, SW0 = 34, SW1 = 35, SP0 = 36, SP1 = 37, SP2 = 38, SP3 = 39, SE0 = 40, SE1 = 41, SE2 = 42, SE3 = 43,
 	           SG0 = 44, SG1 = 45, SG2 = 46, SG3 = 47, SG4 = 48, SL0 = 49, SL1 = 50, SL2 = 51, SL3 = 52, SL4 = 53, CL0 = 54, CL1 = 55, CL2 = 56, CL3 = 57;
 	reg [5:0] st = IDLE;
+	reg [3:0] dbg_n = 4'd0; reg [31:0] dbg_w = 32'd0, dbg_sh = 32'd0; reg dbg_f = 1'b0;
+	wire [3:0] dbg_nib = dbg_sh[31:28];
+	wire [7:0] dbg_ch = (dbg_n == 4'd2) ? (dbg_f ? 8'h46 : 8'h4e) : (dbg_n == 4'd1) ? 8'h0a : (dbg_nib < 4'd10 ? 8'h30 + {4'd0, dbg_nib} : 8'h57 + {4'd0, dbg_nib});
 	// ---- the flash file system (intcode_fs.py).  From FS_AT on, the flash holds a chain of records: a header of 32 bytes (the name as BCPL packs a string, six
 	// words; the length of the data; a word kept for flags) and the data, padded to 4 bytes; the next record follows.  A blank header (all ones) ends the chain, and so
 	// does a record whose length is still all ones (not yet closed).  A later record hides an earlier one of the same name.  Files are read three at a time (GET
@@ -246,7 +252,7 @@ module intcode_sys #(
 	wire        mre_o = (st == NM0) || (st == NM1) || (st == FE_N0);
 	wire        wopen_ok = (fs_end < 24'hFFE000);
 	assign u_valid = (u_do != 32'hffffffff);
-	assign u_we = (st == WR) || (st == ENQ);
+	assign u_we = (st == WR) || (st == ENQ) || (st == DBG);
 	assign u_re = u_valid && !rxf_full;                                     // take a received byte whenever there is one and room for it
 	always @(posedge clk) begin
 		if (sys_rst) begin rxw <= 7'd0; rxr <= 7'd0; end
@@ -287,6 +293,7 @@ module intcode_sys #(
 					end else st <= GOT;
 				end
 				else if (enq_n != 4'd0) st <= ENQ;
+				else if (dbg_n != 4'd0) st <= DBG;
 				else if (halted && w_open) begin cl_ret <= IDLE; st <= CL0; end                // a program that halts with a file open closes it
 			GOT: case (op)
 				26: st <= (fsel != 2'd0) ? FR0 : RD;                     // rdch: from a file in the flash, or the console
@@ -316,6 +323,7 @@ module intcode_sys #(
 			endcase
 			RD: if (!rxf_empty) begin io_res <= (rxf[rxr] == 8'h04) ? {WIDTH{1'b1}} : {{(WIDTH-8){1'b0}}, rxf[rxr]}; got_char <= 1'b1; st <= FIN; end   // the oldest byte
 			ENQ: if (!u_wait) st <= IDLE;
+			DBG: if (!u_wait) begin dbg_n <= dbg_n - 4'd1; if (dbg_n > 4'd2) dbg_sh <= {dbg_sh[27:0], 4'd0}; st <= IDLE; end
 			WR: if (!u_wait) st <= FIN;                                                                                    // this write was accepted
 			NM0: st <= NM1;
 			NM1: begin nm_w0 <= m_rdata_w; st <= NM2; end
@@ -334,6 +342,7 @@ module intcode_sys #(
 			FE_N1: begin nm_cur <= kname ? (ei == 3'd0 ? sname0 : ei == 3'd1 ? sname1 : ei == 3'd2 ? sname2 : ei == 3'd3 ? sname3 : ei == 3'd4 ? sname4 : sname5) : m_rdata_w; st <= inhdr ? WO2 : FE_R; end      // STDIN, or the name from the store
 			FE_R: `FOP(3'd1, FE_C)
 			FE_C: begin
+				if (ei == 3'd0 && cur == FS_AT) dbg_w <= f_data;
 				if (ei == 3'd0 && (f_data == 32'd0 || f_data == 32'hffffffff)) begin          // a blank header: the end of the chain
 					fs_end <= cur; e_open <= 1'b0; `FOP(3'd3, FE_OPEN)
 				end else begin
@@ -363,9 +372,9 @@ module intcode_sys #(
 					else begin io_res <= {WIDTH{1'b0}}; st <= FIN; end
 				end else if (found && fany) begin
 					fl_base[fslot] <= f_dat; fl_pos[fslot] <= 24'd0; fl_len[fslot] <= f_ln; fl_open[fslot] <= 1'b1;
-					if (stdin_scan) begin stdin_fs <= {1'b0, 1'b1} + fslot; fsel <= {1'b0, 1'b1} + fslot; stdin_chk <= 1'b1; stdin_scan <= 1'b0; kname <= 1'b0; st <= GOT; end
+					if (stdin_scan) begin if (DEBUG_FS != 0) begin dbg_n <= 4'd10; dbg_sh <= dbg_w; dbg_f <= 1'b1; end stdin_fs <= {1'b0, 1'b1} + fslot; fsel <= {1'b0, 1'b1} + fslot; stdin_chk <= 1'b1; stdin_scan <= 1'b0; kname <= 1'b0; st <= GOT; end
 					else begin io_res <= {{(WIDTH-3){1'b0}}, 3'd5 + {1'b0, fslot}}; st <= FIN; end
-				end else if (stdin_scan) begin stdin_chk <= 1'b1; stdin_scan <= 1'b0; kname <= 1'b0; st <= GOT; end
+				end else if (stdin_scan) begin if (DEBUG_FS != 0) begin dbg_n <= 4'd10; dbg_sh <= dbg_w; dbg_f <= 1'b0; end stdin_chk <= 1'b1; stdin_scan <= 1'b0; kname <= 1'b0; st <= GOT; end
 				else st <= FE_NF;
 			end
 			FE_NF: begin
@@ -424,12 +433,16 @@ module intcode_sys #(
 			     else st <= CL1;
 			CL1: begin f_ln <= wp - (hdr + 24'd32); rs0 <= CL2; st <= SL0; end
 			CL2: begin wp <= wp + 24'd3; st <= CL3; end
-			CL3: begin fs_end <= {wp[23:2], 2'b00}; w_open <= 1'b0; wsel <= 1'b0; st <= cl_ret; end
+			CL3: begin fs_end <= {wp[23:2], 2'b00}; any_w <= 1'b1; w_open <= 1'b0; wsel <= 1'b0; st <= cl_ret; end
 			FIN: begin io_ack <= 1'b1; st <= IDLE; end
 			default: st <= IDLE;
 		endcase
 	end
 
+`ifdef TRACE_OPS
+	reg [5:0] st_q = 0; reg [31:0] cyc = 0;
+	always @(posedge clk) begin cyc <= cyc + 1; st_q <= st; if (st != st_q && st != FW) $display("st %0d op %0d fsel=%0d fret=%0d", st, op, fsel, fret); if (st == FW && cyc[7:0] == 0 && cyc > 3000000) $display("FW req=%b ack=%b bst=%0d fbusy=%b xfer=%b f_op=%0d cs=%b", f_req_t, f_ack_t, bst, fbusy, xfer, f_op, cs_q); end
+`endif
 `ifdef TRACE_RD
 	always @(posedge clk) if (st == RD && !rxf_empty) $write("%c%c", 8'h01, rxf[rxr]);
 `endif
