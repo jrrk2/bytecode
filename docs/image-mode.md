@@ -65,3 +65,12 @@ in the heap).  The loader writes the code section of an OCVM image from NFS or t
 globals in the staging RAM and tells the sequencer so with 0x1016 (the code length in words; the code length in 0x1010 is then 0), so an image
 may be longer than the staging RAM: a 75,064-word test program (300,724 bytes, `fpga/vc707-ethmin-sim/run_nfs.sh`) boots over NFS and runs code past word
 65,535.  Images that arrive by TFTP, serial, preload or as a raw `ocamlc` file still have to fit in the staging RAM.
+
+## Bootstrap, verified on the board (2026-10-09)
+
+`io/comp.ml` (265 KB) compiled by `ocamlc` is the stage-0 compiler.  Stage 1 is its compile of `comp.ml` into an image (`#image`), 314,188 bytes, 75,207
+code words (the host runner and the board agree to the byte).  The board boots stage 1 from NFS (`nfs(0,0)bytecode/stage6.img`: the loader streams the
+code into the 128K-word code RAM, spec24, no RAM disk), and stage 1 compiles `comp.ml` again, reading the source and writing the image over NFS
+(`#image nfs(0,0)bytecode/stage7.img nfs(0,0)bytecode/comp.ml`, 707 phrases): stage 2's image is identical to stage 1's.  That is the fixed point.
+It needed tail calls in the code generator (the self-compiled compiler's tail-recursive loops overflowed the stack) and the compiler's session
+globals to start above the image's own.  The collector's debug letters (`G`, `D`) still appear on the console during a compile.
