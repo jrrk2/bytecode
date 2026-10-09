@@ -53,12 +53,19 @@ let sd_init () =
     else 0
   end
 
-(* block blk (SDHC: a block number, 512-byte blocks, 24 bits here) into the buffer at I/O 0x2000; true if the data arrived and checked *)
-let sd_read blk =
-  sdw 7 1; sdw 8 512;
-  sd_start 17 (blk lsr 16) (blk land 0xFFFF) 0x35;
+(* n blocks (1..8: the buffer holds 4 KB) starting at block blk into the buffer at I/O 0x2000; true if the data arrived and checked.
+   Several blocks are one CMD18 with the count given first by CMD23 (the card stops itself); a card that refuses CMD23 gets a CMD12 after. *)
+let sd_xfer cmd blk n setting =
+  sdw 7 n; sdw 8 512;
+  let preset = n = 1 || (sd_cmd 23 0 n 1 && ((sdhi 0) land 0x40) = 0) in
+  sd_start cmd (blk lsr 16) (blk land 0xFFFF) setting;
   delay 3000;
-  sd_wait_bit 1 && sd_wait_bit 2 && (sdlo 5) land 64 <> 0
+  let ok = sd_wait_bit 1 && sd_wait_bit 2 in
+  if not preset then (let _ = sd_cmd 12 0 0 1 in ());
+  ok
+
+let sd_read_n blk n = sd_xfer (if n = 1 then 17 else 18) blk n 0x35 && (sdlo 5) land 64 <> 0
+let sd_read blk = sd_read_n blk 1
 
 let sd_byte i = io_read (0x2000 + i)
 
@@ -70,9 +77,7 @@ let rec sd_ready n =
 
 let sd_put i v = io_write (0x2000 + i) v
 
-(* the buffer at I/O 0x2000 (filled with sd_put) to block blk; true if the card took it (CMD24, then the host waits out the card's busy) *)
-let sd_write blk =
-  sdw 7 1; sdw 8 512;
-  sd_start 24 (blk lsr 16) (blk land 0xFFFF) 0x2D;
-  delay 3000;
-  sd_wait_bit 1 && sd_wait_bit 2 && sd_ready 1000
+(* the buffer at I/O 0x2000 (filled with sd_put) to n blocks from blk; true if the card took them (CMD24, or CMD25 after CMD23; the host waits out
+   the card's busy after each block, then the card is polled until it is ready for data) *)
+let sd_write_n blk n = sd_xfer (if n = 1 then 24 else 25) blk n 0x2D && sd_ready 1000
+let sd_write blk = sd_write_n blk 1

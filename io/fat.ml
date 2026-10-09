@@ -94,7 +94,8 @@ let fat_find name =
   done;
   !found
 
-(* copy the file whose 8.3 name is given into the RAM disk from byte offset off; its length, or -1 if it is not there or a block failed *)
+(* copy the file whose 8.3 name is given into the RAM disk from byte offset off; its length, or -1 if it is not there or a block failed.
+   A cluster goes in one multi-block transfer (up to 8 blocks at a time). *)
 external disk_set : int -> int -> int = "disk_set"
 external disk_get : int -> int = "disk_get"
 let fat_load name off =
@@ -103,13 +104,14 @@ let fat_load name off =
   while !ok && !pos < size && !c >= 2 && !c < 0x0FFFFFF8 do
     let s = ref 0 in
     while !ok && !s < !fat_spc && !pos < size do
-      if not (sd_read (clus_lba !c + !s)) then ok := false
+      let n = if !fat_spc - !s > 8 then 8 else !fat_spc - !s in
+      if not (sd_read_n (clus_lba !c + !s) n) then ok := false
       else begin
-        let n = if size - !pos < 512 then size - !pos else 512 in
-        for i = 0 to n - 1 do let _ = disk_set (off + !pos + i) (sd_byte i) in () done;
-        pos := !pos + n
+        let m = if size - !pos < 512 * n then size - !pos else 512 * n in
+        for i = 0 to m - 1 do let _ = disk_set (off + !pos + i) (sd_byte i) in () done;
+        pos := !pos + m
       end;
-      s := !s + 1
+      s := !s + n
     done;
     if !ok && !pos < size then c := fat_next !c
   done;
@@ -120,22 +122,24 @@ let disk_sum off n =
   for i = 0 to n - 1 do a := (!a + disk_get (off + i)) mod 65521; b := (!b + !a) mod 65521 done;
   !b * 65536 + !a
 
-(* write RAM-disk bytes from offset off over the existing file of that name (its size does not change); true if every block was taken *)
 let fat_pos = ref 0   (* where a failed fat_store stopped *)
+
+(* write RAM-disk bytes from offset off over the existing file of that name (its size does not change); true if every block was taken *)
 let fat_store name off =
   let c = ref (fat_find name) in
   let size = !fat_size and pos = ref 0 and ok = ref (!c >= 2) in
   while !ok && !pos < size && !c >= 2 && !c < 0x0FFFFFF8 do
     let s = ref 0 in
     while !ok && !s < !fat_spc && !pos < size do
-      let n = if size - !pos < 512 then size - !pos else 512 in
-      if n < 512 && not (sd_read (clus_lba !c + !s)) then ok := false
+      let n = if !fat_spc - !s > 8 then 8 else !fat_spc - !s in
+      let m = if size - !pos < 512 * n then size - !pos else 512 * n in
+      if m < 512 * n && not (sd_read_n (clus_lba !c + !s) n) then ok := false      (* a partial last block keeps the rest of the card's data *)
       else begin
-        for i = 0 to n - 1 do sd_put i (disk_get (off + !pos + i)) done;
-        if not (sd_write (clus_lba !c + !s)) then ok := false;
-        pos := !pos + n; fat_pos := !pos
+        for i = 0 to m - 1 do sd_put i (disk_get (off + !pos + i)) done;
+        if not (sd_write_n (clus_lba !c + !s) n) then ok := false;
+        pos := !pos + m; fat_pos := !pos
       end;
-      s := !s + 1
+      s := !s + n
     done;
     if !ok && !pos < size then c := fat_next !c
   done;
