@@ -149,5 +149,5 @@ a 280 KB image) otherwise fills.  The SD driver and FAT reader are part of the c
 the same files are still there to `run_file` for the manual functions.
 
 Checked on the board: `read_file "nfs(0,0)maths.ml"` returns the file (2028 bytes, 28 ms) and `run_file "nfs(0,0)maths.ml"` compiles it in
-place from the server through the 512-byte channel blocks.  Not yet run on the board: `sd(0,0)` names, and NFS output through
-`close_out` (written, only compiled on the host).
+place from the server through the 512-byte channel blocks.  `write_file "nfs(0,0)bytecode/hello.txt" "hello from the board"` created the file on the server.  Not yet run on the board: `sd(0,0)`
+names, and the streaming output channel on a long file.
