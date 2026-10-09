@@ -76,6 +76,24 @@ place.  To finish:
 * Then shrink the RAM disk to a scratch size (or none) and spend the tiles: code RAM to 128K words (64 more tiles), a bigger heap, deeper
   stack, URAM-style big cache for the DDR3 disk.  Keep a small RAM disk for the preloaded-bitstream case (`tools/preload.py`).
 
+## Standard library names (String.length, Sys.readdir ...)
+Today's names are flat and ad hoc (`string_length`, `string_get`, `create_bytes`, `files`, `disk_get`); the channel functions (`open_in`, `input_line`, `close_in`,
+`output_string`, `read_file`) are already the standard ones.  The lexer treats `.` as punctuation, so `String.length` is three tokens, and there are no modules.  The
+VM implements about 30 C primitives (string and bytes length, get, set, create and equality; arrays; floats; a little output) and not `caml_blit_string`,
+`caml_make_vect`, `caml_fill_bytes`, the `caml_compare` family or `caml_format_int`, so the real `Stdlib` cannot be linked: what is missing is written in ML.
+Steps:
+1. **Qualified names.**  The lexer reads `Upper.lower` as one identifier; a table of aliases maps it to the existing internals (`String.length`, `String.get`,
+   `Bytes.create/get/set/to_string`, `Char.code/chr`, `Array.get/set/length`, `Sys.file_exists`, ...).  The old flat names stay as aliases.  No code cost beyond the lexer.
+2. **The missing functions as an ML library.**  `String.sub/concat/index`, `List.length/rev/map/iter/fold_left/nth/mem`, `Array.make/sub/blit`, `print_string/print_int/print_endline`,
+   and `Sys.readdir`, which needs a builtin returning a `string array` and a directory read per device (the RAM disk's file table, NFS READDIR, a FAT directory scan; `"/"`
+   could list the mount points).  Loaded as ML text from `/nfs/lib` or the card, or compiled into the image (a few thousand words self-compiled).  `Printf`: only `printf` with
+   `%d %s %c` unless more is wanted.
+3. **Simple modules.**  `module M = struct ... end` and `open M` as name prefixing (each name declared inside becomes `M.name`; a reference inside resolves to the module's own earlier
+   names first); no signatures or functors.  Lets the library be written as modules.
+4. **(Optional) migrate `comp.ml` to the standard style.**  It is also compiled by `ocamlc -nopervasives`, so it can use only what both accept: with step 3 it can begin with
+   `module String = struct external length : string -> int = "%string_length" ... end` and use `String.length` throughout.  A scripted edit, checked by the identical-image comparison.
+Do 1 and 2 first (visible to users, `comp.ml` unchanged), 3 if real modules are wanted, 4 only if the compiler's own source should be in standard style.
+
 ## Fewer memories
 A design with many special-purpose RAMs is hard to reason about: each one needs deciding whether it is necessary, and each is a special case in the
 software.  In the spec23 build (675 RAMB36 tiles): heap 288 (two semispaces), RAM disk 128, program code 64, staging 64, stack 36, loader code ROM 32
