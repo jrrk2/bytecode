@@ -3730,7 +3730,7 @@ let run_phrase_body e name =
   end
   else if !doorway < 0 then Err "the doorway was not found"
   else begin
-    if here () >= 65500 then Err "out of code space"       (* the code window is 64K words *)
+    if here () >= 131000 then Err "out of code space"      (* the code window is 128K words *)
     else begin
     io_write prog_words_reg (here ());
     code_wr !doorway op_branch;
