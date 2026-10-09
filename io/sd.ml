@@ -1,7 +1,7 @@
 (* SD card driver for the lowRISC host in fpga/vc707-ethmin/sd_wrap.v, written for io/comp.ml's dialect.
    Registers are 32 bits wide and an int here has 31, so every register is written and read as two 16-bit halves; a command's
    argument is likewise given as two halves (the host-capacity bit of ACMD41 is bit 30 and does not survive as one number).
-   Registers (index n at I/O 0x1100 + 2n, high half at +1): writes 0 align, 1 clock divider (SD clock = clk / (2 (n + 1))),
+   Registers (index n at I/O 0x1100 + 2n, high half at +1): writes 0 align, 1 clock divider (SD clock = clk / (2 (n + 1)): 400 kHz at 77 for the card's start-up, 15.6 MHz at 1 once it is initialised),
    2 argument, 3 command, 4 setting (data start: +8 write, +0x10 read, +0x20 four bits), 5 start, 6 run flags, 7 block count, 8 block size, 9 timeout;
    reads 0..3 response, 5 status, 12 card detect (1 = present on the VC707), 14 {finish_data, finish_cmd}.  The 4 KB block buffer is at I/O 0x2000.
    sd_write puts a block back; nothing else here writes the card. *)
@@ -50,7 +50,7 @@ let sd_init () =
     sd_rca := sdhi 0;
     if not (sd_cmd 7 !sd_rca 0 1) then 7
     else if not (sd_cmd 55 !sd_rca 0 1) || not (sd_cmd 6 0 2 1) then 8      (* ACMD6: four data lines from here on *)
-    else 0
+    else begin sdw 1 1; 0 end                                                (* then 15.6 MHz, under the 25 MHz of default speed *)
   end
 
 (* n blocks (1..8: the buffer holds 4 KB) starting at block blk into the buffer at I/O 0x2000; true if the data arrived and checked.
