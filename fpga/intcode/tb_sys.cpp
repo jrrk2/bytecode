@@ -6,15 +6,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <string>
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     uint64_t max = argc > 1 ? strtoull(argv[1], nullptr, 0) : 200000000ULL;
     const char *input = argc > 2 ? argv[2] : "";
+    std::string filetext;                                      // INPUT_FILE: the text to type, from a file (a program image is long)
+    if (const char *fn = getenv("INPUT_FILE")) { FILE *f = fopen(fn, "rb"); int c; while (f && (c = fgetc(f)) != EOF) filetext += (char)c; if (f) fclose(f); input = filetext.c_str(); }
     int div = getenv("CLK_DIV") ? atoi(getenv("CLK_DIV")) : 217;
     Vintcode_sys *top = new Vintcode_sys;
     top->uart_rx_in = 1; top->clk = 0;
     // the receiver: bits of the typed text, 10 per byte
-    size_t ni = strlen(input), ib = 0; int ibit = -1, icnt = 0; uint32_t ibyte = 0;
+    size_t ni = getenv("INPUT_FILE") ? filetext.size() : strlen(input), ib = 0; int ibit = -1, icnt = 0; uint32_t ibyte = 0;
     // the transmitter: sample the line in the middle of each bit
     int ts = -1, tcnt = 0, tbyte = 0, last = 1;
     uint64_t clocks = 0; unsigned chars = 0;

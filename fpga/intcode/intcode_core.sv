@@ -18,6 +18,7 @@ module intcode_core #(
 	input  wire             clk,
 	input  wire             rst,
 	input  wire [WIDTH-1:0] init_c, init_p, init_g,      // the registers as the loader leaves them
+	input  wire             boot_store,                  // 1: take C, P and G from the store at reset instead (words BOOT, BOOT+1, BOOT+2)
 	output reg  [AW-1:0]    m_addr,
 	output reg  [WIDTH-1:0] m_wdata,
 	output reg              m_we,
@@ -33,6 +34,7 @@ module intcode_core #(
 	output reg  [WIDTH-1:0] result
 );
 	localparam BPW = WIDTH / 8;                           // characters to a word
+	localparam [AW-1:0] BOOT = 16'h7FFD;                  // 32765: C, P, G, in the top three words of a 32K-word store
 
 	localparam [5:0]
 		S_F0 = 0, S_F1 = 1, S_F2 = 2, S_F3 = 3, S_AD = 4, S_IND = 5, S_IND2 = 6, S_EX = 7,
@@ -43,7 +45,8 @@ module intcode_core #(
 		S_GB0 = 25,                                                           // getbyte
 		S_PB0 = 26, S_PB1 = 27, S_PB2 = 28,                                    // putbyte
 		S_IO = 29, S_IOW = 30, S_HALT = 31,
-		S_MUL = 32, S_DIV0 = 33, S_DIV = 34;                                   // serial multiply and divide, a bit a clock
+		S_MUL = 32, S_DIV0 = 33, S_DIV = 34,
+		S_B0 = 35, S_B1 = 36, S_B2 = 37, S_B3 = 38;                            // reading the start registers from the store                                   // serial multiply and divide, a bit a clock
 
 	reg [5:0]       st;
 	reg [WIDTH-1:0] T2;
@@ -94,6 +97,9 @@ module intcode_core #(
 		io_req = 1'b0; io_op = D[5:0]; io_a = A;
 		case (st)
 			S_F0:  begin m_addr = C[AW-1:0]; m_re = 1'b1; end
+			S_B0:  begin m_addr = BOOT; m_re = 1'b1; end
+			S_B1:  begin m_addr = BOOT + 1'b1; m_re = 1'b1; end
+			S_B2:  begin m_addr = BOOT + 2; m_re = 1'b1; end
 			S_F2:  begin m_addr = C[AW-1:0]; m_re = 1'b1; end
 			S_IND: begin m_addr = D[AW-1:0]; m_re = 1'b1; end
 			S_EX: case (F)
@@ -131,10 +137,15 @@ module intcode_core #(
 	always @(posedge clk) begin
 		instr_done <= 1'b0;
 		if (rst) begin
-			st <= S_F0; halted <= 1'b0; result <= 0;
+			st <= boot_store ? S_B0 : S_F0; halted <= 1'b0; result <= 0;
 			A <= 0; B <= 0; D <= 0; W <= 0; T0 <= 0; T1 <= 0; T2 <= 0; tword <= 0; cnt <= 0;
 			C <= init_c; P <= init_p; G <= init_g;
 		end else case (st)
+			// ---- start-up from the store: C, P, G from three words ----
+			S_B0: st <= S_B1;
+			S_B1: begin C <= m_rdata; st <= S_B2; end
+			S_B2: begin P <= m_rdata; st <= S_B3; end
+			S_B3: begin G <= m_rdata; st <= S_F0; end
 			// ---- fetch: W = M[C++]; D = the address field, or the next word if the D flag is set ----
 			S_F0: st <= S_F1;
 			S_F1: begin

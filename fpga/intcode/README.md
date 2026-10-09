@@ -68,6 +68,25 @@ console (so a program that opens files, such as the compiler, does not run here 
   halts after one line, so it needs a reset (or a UF2 copy) for another.
 * At 25 MHz and 5.6 clocks an instruction the machine does about 4.5 MIPS; the bootstrap's 25.6 M instructions would take about 6 s a generation.
 
+## Changing the program without a rebuild (2026-10-09)
+
+The store is the initial contents of 32 RAMB36s, so a new program is a rewrite of their `INIT_nn` lines in the routed design's FASM; placement and routing are
+untouched.  `fasm_patch_mem.py base.fasm placement.json image.hex out.fasm` does it.  The mapping was derived from the netlist and checked against the FASM for three
+cells: the RAM `sys.mem.0.K` holds bit K of the 32K-word store; its tile's `RAMB18_Y0` holds the even addresses and `RAMB18_Y1` the odd ones, 64 `INIT` rows of 256
+bits each, address 0 at the right-hand end of the string.  Self-test: patching the base with its own image reproduces its FASM byte for byte.  The start registers C, P and
+G are no longer constants in the logic: with `boot_store` the core reads them at reset from the top three words of the store (32765..32767), so they patch with the rest.
+
+    fpga/intcode/sonata_build.sh prog.int ~/bytecode-work/sonata/base      # once: synthesis, place and route (about 70 s)
+    fpga/intcode/patch_sonata.sh other.int                                 # any later program: assemble, patch, convert, copy to /mnt/sonata, sync (about 26 s)
+
+`intcode_send.py` is a Python port of icint's assembler (checked word for word against the C one on five programs, including the 10,158-word compiler front end) and
+also writes the store image.  Checked on the board: the base held an echo that prints a banner on start; `patch_sonata.sh echo3.int` replaced it with a program that waits
+for a key and then prints `PATCHED VIA FASM`, and typed text came back in capitals.  The convert step dominates the 26 s (the UF2 is the whole 4.4 MB bitstream).
+
+Two other routes, not built: `loader.int` is a 121-word UART loader (assembled at 26000, `W aaaaaaaa dddddddd` and `G pppppppp` commands) with `intcode_send.py --port`
+as the sender, tested in the assembler but not yet in the system simulation; and reading the program at reset from the Sonata's software SPI flash (pins D10 cs, A8 clk,
+C11/C10/A10/A9 data), written by dropping a small UF2 on the SONATA drive with no bitstream change at all.
+
 ## Not done
 
 * WIDTH 16.  The shipped INTCODE has the 32-bit word baked in (four characters to a word in `C` constants and in the library's byte routines; `WORDSIZE 32`

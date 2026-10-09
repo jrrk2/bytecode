@@ -93,22 +93,26 @@ int main(int argc, char **argv) {
     fp = fopen(argv[1], "r");
     if (!fp) { fprintf(stderr, "%s: Can't open\n", argv[1]); return 0; }
     M = (int *)calloc(STORE, sizeof(int));
-    G = MGLOB; P = MPROG;
-    M[P++] = LIG1; M[P++] = K2; M[P++] = X22;
+    // INTCODE_BASE=n assembles the program at word n with no start-up stub: the loader (loader.int) lives high in the store, out of the way of what it loads
+    const char *bs = getenv("INTCODE_BASE");
+    int base = bs ? atoi(bs) : MPROG;
+    G = MGLOB; P = base;
+    if (!bs) { M[P++] = LIG1; M[P++] = K2; M[P++] = X22; }
     initio();
     printf("INTCODE SYSTEM ENTERED\n");
     assemble();
     fclose(fp);
-    printf("\nPROGRAM SIZE = %d\n", P - MPROG);
+    printf("\nPROGRAM SIZE = %d\n", P - base);
     if (const char *dump = getenv("INTCODE_DUMP")) {          // the loaded store as a $readmemh file, and the registers the loader leaves
         char path[512];
         snprintf(path, sizeof path, "%s/image.hex", dump);
         FILE *f = fopen(path, "w");
+        M[32765] = base; M[32766] = P; M[32767] = G;               // the start registers, where intcode_core reads them with boot_store
         for (int i = 0; i < 32768; i++) fprintf(f, "%08x\n", (unsigned)M[i]);
         fclose(f);
         snprintf(path, sizeof path, "%s/image.vh", dump);
         f = fopen(path, "w");
-        fprintf(f, "`define INIT_C %d\n`define INIT_P %d\n`define INIT_G %d\n", MPROG, P, G);
+        fprintf(f, "`define INIT_C %d\n`define INIT_P %d\n`define INIT_G %d\n", base, P, G);
         fclose(f);
         fprintf(stderr, "store image dumped to %s\n", dump);
         return 0;
@@ -116,7 +120,7 @@ int main(int argc, char **argv) {
 
     Vintcode_core *top = new Vintcode_core;
     top->rst = 1;
-    top->init_c = MPROG; top->init_p = P; top->init_g = G;
+    top->init_c = base; top->init_p = P; top->init_g = G; top->boot_store = 0;
     top->m_rdata = 0; top->io_ack = 0; top->io_res = 0; top->clk = 0;
     for (int i = 0; i < 4; i++) { top->clk = 0; top->eval(); top->clk = 1; top->eval(); }
     top->rst = 0; top->clk = 0; top->eval();

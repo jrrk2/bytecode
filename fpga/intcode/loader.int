@@ -1,0 +1,33 @@
+/ INTCODE UART loader.  Assembled high in the store (INTCODE_BASE=26000) so that what it loads can occupy 0..25999.
+/ It reads commands from the console, white space between them ignored:
+/   W aaaaaaaa dddddddd     store the word d (8 hex digits) at address a (8 hex digits)
+/   G pppppppp              P := p and jump to word 402, where a program's start-up stub is (load and run it)
+/ No library, no subroutines: the operate codes X26 (read a character) and X27 (write one) do the I/O, so overwriting the low store
+/ (the program's globals at 1.., its stub at 402..) cannot disturb it.  The cells are 1 V, 2 N, 3 PH, 4 AD, 6 C, 7 D.
+ L0 SL3
+ L76 X27 L79 X27 L65 X27 L68 X27 L10 X27
+10 X26 SL6
+ LIL6 L87 X10 TL20
+ LIL6 L71 X10 TL30
+ JL10
+20 L0 SL3 JL40
+30 L2 SL3 JL40
+40 L0 SL1 L8 SL2
+41 X26 SL6
+ LIL6 L15 X18 SL7
+ LIL6 L64 X14 FL42
+ LIL7 L9 X8 SL7
+42 LIL1 L4 X16 LIL7 X19 SL1
+ LIL2 L1 X9 SL2
+ LIL2 TL41
+ LIL3 FL50
+ LIL3 L1 X10 TL60
+ L402 LIL1 X32
+50 LIL1 SL4 L1 SL3 JL40
+60 LIL1 SIL4 JL10
+1 D0
+2 D0
+3 D0
+4 D0
+6 D0
+7 D0

@@ -13,7 +13,6 @@ module intcode_sys #(
 	output wire       uart_tx_out,
 	output wire [7:0] led
 );
-`include "image.vh"
 	reg [3:0] rcnt = 4'd0;
 	wire rst = (rcnt != 4'hf);
 	always @(posedge clk) if (rcnt != 4'hf) rcnt <= rcnt + 4'd1;
@@ -28,7 +27,7 @@ module intcode_sys #(
 	reg  [WIDTH-1:0] io_res;
 
 	intcode_core #(.WIDTH(WIDTH), .AW(16)) core (
-		.clk(clk), .rst(rst), .init_c(`INIT_C), .init_p(`INIT_P), .init_g(`INIT_G),
+		.clk(clk), .rst(rst), .init_c(32'd0), .init_p(32'd0), .init_g(32'd0), .boot_store(1'b1),   // C, P and G come from the store (image.hex words 32765..32767)
 		.m_addr(m_addr), .m_wdata(m_wdata), .m_we(m_we), .m_re(m_re), .m_rdata(m_rdata_w),
 		.io_req(io_req), .io_op(io_op), .io_a(io_a), .io_ack(io_ack), .io_res(io_res),
 		.instr_done(instr_done), .halted(halted), .result(result));
