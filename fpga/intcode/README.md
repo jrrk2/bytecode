@@ -60,8 +60,12 @@ console (so a program that opens files, such as the compiler, does not run here 
   compiled with the kit's own compiler (`echo.b`) turns `hello sonata` typed at the console into `HELLO SONATA`.  Two bugs found there, not in the core: simpleuart
   holds the bus (`wait`) while it is busy, so the write strobe has to be held until accepted, not pulsed; and its bit period is the divider plus 2 clocks.
 * Open flow: `sonata_build.sh prog.int` (yosys, nextpnr-himbaechel, prjxray, the UF2 writer): 32-bit system 2,070 LUTs, 476 flip-flops, 176 CARRY4, 32 RAMB36 of 75;
-  `router2` routes it and meets 25 MHz (105.9 MHz post-route); the Sonata example's README says the 25 MHz clock path needs `router1`, which was still running when this
-  was written.  The UF2 for slot 1 is 4.4 MB (8,564 blocks); other slots are the same bits at 0x10000000 and 0x20000000.  Not yet loaded on a board.
+  `router2` routes it and meets 25 MHz (105.9 MHz post-route).  (The Sonata example's README says the 25 MHz clock path needs `router1`; with this build
+  `router2` places the clock buffer on its dedicated routing and the design runs, so that note does not apply here.)  The UF2 for slot 1 is 4.4 MB (8,564 blocks);
+  other slots are the same bits at 0x10000000 and 0x20000000.
+* **On the board** (2026-10-09, UF2 copied to the SONATA drive, address 0): the heartbeat LED blinks, and a line typed at UART 0 (`/dev/ttyUSB5` here: the third
+  interface of the board's FTDI bridge, C17/D18 are `ser0` in the Sonata pin file, 115200 8N1) comes back in capitals: `hello sonata` -> `HELLO SONATA`.  The echo program
+  halts after one line, so it needs a reset (or a UF2 copy) for another.
 * At 25 MHz and 5.6 clocks an instruction the machine does about 4.5 MIPS; the bootstrap's 25.6 M instructions would take about 6 s a generation.
 
 ## Not done
