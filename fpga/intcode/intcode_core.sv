@@ -42,9 +42,13 @@ module intcode_core #(
 		S_C0 = 19, S_C1 = 20, S_C2 = 21, S_C3 = 22, S_C4 = 23, S_C5 = 24,      // X35: call with a new frame
 		S_GB0 = 25,                                                           // getbyte
 		S_PB0 = 26, S_PB1 = 27, S_PB2 = 28,                                    // putbyte
-		S_IO = 29, S_IOW = 30, S_HALT = 31;
+		S_IO = 29, S_IOW = 30, S_HALT = 31,
+		S_MUL = 32, S_DIV0 = 33, S_DIV = 34;                                   // serial multiply and divide, a bit a clock
 
 	reg [5:0]       st;
+	reg [WIDTH-1:0] T2;
+	reg [6:0]       cnt;
+	reg             negq, negr, dmod;
 	reg [WIDTH-1:0] A, B, C, D, P, G, W;
 	reg [WIDTH-1:0] T0, T1;                               // scratch for the multi-word operate codes
 
@@ -61,9 +65,6 @@ module intcode_core #(
 		case (D[5:0])
 			2:  xres = -A;
 			3:  xres = ~A;
-			5:  xres = B * A;
-			6:  xres = (A == 0) ? {WIDTH{1'b0}} : $signed(sB / sA);
-			7:  xres = (A == 0) ? {WIDTH{1'b0}} : $signed(sB % sA);
 			8:  xres = B + A;
 			9:  xres = B - A;
 			10: xres = (B == A)    ? TRUE_ : 0;
@@ -131,7 +132,7 @@ module intcode_core #(
 		instr_done <= 1'b0;
 		if (rst) begin
 			st <= S_F0; halted <= 1'b0; result <= 0;
-			A <= 0; B <= 0; D <= 0; W <= 0; T0 <= 0; T1 <= 0; tword <= 0;
+			A <= 0; B <= 0; D <= 0; W <= 0; T0 <= 0; T1 <= 0; T2 <= 0; tword <= 0; cnt <= 0;
 			C <= init_c; P <= init_p; G <= init_g;
 		end else case (st)
 			// ---- fetch: W = M[C++]; D = the address field, or the next word if the D flag is set ----
@@ -165,6 +166,18 @@ module intcode_core #(
 					3'd7: begin
 						if (xvalid) A <= xres;
 						else case (D[5:0])
+							5:  begin T0 <= B; T1 <= 0; cnt <= 0; st <= S_MUL; instr_done <= 1'b0; end
+							6, 7: begin
+								instr_done <= 1'b0;
+								if (A == 0) begin A <= 0; instr_done <= 1'b1; end     // no divide by zero: the interpreter's undefined case gives 0 here
+								else begin
+									T1 <= sB[WIDTH-1] ? -B : B;      // |dividend|, which becomes the quotient
+									T0 <= sA[WIDTH-1] ? -A : A;      // |divisor|
+									T2 <= 0; cnt <= 0;
+									negq <= sB[WIDTH-1] ^ sA[WIDTH-1]; negr <= sB[WIDTH-1]; dmod <= (D[5:0] == 7);
+									st <= S_DIV;
+								end
+							end
 							1:  begin st <= S_X1;  instr_done <= 1'b0; end
 							4:  begin st <= S_X4A; instr_done <= 1'b0; end
 							22: begin halted <= 1'b1; result <= 0; st <= S_HALT; end
@@ -212,6 +225,26 @@ module intcode_core #(
 			S_PB0: begin T0 <= m_rdata; st <= S_PB1; end
 			S_PB1: begin tword <= (m_rdata & ~bmask) | (({{(WIDTH-8){1'b0}}, T0[7:0]}) << (8 * bm)); st <= S_PB2; end
 			S_PB2: begin instr_done <= 1'b1; st <= S_F0; end
+			// ---- X5: A = B * A, shift and add: T0 the multiplicand shifting left, A the multiplier shifting right, T1 the sum ----
+			S_MUL: begin
+				if (cnt == WIDTH - 1) begin A <= T1 + (A[0] ? T0 : {WIDTH{1'b0}}); instr_done <= 1'b1; st <= S_F0; end
+				else begin T1 <= T1 + (A[0] ? T0 : {WIDTH{1'b0}}); T0 <= T0 << 1; A <= A >> 1; cnt <= cnt + 1; end
+			end
+			// ---- X6 / X7: A = B / A or B % A, restoring division of the magnitudes, a bit a clock; T1 the dividend turning into the quotient,
+			//      T2 the remainder, T0 the divisor.  Quotient and remainder as C gives them: truncated toward zero, remainder with the dividend's sign.
+			S_DIV: begin
+				if ({T2[WIDTH-2:0], T1[WIDTH-1]} >= T0) begin
+					T2 <= {T2[WIDTH-2:0], T1[WIDTH-1]} - T0; T1 <= {T1[WIDTH-2:0], 1'b1};
+				end else begin
+					T2 <= {T2[WIDTH-2:0], T1[WIDTH-1]};      T1 <= {T1[WIDTH-2:0], 1'b0};
+				end
+				cnt <= cnt + 1;
+				if (cnt == WIDTH - 1) st <= S_DIV0;
+			end
+			S_DIV0: begin
+				A <= dmod ? (negr ? -T2 : T2) : (negq ? -T1 : T1);
+				instr_done <= 1'b1; st <= S_F0;
+			end
 			// ---- stream operations: one request, one answer ----
 			S_IO:  st <= S_IOW;
 			S_IOW: if (io_ack) begin

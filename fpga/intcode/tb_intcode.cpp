@@ -100,6 +100,19 @@ int main(int argc, char **argv) {
     assemble();
     fclose(fp);
     printf("\nPROGRAM SIZE = %d\n", P - MPROG);
+    if (const char *dump = getenv("INTCODE_DUMP")) {          // the loaded store as a $readmemh file, and the registers the loader leaves
+        char path[512];
+        snprintf(path, sizeof path, "%s/image.hex", dump);
+        FILE *f = fopen(path, "w");
+        for (int i = 0; i < 32768; i++) fprintf(f, "%08x\n", (unsigned)M[i]);
+        fclose(f);
+        snprintf(path, sizeof path, "%s/image.vh", dump);
+        f = fopen(path, "w");
+        fprintf(f, "`define INIT_C %d\n`define INIT_P %d\n`define INIT_G %d\n", MPROG, P, G);
+        fclose(f);
+        fprintf(stderr, "store image dumped to %s\n", dump);
+        return 0;
+    }
 
     Vintcode_core *top = new Vintcode_core;
     top->rst = 1;
