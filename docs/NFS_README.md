@@ -108,3 +108,15 @@ same text as the REPL's: `io/nfs.ml`, spliced into both `io/comp.ml` and `io/net
 it after editing `io/nfs.ml`; `--check` says whether the copies are current).  Neither program can call into the other:
 the loader is a separate code bank and a loaded image replaces the heap and globals.  A path may have several components
 (`dir/dir/file`), each looked up in turn.  Boot files are copied into the export, not linked (a symbolic link cannot be read).
+
+## Booting with nothing on the network
+
+`tools/preload.py` sets the initial contents of the staging RAM and the RAM disk in a built bitstream (no rebuild: Vivado's
+`updatemem`, with the tile table `out/ram_slices.txt`).  The loader looks at the end of the staging RAM first: "PREL" at
+0x3FFF0, then the image length in three bytes, and the image from offset 0; if they check out it boots that, before DHCP
+or NFS (hold a button to skip it).  So
+
+    python3 tools/loader_update.py --bit B.bit --cells out/ram_cells.txt --program program.hex --data data.hex --out L.bit
+    python3 tools/preload.py --bit L.bit --slices out/ram_slices.txt --out P.bit stage=stage.bin disk=disk.img
+
+gives a bitstream that starts the compiler, with its source files on the RAM disk, from power-up.

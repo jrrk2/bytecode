@@ -1203,6 +1203,19 @@ let serial_window () =
     if io_read uart_rx = 1 then serial_boot ()
   done
 
+(* ---- an image already in the staging RAM when the board starts ----
+   tools/preload.py can set a block RAM's initial contents in a built bitstream, so the staging RAM can hold a program from
+   power-up: the image from offset 0, and at 0x3FFF0 "PREL" and its length (3 bytes, little-endian).  The loader boots it before
+   it looks at the network.  A button held down skips it, and so does an image that does not check out. *)
+let preload_at = 0x3FFF0
+let try_preload () =
+  if byte preload_at = 0x50 && byte (preload_at + 1) = 0x52 && byte (preload_at + 2) = 0x45 && byte (preload_at + 3) = 0x4C
+     && io_read buttons land 0x1F = 0 then begin
+    img_len := small (preload_at + 4);
+    uart_puts "boot: preloaded image, "; uart_dec !img_len; uart_puts " bytes\n";
+    check_and_boot ()
+  end
+
 let () =
   io_write leds 1;
   uart_puts "netboot (OCaml processor): build ";
@@ -1211,6 +1224,7 @@ let () =
   uart_hex16 (io_read eth_status_phy);
   uart_putc '\n';
   serial_window ();
+  try_preload ();
   let pkts = ref 0 in
   while true do
     dhcp_tick ();

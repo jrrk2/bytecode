@@ -72,4 +72,10 @@ foreach c [get_cells -hier -filter {REF_NAME =~ RAMB*}] {
     puts $fp "[get_property NAME $c] [get_property LOC $c] [get_property READ_WIDTH_A $c] [get_property REF_NAME $c]"
 }
 close $fp
+# and which bits and addresses of its RAM each tile holds (tools/preload.py sets inferred RAMs' initial contents with it)
+set fp [open out/ram_slices.txt w]
+foreach c [get_cells -hier -filter {REF_NAME =~ RAMB*}] {
+    puts $fp "[get_property NAME $c] [get_property LOC $c] [get_property REF_NAME $c] [get_property RAM_SLICE_BEGIN $c] [get_property RAM_SLICE_END $c] [get_property RAM_ADDR_BEGIN $c] [get_property RAM_ADDR_END $c]"
+}
+close $fp
 puts "ETHMIN_VM_BUILD_DONE"
