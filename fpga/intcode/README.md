@@ -17,7 +17,7 @@ icint's banner and its "EXECUTION CYCLES", so its output can be diffed against `
   new `st` and `cg` (generation 1), which compile the four sources again, and those results into generation 2.  The INTCODE and OCODE of all four sources are
   identical in all three generations (63,657 bytes of INTCODE): a fixed point.  Three of the four equal the kit's own `blib.i syn.i trn.i`; `cg.i` differs only
   in the code generator's work-vector size, which is a manifest in `CGHDR` (8000 in the sources as shipped, 4000 in the kit's checked-in `cg.i`).
-* Cost: 25.6 M instructions per generation (syntax and translation 21 M, code generation 9 M of the three-phase total across the four files), 139.5 M clocks,
+* Cost: 25.6 M instructions per generation (syntax and translation 18.3 M, code generation 7.3 M, over the four files), 139.5 M clocks,
   so **5.45 clocks per instruction** with this simple state machine (a two-clock fetch from a synchronous store, then the address stage, then execute).
   At 100 MHz that is 18 MIPS and 1.4 s for a generation; at 62.5 MHz 2.2 s.  Overlapping the next fetch with the execute would bring it towards 3 clocks.
 
