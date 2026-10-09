@@ -19,6 +19,9 @@ int main(int argc, char **argv) {
     std::string flash;
     if (const char *fn = getenv("FLASH_FILE")) { FILE *f = fopen(fn, "rb"); int c; while (f && (c = fgetc(f)) != EOF) flash += (char)c; if (f) fclose(f); }
     uint32_t flash_base = getenv("FLASH_BASE") ? strtoul(getenv("FLASH_BASE"), nullptr, 0) : 0xA00000;
+    // the flash is writable: from flash_base to the 16 MiB mark, ones where nothing was loaded; WREN, page program, sector erase and the status register are modelled
+    if (flash.size() < 0x1000000 - flash_base) flash.resize(0x1000000 - flash_base, (char)0xFF);
+    int f_wel = 0, f_busy = 0; unsigned f_nprog = 0, f_nerase = 0, f_polls = 0;
     int f_bits = 0, f_prev_clk = 0, f_miso = 1, f_cmd_seen[256] = {0}; uint32_t f_cmd = 0, f_addr = 0; unsigned f_bytes = 0;
     Vintcode_sys *top = new Vintcode_sys;
     top->uart_rx_in = 1; top->clk = 0; top->spi_miso = 1;
@@ -35,12 +38,34 @@ int main(int argc, char **argv) {
         // the flash slave
         {
             int cs_n = top->spi_cs_n, sck = top->spi_clk, mosi = top->spi_mosi;
-            if (cs_n) { f_bits = 0; f_cmd = 0; f_addr = 0; f_miso = 1; }
+            if (cs_n) {
+                if (f_bits >= 32 && f_cmd == 0x20 && f_wel) {                       // sector erase on the chip select rising
+                    uint32_t a = f_addr & ~0xFFFu; f_nerase++;
+                    for (uint32_t k = 0; k < 4096; k++) if (a + k >= flash_base && a + k - flash_base < flash.size()) flash[a + k - flash_base] = (char)0xFF;
+                    f_busy = 3;
+                }
+                if (f_bits >= 32 && f_cmd == 0x02 && f_wel) f_busy = 2;
+                if (f_bits >= 8 && (f_cmd == 0x02 || f_cmd == 0x20)) f_wel = 0;
+                f_bits = 0; f_cmd = 0; f_addr = 0; f_miso = 1;
+            }
             else {
                 if (sck && !f_prev_clk) {                                // rising edge: the master's bit, in
-                    if (f_bits < 8) { f_cmd = (f_cmd << 1) | mosi; if (f_bits == 7) f_cmd_seen[f_cmd & 255]++; }
-                    else if (f_bits < 32) f_addr = (f_addr << 1) | mosi;
+                    if (f_bits < 8) { f_cmd = (f_cmd << 1) | mosi; if (f_bits == 7) { f_cmd_seen[f_cmd & 255]++; if (f_cmd == 0x06) f_wel = 1; } }
+                    else if (f_bits < 32 && f_cmd != 0x05) f_addr = (f_addr << 1) | mosi;
+                    else if (f_cmd == 0x02 && f_bits >= 32) {                    // page program: each byte clears bits, within its page
+                        static uint32_t pb; pb = (pb << 1) | mosi;
+                        if ((f_bits - 32) % 8 == 7 && f_wel) {
+                            uint32_t n = (f_bits - 32) / 8, a = (f_addr & ~255u) | ((f_addr + n) & 255u);
+                            if (a >= flash_base && a - flash_base < flash.size()) flash[a - flash_base] &= (char)(pb & 255);
+                            f_nprog++;
+                        }
+                    }
                     f_bits++;
+                }
+                if (!sck && f_prev_clk && f_cmd == 0x05 && f_bits >= 8) {          // read status: bit 0 is busy, for a few polls
+                    if (f_bits == 8) { f_polls++; if (f_busy > 0) f_busy--; }
+                    f_miso = ((f_bits - 8) % 8 == 7) ? (f_busy > 0 ? 1 : 0) : 0;
+                    if (f_busy > 0 && (f_bits - 8) % 8 == 7) { }
                 }
                 if (!sck && f_prev_clk && f_bits >= 32 && f_cmd == 0x03) {  // falling edge in the data phase: the next bit, out
                     uint32_t bit = f_bits - 32, a = f_addr + bit / 8;
@@ -71,7 +96,8 @@ int main(int argc, char **argv) {
         if (getenv("TX_EDGES") && tx != last) fprintf(stderr, "%llu:%d ", (unsigned long long)clocks, tx);
         last = tx;
     }
-    fprintf(stderr, "\n[flash: reset %d%d, read %d, %u bytes]", f_cmd_seen[0x66], f_cmd_seen[0x99], f_cmd_seen[0x03], f_bytes);
+    fprintf(stderr, "\n[flash: reset %d%d, read %d, %u bytes, %u programmed bytes, %u erases, %u status polls]", f_cmd_seen[0x66], f_cmd_seen[0x99], f_cmd_seen[0x03], f_bytes, f_nprog, f_nerase, f_polls);
+    if (const char *fo = getenv("FLASH_OUT")) { FILE *f = fopen(fo, "wb"); if (f) { fwrite(flash.data(), 1, flash.size(), f); fclose(f); } }
     fprintf(stderr, "\n[%llu clocks, %u characters, %s, led=%02x]\n", (unsigned long long)clocks, chars, (top->led & 2) ? "halted" : "still running", (unsigned)top->led);
     delete top;
     return 0;
