@@ -4191,6 +4191,7 @@ let boot_file (nm : string) =
    from inside the builtin instead would re-enter the receive window under
    whatever delivered the command, which is exactly the hazard that made
    re-entrant output draining unsafe. *)
+(* >>> io/nfs.ml *)
 let nfs_lport = 1010            (* privileged: an export without "insecure" insists *)
 let pmap_port = 111
 let nfs_chunk = 1024
@@ -4201,6 +4202,13 @@ let rpc_nfs = 100003
 (* its own address and MAC: the boot server is not usually the file server *)
 let nfs_ip = [| 0; 0; 0; 0 |]
 let nfs_mac = [| 0; 0; 0; 0; 0; 0 |]
+
+(* where the file's bytes go, set by the host: begin (the file is found), room (bytes available), put (offset, byte),
+   finish (the length: false if it cannot be kept) *)
+let nfs_dest_begin = ref (fun (_u : int) -> ())
+let nfs_dest_room = ref (fun (_u : int) -> 0)
+let nfs_dest_put = ref (fun (_o : int) (_v : int) -> ())
+let nfs_dest_finish = ref (fun (_n : int) -> false)
 
 let xp = ref 42                 (* the write cursor into the TX window *)
 let rp = ref 0                  (* and the read cursor into the RX window *)
@@ -4215,13 +4223,16 @@ let xpad n =
   for i = 0 to pad - 1 do tx (!xp + n + i) 0 done;
   xp := !xp + n + pad
 
-let xstr s =
-  let n = string_length s in
+(* the characters a..b-1 of s, as an XDR string *)
+let xname s a b =
+  let n = b - a in
   x32 n;
-  for i = 0 to n - 1 do tx (!xp + i) (int_of_char (string_get s i)) done;
+  for i = 0 to n - 1 do tx (!xp + i) (int_of_char (string_get s (a + i))) done;
   xpad n
 
-(* the file handle mount gave us, and the one for the file itself *)
+let xstr s = xname s 0 (string_length s)
+
+(* the file handle mount gave us (then each directory on the way), and the one for the file itself *)
 let fh_root = create_bytes 64
 let fh_root_len = ref 0
 let fh_file = create_bytes 64
@@ -4308,10 +4319,17 @@ let nfs_tries = ref 0
 let mnt_port = ref 0
 let nfsd_port = ref 2049
 let nfs_off = ref 0              (* bytes taken so far *)
-let nfs_at = ref 0               (* where they are going on the disk *)
 let nfs_export = ref ""
-let nfs_file = ref ""
+let nfs_path = ref ""            (* "dir/dir/file" below the export *)
+let nfs_cs = ref 0               (* the component being looked up: nfs_path from nfs_cs to nfs_ce *)
+let nfs_ce = ref 0
 let nfs_result = ref (0 - 1)     (* -1 running, -2 failed, else the length *)
+
+let nfs_find_end () =
+  let e = ref !nfs_cs in
+  let n = string_length !nfs_path in
+  while !e < n && string_get !nfs_path !e <> '/' do e := !e + 1 done;
+  nfs_ce := !e
 
 let send_getport prog vers =
   rpc_call rpc_pmap 2 3;
@@ -4326,7 +4344,7 @@ let send_mnt () =
 let send_lookup () =
   rpc_call rpc_nfs 3 3;
   xfh fh_root !fh_root_len;
-  xstr !nfs_file;
+  xname !nfs_path !nfs_cs !nfs_ce;
   nfs_send !nfsd_port
 
 let send_read () =
@@ -4382,9 +4400,16 @@ let nfs_reply len =
     else begin
       fh_file_len := take_fh fh_file;
       if !fh_file_len = 0 then nfs_fail "bad handle"
-      else begin
+      else if !nfs_ce < string_length !nfs_path then begin
+        (* a directory on the way: it becomes the one to look in, and the next component is looked up *)
+        for i = 0 to 63 do bytes_set fh_root i (bytes_get fh_file i) done;
+        fh_root_len := !fh_file_len;
+        nfs_cs := !nfs_ce + 1;
+        nfs_find_end ();
+        send_lookup (); nfs_step ()
+      end else begin
         nfs_off := 0;
-        nfs_at := rfs_free ();
+        (!nfs_dest_begin) 0;
         nfs_state := nfs_reading; send_read (); nfs_step ()
       end
     end
@@ -4396,18 +4421,16 @@ let nfs_reply len =
       let _count = r32 () in
       let eof = r32 () in
       let n = r32 () in
-      if !nfs_at + !nfs_off + n > io_read disk_size_reg then
+      if !nfs_off + n > (!nfs_dest_room) 0 then
         nfs_fail "disk full"
       else begin
-        (* straight to the disk: no copy in staging, and nothing to move
-           afterwards -- the bytes are already where the file will live *)
         for i = 0 to n - 1 do
-          db_set (!nfs_at + !nfs_off + i) (rx (!rp + i))
+          (!nfs_dest_put) (!nfs_off + i) (rx (!rp + i))
         done;
         nfs_off := !nfs_off + n;
         if eof <> 0 || n = 0 then begin
           nfs_state := nfs_idle;
-          if rfs_commit !nfs_file !nfs_at !nfs_off < 0 then
+          if not_b ((!nfs_dest_finish) !nfs_off) then
             nfs_fail "disk full"
           else begin
             nfs_result := !nfs_off;
@@ -4443,6 +4466,25 @@ let nfs_arp_reply len =
     nfs_step ()
   end
 
+(* start fetching export + path, the server being nfs_ip; the host has checked it can *)
+let nfs_launch export path =
+  nfs_export := export; nfs_path := path;
+  nfs_cs := 0; nfs_find_end ();
+  nfs_result := 0 - 1;
+  nfs_state := nfs_arping;
+  nfs_arp_request ();
+  nfs_step ()
+(* <<< io/nfs.ml *)
+
+(* the file goes to the RAM disk, as a file of that name *)
+let nfs_at = ref 0               (* where its bytes are going on the disk *)
+let () =
+  nfs_dest_begin := (fun (_u : int) -> nfs_at := rfs_free ());
+  nfs_dest_room := (fun (_u : int) -> io_read disk_size_reg - !nfs_at);
+  (* straight to the disk: no copy in staging, and nothing to move afterwards -- the bytes are already where the file will live *)
+  nfs_dest_put := (fun (o : int) (v : int) -> db_set (!nfs_at + o) v);
+  nfs_dest_finish := (fun (n : int) -> rfs_commit !nfs_path !nfs_at n >= 0)
+
 (* what the language sees *)
 (* "192.168.1.106" as one argument: the compiler applies at most two at a
    time, so four octets could not be passed even though they would read
@@ -4472,11 +4514,7 @@ let nfs_start export f =
   else if string_length f > rfs_name_max then 0
   else begin
     let _ = rfs_ready () in
-    nfs_export := export; nfs_file := f;
-    nfs_result := 0 - 1;
-    nfs_state := nfs_arping;
-    nfs_arp_request ();
-    nfs_step ();
+    nfs_launch export f;
     1
   end
 

@@ -98,3 +98,13 @@ file appends a second copy and the newest name wins.
 Reading a large file back with `read_file` over UDP is cut to about 1400
 bytes by the reply buffer -- the file on the disk is whole, and `files`
 shows its real length.
+
+## The loader boots over NFS
+
+`io/netboot.ml` (the resident loader) fetches `vm.img` and, unless the RAM disk already holds a file system, `disk.img`
+from the export `/srv/nfs/vc707` on the boot server (the DIP switches' host number, or the DHCP siaddr), in the directory
+`bytecode/<mac>/` -- here `bytecode/02:00:00:4d:47:33/` -- and only if NFS gets no answer falls back to TFTP.  The client is the
+same text as the REPL's: `io/nfs.ml`, spliced into both `io/comp.ml` and `io/netboot.ml` by `tools/nfs_splice.py` (run
+it after editing `io/nfs.ml`; `--check` says whether the copies are current).  Neither program can call into the other:
+the loader is a separate code bank and a loaded image replaces the heap and globals.  A path may have several components
+(`dir/dir/file`), each looked up in turn.  Boot files are copied into the export, not linked (a symbolic link cannot be read).
