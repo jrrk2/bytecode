@@ -92,6 +92,7 @@ Steps:
    names first); no signatures or functors.  Lets the library be written as modules.
 4. **(Optional) migrate `comp.ml` to the standard style.**  It is also compiled by `ocamlc -nopervasives`, so it can use only what both accept: with step 3 it can begin with
    `module String = struct external length : string -> int = "%string_length" ... end` and use `String.length` throughout.  A scripted edit, checked by the identical-image comparison.
+A first cut of 1 and part of 2 exists (qualified names, `String.length`, `Array.length`, `Array.get`, `Sys.readdir` for the RAM disk, `/` and `/sd`, array and list printing): see `docs/readdir-demo.md`. Still missing for 2: `caml_make_vect` (no run-time-length arrays; `Sys.readdir` uses a ladder of literals up to 64), `ATOM0` (no `[||]`), NFS READDIR3.
 Do 1 and 2 first (visible to users, `comp.ml` unchanged), 3 if real modules are wanted, 4 only if the compiler's own source should be in standard style.
 
 ## Fewer memories

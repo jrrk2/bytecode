@@ -476,6 +476,12 @@ let tokenize () =
       end else if is_alpha c then begin
         let j = ref i in
         while !j < !line_len && (is_alpha (char_at !j) || is_digit (char_at !j)) do j := !j + 1 done;
+        (* a module path: String.length, Sys.readdir -- an upper-case name, a dot and a lower-case letter, one identifier *)
+        let upper = c >= 65 && c <= 90 in
+        while upper && !j + 1 < !line_len && char_at !j = 46 && is_alpha (char_at (!j + 1)) do
+          j := !j + 1;
+          while !j < !line_len && (is_alpha (char_at !j) || is_digit (char_at !j)) do j := !j + 1 done
+        done;
         go !j (TId (substring i !j) :: acc)
       end else if c = 34 then begin
         (* a string literal.  A backslash escapes the next character, with
@@ -605,6 +611,9 @@ let rec apps f l = match l with [] -> f | a :: r -> apps (App (f, a)) r
 (* a constructor starts with a capital, a type variable with a quote *)
 let is_ctor s =
   string_length s > 0 && (let c = int_of_char (string_get s 0) in c >= 65 && c <= 90)
+  && (let dot = ref false in
+      for i = 0 to string_length s - 1 do if string_get s i = '.' then dot := true done;
+      if !dot then false else true)
 let is_tyvar s = string_length s > 0 && int_of_char (string_get s 0) = 39
 
 let ( ^^ ) a b =
@@ -1245,6 +1254,9 @@ and parse_atom toks = match toks with
      | Err e -> Err e
      | Ok (a, rest) -> Ok (Field (a, "contents"), rest))
   | TId x :: rest when not (keyword x) -> Ok (Var x, rest)
+  (* the empty array: [||] (its || lexes as one operator) or [| |] *)
+  | t :: t2 :: t3 :: rest when is_sym t "[" && is_sym t2 "||" && is_sym t3 "]" -> Ok (ArrLit [], rest)
+  | t :: t2 :: t3 :: t4 :: rest when is_sym t "[" && is_sym t2 "|" && is_sym t3 "|" && is_sym t4 "]" -> Ok (ArrLit [], rest)
   | t :: t2 :: rest when is_sym t "[" && is_sym t2 "|" -> parse_arr_lit rest []
   | t :: t2 :: rest when is_sym t "[" && is_sym t2 "]" -> Ok (Con ("[]", []), rest)
   | t :: rest when is_sym t "[" -> parse_list_lit rest
@@ -2376,6 +2388,7 @@ let prim_table = [
   ("%bytes_unsafe_set", (1, 83, 3));
   ("%string_length", (2, 278, 1));
   ("%string_safe_get", (2, 347, 2));
+  ("%array_length", (1, 79, 1));
   ("%array_safe_get", (2, 13, 2));
   ("%array_safe_set", (2, 15, 3));
   ("caml_create_bytes", (2, 82, 1));
@@ -2953,6 +2966,7 @@ let rec comp env e =
   | ExnVal c -> emit op_getglobal; emit (exn_slot c); true
   | Con (c, args) -> comp_con env c args
   | Tuple es -> comp_block env 0 es
+  | ArrLit [] -> comp_err := "the empty array [||] is not supported yet (the VM's ATOM0 is a no-op)"; false
   | ArrLit es -> comp_block env 0 es
   | Match (scrut, arms) -> tail_now := t; comp_match env scrut arms
   | Field (b, f) ->
@@ -3784,7 +3798,9 @@ let run_phrase e name =
 (* what came back is the accumulator, which for an int or a bool is the
    value itself; a function stays in its global and is not brought out *)
 let float_printer = ref (fun (_ : float) -> ())
-let print_compiled ty v = match repr ty with
+external array_length : 'a array -> int = "%array_length"
+let is_nil (v : int) = v = 0     (* the empty list is the immediate 0 *)
+let rec print_compiled ty v = match repr ty with
   | TInt -> put_int v
   | TBool -> puts (if v = 1 then "true" else "false")
   (* what came back is the string itself, which arrived as the
@@ -3792,6 +3808,24 @@ let print_compiled ty v = match repr ty with
   | TString -> putc '"'; puts (magic v); putc '"'
   | TFloat -> (!float_printer) (magic v)
   | TArrow (_, _) -> puts "<fun>"
+  (* an array is a block of its elements; a list is a chain of two-field blocks ending in the immediate 0 *)
+  | TCon (cn, [t]) when string_equal cn "array" ->
+    puts "[|";
+    for i = 0 to array_length (magic v) - 1 do
+      (if i > 0 then puts "; ");
+      print_compiled t (array_get (magic v) i)
+    done;
+    puts "|]"
+  | TCon (cn, [t]) when string_equal cn "list" ->
+    putc '[';
+    let cell = ref v and first = ref true in
+    while not_b (is_nil (magic !cell)) do
+      (if not_b !first then puts "; ");
+      first := false;
+      print_compiled t (array_get (magic !cell) 0);
+      cell := array_get (magic !cell) 1
+    done;
+    putc ']'
   | _ -> puts "<value>"
 
 
@@ -5331,6 +5365,163 @@ let () =
     nfs_pump ();
     if !nfs_result < 0 then raise (Sys_error "nfs: write failed"))
 
+(* ---- Sys.readdir : string -> string array ----
+   "." is the RAM disk's files, "/" the mount points, "/sd" the root directory of the card; a directory on the NFS server is not read yet (that needs
+   READDIR3 in the client).  The result is a new type for the REPL: a string array, printed as [|"a"; "b"|].
+   The machine has no caml_make_vect, so an array whose length is known only now is picked from a ladder of literal arrays (up to 64 entries) and
+   filled; Array.make proper wants that primitive in the VM (see the TODO). *)
+let mk_str_array (n : int) : string array = match n with
+  | 1 -> [| "" |]
+  | 2 -> [| ""; "" |]
+  | 3 -> [| ""; ""; "" |]
+  | 4 -> [| ""; ""; ""; "" |]
+  | 5 -> [| ""; ""; ""; ""; "" |]
+  | 6 -> [| ""; ""; ""; ""; ""; "" |]
+  | 7 -> [| ""; ""; ""; ""; ""; ""; "" |]
+  | 8 -> [| ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 9 -> [| ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 10 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 11 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 12 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 13 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 14 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 15 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 16 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 17 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 18 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 19 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 20 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 21 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 22 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 23 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 24 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 25 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 26 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 27 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 28 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 29 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 30 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 31 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 32 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 33 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 34 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 35 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 36 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 37 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 38 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 39 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 40 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 41 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 42 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 43 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 44 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 45 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 46 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 47 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 48 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 49 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 50 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 51 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 52 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 53 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 54 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 55 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 56 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 57 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 58 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 59 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 60 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 61 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 62 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 63 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | 64 -> [| ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; ""; "" |]
+  | _ -> raise (Failure "mk_str_array")
+
+let rec list_len (l : string list) = match l with [] -> 0 | _ :: r -> 1 + list_len r
+
+(* l is last entry first, the array is in order; more than 64 entries are cut *)
+let str_array (l : string list) : string array =
+  let n = list_len l in
+  (if n = 0 then raise (Sys_error "empty directory: an empty array needs ATOM0 in the VM (see the TODO)"));
+  let n = if n > 64 then 64 else n in
+  let a = mk_str_array n in
+  let i = ref (n - 1) and rest = ref l in
+  while !i >= 0 do
+    (match !rest with
+     | x :: r -> array_set a !i x; rest := r
+     | [] -> ());
+    i := !i - 1
+  done;
+  a
+
+let rfs_names () =
+  if io_read disk_size_reg = 0 then []
+  else begin
+    let _ = rfs_ready () in
+    let r = ref [] in
+    for k = 0 to rfs_count () - 1 do
+      let base = rfs_dir + k * rfs_ent in
+      let n = ref 0 in
+      while !n < rfs_name_max && db (base + !n) <> 0 do n := !n + 1 done;
+      let b = create_bytes !n in
+      for i = 0 to !n - 1 do bytes_set b i (char_of_int (db (base + i))) done;
+      r := bytes_to_string b :: !r
+    done;
+    !r
+  end
+
+(* an 8.3 directory entry as name.ext in lower case *)
+let fat_entry_name (o : int) =
+  let low c = if c >= 65 && c <= 90 then c + 32 else c in
+  let n = ref 8 in
+  while !n > 0 && sd_byte (o + !n - 1) = 32 do n := !n - 1 done;
+  let e = ref 3 in
+  while !e > 0 && sd_byte (o + 8 + !e - 1) = 32 do e := !e - 1 done;
+  let b = create_bytes (!n + (if !e > 0 then !e + 1 else 0)) in
+  for i = 0 to !n - 1 do bytes_set b i (char_of_int (low (sd_byte (o + i)))) done;
+  (if !e > 0 then begin
+     bytes_set b !n '.';
+     for i = 0 to !e - 1 do bytes_set b (!n + 1 + i) (char_of_int (low (sd_byte (o + 8 + i)))) done
+   end);
+  bytes_to_string b
+
+let fat_names () =
+  let r = ref [] and c = ref !fat_root and fin = ref false in
+  while not_b !fin && !c >= 2 && !c < 0x0FFFFFF8 do
+    let s = ref 0 in
+    while not_b !fin && !s < !fat_spc do
+      if not_b (sd_read (clus_lba !c + !s)) then fin := true
+      else begin
+        let e = ref 0 in
+        while not_b !fin && !e < 16 do
+          let o = !e * 32 in
+          let first = sd_byte o and attr = sd_byte (o + 11) in
+          if first = 0 then fin := true
+          else if first <> 0xE5 && attr <> 0x0F && attr land 0x08 = 0 then r := fat_entry_name o :: !r;
+          e := !e + 1
+        done
+      end;
+      s := !s + 1
+    done;
+    if not_b !fin then c := fat_next !c
+  done;
+  !r
+
+let sys_readdir (path : string) : string array =
+  let n = string_length path in
+  if n = 0 || (n = 1 && string_get path 0 = '.') then str_array (rfs_names ())
+  else if n = 1 && string_get path 0 = '/' then str_array [after !nfs_mount 1; "sd"]
+  else if string_equal path "/sd" || string_equal path "/sd/" then begin
+    (if not_b !sd_up then begin
+       (if sd_init () <> 0 then raise (Sys_error (path ^^ ": no card")));
+       sd_up := true
+     end);
+    fat_part := 0;
+    if fat_mount () <> 0 then raise (Sys_error (path ^^ ": no FAT volume"))
+    else str_array (fat_names ())
+  end
+  else raise (Sys_error (path ^^ ": cannot list this (NFS directories are not read yet)"))
+
 (* ---- evaluating a line, whichever way it came ---- *)
 (* Printing a double, without caml_format_float -- which this processor does
    not have, and which would be a page of C if it did.  Six digits after the
@@ -5458,6 +5649,7 @@ let builtins =
     ("run_file", 1, TArrow (TString, TInt));
     ("files", 1, TArrow (TInt, TInt));
     ("nfs_server", 2, TArrow (TString, TArrow (TString, TInt)));
+    ("Sys.readdir", 1, TArrow (TString, TCon ("array", [TString])));
     ("nfs_root", 1, TArrow (TString, TInt));
     ("nfs_fetch", 2, TArrow (TString, TArrow (TString, TInt)));
     ("nfs_done", 1, TArrow (TInt, TInt));
@@ -5624,7 +5816,7 @@ let evaluate_line_unsafe () =
                let ty = ty_of_texp (fresh_sub (tyvars_of te [])) te in
                externals := (name, d) :: !externals;
                type_session := (name, generalize !type_session ty) :: !type_session;
-               puts "external "; puts name; newline ())
+               (if not_b !quiet then begin puts "external "; puts name; newline () end))
     | Ok toks when (match toks with t :: _ -> is_kw t "type" | [] -> false) ->
       (* a declaration, not an expression: it binds constructors and has no
          value to print.  type a = ... and b = ... declares each in turn. *)
@@ -6470,6 +6662,7 @@ let () =
       (magic (fun (a : string) -> match (!fs_get) a with Ok v -> v | Err _ -> ""));
     install_fn "run_file" (magic (fun (a : string) -> (!fs_run) a));
     install_fn "files" (magic (fun (n : int) -> (!fs_ls) n));
+    install_fn "Sys.readdir" (magic (fun (p : string) -> sys_readdir p));
     install_fn "nfs_server" (magic (fun (a : string) (m : string) -> nfs_mount_set m; nfs_set_server a));
     install_fn "nfs_fetch"
       (magic (fun (e : string) (f : string) -> nfs_start e f));
@@ -6502,6 +6695,9 @@ let () =
     install_fn "disk_set" (magic (fun (i : int) (v : int) -> disk_set i v; 0));
     install_fn "image_begin" (magic (fun (a : string) -> img_begin a));
     install_fn "image_end" (magic (fun (n : int) -> img_end n));
+    predefine "external String.length : string -> int = \"%string_length\"";
+    predefine "external Array.length : 'a array -> int = \"%array_length\"";
+    predefine "external Array.get : 'a array -> int -> 'a = \"%array_safe_get\"";
     predefine "let help = \"mini-ML on the OCaml processor: type an expression or a let and press Enter (;; ends a phrase early).\\n  1 + 2        let sq x = x * x        sq 12        let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\\nNames: /sd/name is the SD card, /nfs/dir/name the NFS server (after  nfs_server \\\"192.168.1.106\\\" \\\"/nfs\\\";  add :/export to the address\\n  to change the export, default /srv/nfs/vc707), anything else the RAM disk if there is one.  NFS files are for the UART session.\\n  run_file \\\"/sd/comp.ml\\\"   read_file \\\"/nfs/maths.ml\\\"   write_file \\\"/nfs/b.txt\\\" \\\"text\\\"   open_in, open_out, input_line, output_string ...\\n  #image /nfs/out.img /nfs/comp.ml  builds an image on the server.  nfs_fetch / nfs_done copy a file in.\\nMore SD: run_file \\\"sd.ml\\\"; run_file \\\"fat.ml\\\"; sd_init (); fat_mount (); fat_ls !fat_root.   More on the board: telnet (port 23) or UDP 7777.\\nAfter a reset the loader asks boot: and takes  sd(0,0)vm.img   nfs(0,0)path   tftp(0,0)file   mem(0,0)   or nothing for the default; ? lists them.\\nhelp prints this again.\""
   end;
   puts "OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build ";
