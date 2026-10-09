@@ -4126,11 +4126,33 @@ let fat_read_by (get : int -> int) =
 let dev_unit = ref 0
 let dev_part = ref 0
 let dev_rel = ref ""
+(* The name space: /sd/name is the SD card (partition 0), /nfs/dir/name (or whatever mount point nfs_server was given) is the NFS server it
+   names, under the export nfs_root; anything else is the RAM disk, if there is one.  nfs(U,P)path and sd(U,P)name are the older spellings. *)
+let nfs_mount = ref "/nfs"
+let nfs_root = ref "/srv/nfs/vc707"
+
+let has_prefix (s : string) (p : string) =
+  let n = string_length p in
+  string_length s >= n && (let ok = ref true in
+                           for i = 0 to n - 1 do if string_get s i <> string_get p i then ok := false done;
+                           !ok)
+
+let after (s : string) (k : int) =
+  let r = create_bytes (string_length s - k) in
+  for i = k to string_length s - 1 do bytes_set r (i - k) (string_get s i) done;
+  bytes_to_string r
 
 let dev_digit (nm : string) (i : int) =
   i < string_length nm && int_of_char (string_get nm i) >= 48 && int_of_char (string_get nm i) <= 57
 
-let dev_split (nm : string) =
+let rec dev_split (nm : string) =
+  let n = string_length nm in
+  let m = string_length !nfs_mount in
+  if has_prefix nm "/sd/" then begin dev_unit := 0; dev_part := 0; dev_rel := after nm 4; 2 end
+  else if has_prefix nm !nfs_mount && n > m + 1 && string_get nm m = '/' then begin dev_unit := 0; dev_part := 0; dev_rel := after nm (m + 1); 1 end
+  else dev_split_old nm
+
+and dev_split_old (nm : string) =
   let n = string_length nm in
   let d = if n > 4 && string_get nm 0 = 'n' && string_get nm 1 = 'f' && string_get nm 2 = 's' && string_get nm 3 = '(' then 1
           else if n > 3 && string_get nm 0 = 's' && string_get nm 1 = 'd' && string_get nm 2 = '(' then 2
@@ -5148,13 +5170,25 @@ let nfs_dest_to_disk () =
   nfs_dest_room := (fun (_u : int) -> io_read disk_size_reg - !nfs_at);
   nfs_dest_put := (fun (o : int) (v : int) -> db_set (!nfs_at + o) v);
   nfs_dest_finish := (fun (n : int) -> rfs_commit !nfs_name !nfs_at n >= 0)
+(* the mount point: "/nfs", with a leading slash and none at the end *)
+let nfs_mount_set (m : string) =
+  let n = string_length m in
+  let k = if n > 1 && string_get m (n - 1) = '/' then n - 1 else n in
+  let r = create_bytes (k + (if n > 0 && string_get m 0 = '/' then 0 else 1)) in
+  (if n > 0 && string_get m 0 = '/' then (for i = 0 to k - 1 do bytes_set r i (string_get m i) done)
+   else begin bytes_set r 0 '/'; for i = 0 to k - 1 do bytes_set r (i + 1) (string_get m i) done end);
+  nfs_mount := bytes_to_string r
+
 (* what the language sees *)
 (* "192.168.1.106" as one argument: the compiler applies at most two at a
    time, so four octets could not be passed even though they would read
    better as numbers *)
 let nfs_set_server (a : string) =
-  let oct = ref 0 and k = ref 0 and ok = ref true in
-  for i = 0 to string_length a - 1 do
+  let oct = ref 0 and k = ref 0 and ok = ref true and stop = ref (string_length a) in
+  (* "192.168.1.106:/srv/nfs/vc707": the address, then the export *)
+  for i = string_length a - 1 downto 0 do if string_get a i = ':' then stop := i done;
+  (if !stop < string_length a then nfs_root := after a (!stop + 1));
+  for i = 0 to !stop - 1 do
     let c = int_of_char (string_get a i) in
     if c = 46 then begin
       (if !k < 4 then array_set nfs_ip !k !oct);
@@ -5190,8 +5224,6 @@ let nfs_start export f =
    this way).  open_out writes a scratch file of the last component's name on the RAM disk, and close_out creates the file on
    the server and sends it.  The wait is for the replies in this very call, so it is only done in a session on the UART: in a
    network session the TX window holds the reply being built and the receive window the command being run. *)
-let nfs_root = ref "/srv/nfs/vc707"
-
 (* the last component, which names the scratch file on the RAM disk *)
 let nfs_base (path : string) =
   let n = string_length path in
@@ -5230,7 +5262,7 @@ let nfs_ready (nm : string) =
        array_set nfs_ip 3 !dev_unit;
        for i = 0 to 5 do array_set nfs_mac i 0 done
      end);
-    if array_get nfs_ip 0 = 0 then raise (Sys_error (nm ^^ ": no server (nfs_server, or nfs(N,0))"))
+    if array_get nfs_ip 0 = 0 then raise (Sys_error (nm ^^ ": no server (nfs_server \"ip\" \"/nfs\")"))
   end
 
 let () =
@@ -5425,7 +5457,7 @@ let builtins =
     ("read_file", 1, TArrow (TString, TString));
     ("run_file", 1, TArrow (TString, TInt));
     ("files", 1, TArrow (TInt, TInt));
-    ("nfs_server", 1, TArrow (TString, TInt));
+    ("nfs_server", 2, TArrow (TString, TArrow (TString, TInt)));
     ("nfs_root", 1, TArrow (TString, TInt));
     ("nfs_fetch", 2, TArrow (TString, TArrow (TString, TInt)));
     ("nfs_done", 1, TArrow (TInt, TInt));
@@ -5562,6 +5594,9 @@ let directive () =
       (if size < 0 then puts "not written" else begin put_int size; puts " bytes" end);
       newline ()
     end
+  | w :: host :: rest when string_equal w "nfs" ->
+    (match rest with m :: _ -> nfs_mount_set m | [] -> nfs_mount_set "/nfs");
+    puts (if nfs_set_server host = 1 then "nfs server set" else "error: bad address"); newline ()
   | [w] when string_equal w "freeze" ->
     (* bring-up: the next bounds error stops the machine in a loop that allocates nothing, so that its memories can be
        read back over JTAG as they were *)
@@ -6435,7 +6470,7 @@ let () =
       (magic (fun (a : string) -> match (!fs_get) a with Ok v -> v | Err _ -> ""));
     install_fn "run_file" (magic (fun (a : string) -> (!fs_run) a));
     install_fn "files" (magic (fun (n : int) -> (!fs_ls) n));
-    install_fn "nfs_server" (magic (fun (a : string) -> nfs_set_server a));
+    install_fn "nfs_server" (magic (fun (a : string) (m : string) -> nfs_mount_set m; nfs_set_server a));
     install_fn "nfs_fetch"
       (magic (fun (e : string) (f : string) -> nfs_start e f));
     install_fn "nfs_root" (magic (fun (a : string) -> nfs_root := a; 1));
@@ -6467,7 +6502,7 @@ let () =
     install_fn "disk_set" (magic (fun (i : int) (v : int) -> disk_set i v; 0));
     install_fn "image_begin" (magic (fun (a : string) -> img_begin a));
     install_fn "image_end" (magic (fun (n : int) -> img_end n));
-    predefine "let help = \"mini-ML on the OCaml processor: type an expression or a let and press Enter (;; ends a phrase early).\\n  1 + 2        let sq x = x * x        sq 12        let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\\nFiles: a plain name is on the RAM disk (survives a chain load):  files 0   read_file \\\"a.ml\\\"   write_file \\\"a.ml\\\" \\\"text\\\"   run_file \\\"a.ml\\\"\\n  sd(0,0)name is on the SD card, nfs(0,0)dir/name on the server (nfs_server \\\"192.168.1.106\\\", nfs_root \\\"/srv/nfs/vc707\\\"; UART session):\\n  run_file \\\"sd(0,0)comp.ml\\\"   read_file \\\"nfs(0,0)bytecode/a.txt\\\"   write_file \\\"nfs(0,0)bytecode/b.txt\\\" \\\"text\\\".  nfs_fetch / nfs_done copy a file in.\\nMore SD: run_file \\\"sd.ml\\\"; run_file \\\"fat.ml\\\"; sd_init (); fat_mount (); fat_ls !fat_root.   More on the board: telnet (port 23) or UDP 7777.\\nAfter a reset the loader asks boot: and takes  sd(0,0)vm.img   nfs(0,0)path   tftp(0,0)file   mem(0,0)   or nothing for the default; ? lists them.\\nhelp prints this again.\""
+    predefine "let help = \"mini-ML on the OCaml processor: type an expression or a let and press Enter (;; ends a phrase early).\\n  1 + 2        let sq x = x * x        sq 12        let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\\nNames: /sd/name is the SD card, /nfs/dir/name the NFS server (after  nfs_server \\\"192.168.1.106\\\" \\\"/nfs\\\";  add :/export to the address\\n  to change the export, default /srv/nfs/vc707), anything else the RAM disk if there is one.  NFS files are for the UART session.\\n  run_file \\\"/sd/comp.ml\\\"   read_file \\\"/nfs/maths.ml\\\"   write_file \\\"/nfs/b.txt\\\" \\\"text\\\"   open_in, open_out, input_line, output_string ...\\n  #image /nfs/out.img /nfs/comp.ml  builds an image on the server.  nfs_fetch / nfs_done copy a file in.\\nMore SD: run_file \\\"sd.ml\\\"; run_file \\\"fat.ml\\\"; sd_init (); fat_mount (); fat_ls !fat_root.   More on the board: telnet (port 23) or UDP 7777.\\nAfter a reset the loader asks boot: and takes  sd(0,0)vm.img   nfs(0,0)path   tftp(0,0)file   mem(0,0)   or nothing for the default; ? lists them.\\nhelp prints this again.\""
   end;
   puts "OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build ";
   uart_build ();

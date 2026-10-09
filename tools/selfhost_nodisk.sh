@@ -8,10 +8,10 @@ B=$(cd "$(dirname "$0")/.." && pwd); W=${1:-/tmp/selfhost_nodisk}
 rm -rf "$W"; mkdir -p "$W/root"; cd "$W"
 cp "$B/io/comp.ml" comp.ml; cp "$B/io/comp.ml" root/comp.ml
 /usr/bin/ocamlc -nopervasives -custom -runtime-variant d -ccopt -I"$B" comp.ml "$B/io/io_stubs.c" "$B/ethmodel.c" -o comp.ref 2>/dev/null
-# blank lines first: each is a poll, and the DHCP exchange has to finish before the NFS client has an address
-{ for i in $(seq 1 1500); do echo; done; echo '#image nfs(106,0)stage2.img nfs(106,0)comp.ml'; } > in.txt
+# blank lines first: each is a poll, and the DHCP exchange has to finish before the NFS client has an address; #nfs names the server and the mount point (the host runner can't call nfs_server)
+{ for i in $(seq 1 1500); do echo; done; echo '#nfs 192.168.1.106 /nfs'; echo '#image /nfs/stage2.img /nfs/comp.ml'; } > in.txt
 ETHMODEL_NODISK=1 ETHMODEL_NFS_ROOT="$W/root" ETHMODEL_UART_INPUT=in.txt timeout 1800 ./comp.ref > run.log 2>&1 || true
-grep "uart: image nfs" run.log
+grep "uart: image /nfs" run.log
 DISK_KIB=4096 python3 "$B/tools/mkdisk.py" d.disk comp.ml=comp.ml > /dev/null
 echo '#image a.img comp.ml' > in2.txt
 ETHMODEL_DISK=d.disk ETHMODEL_UART_INPUT=in2.txt timeout 900 ./comp.ref 2>&1 | grep "uart: image a.img:"

@@ -46,7 +46,7 @@ The file then behaves as any other on the RAM disk:
 
 Typed at `nc -u 192.168.1.233 7777`, against `maths.ml` on the export:
 
-    # nfs_server "192.168.1.224"
+    # nfs_server "192.168.1.224" "/nfs"
     - : int = 1
     # nfs_fetch "/srv/nfs/vc707" "maths.ml"
     - : int = 1
@@ -121,32 +121,40 @@ or NFS (hold a button to skip it).  So
 
 gives a bitstream that starts the compiler, with its source files on the RAM disk, from power-up.
 
-## Files by device name: nfs(U,P)path and sd(U,P)path
+## The name space: /nfs/..., /sd/...
 
-The channel functions take a device in the file name, as the loader's boot prompt does: `open_in`, `open_out`, `read_file`,
-`write_file`, `run_file` and the rest work on the RAM disk for a plain name, on an NFS server for `nfs(U,P)path`, on the SD card for
-`sd(U,P)path`.
+The channel functions (`open_in`, `open_out`, `read_file`, `write_file`, `run_file`, `input_line` and the rest) and the `#image` directive take
+a path that names where the file is:
 
-* **NFS.**  U is the server's host number on the board's network (0: the address `nfs_server` set), P is ignored, the path is below
-  the export `nfs_root` names (default `/srv/nfs/vc707`).  Reading looks the file up and keeps its handle; the channel then fetches
-  512 bytes at a time as they are wanted (two blocks are kept, so a reader that looks a few bytes ahead does not fetch twice).  Nothing is
-  copied to the RAM disk: `run_file "nfs(0,0)bytecode/comp.ml"` compiles the source where it lies.  Writing creates the file when the channel is opened (mode 0644, an existing one is truncated) and sends
-  what is written in 1 KiB FILE_SYNC WRITEs as a buffer fills and on `flush` and `close_out`; nothing is kept on the RAM disk.  An output
-  channel on the server is sequential: `seek_out` to anywhere but the current position raises `Sys_error`.  The calls wait for the replies inside the call, which is only
-  safe in a UART session (the TX window holds a network session's reply and the receive window its command), so in a telnet or UDP
-  session they raise `Sys_error`; `nfs_fetch` still works there.  Writes are made as uid 0: the export needs `no_root_squash`.
-* **SD.**  U must be 0, P is the MBR partition (0..3), the path is a name in the root directory of its FAT32 volume ("vm.img"; 8.3,
-  upper-cased).  Reading follows the cluster chain 512 bytes at a time as for NFS and works in any session.  Writing to the card from
-  the language is not done yet (`fat_store` overwrites an existing file in place).
+* `/sd/name` is the SD card, partition 0 (`name` in the root directory of its FAT32 volume; 8.3, upper-cased).  No set-up.
+* `/nfs/dir/name` is the NFS server: after `nfs_server "192.168.1.106" "/nfs"` the mount point `/nfs` stands for that server and its export.
+  The second argument is the mount point and can be any name (`"/nfs"` is the usual one, `"/srv"` or `"/home"` work too).  Add `:/export` to the
+  address to say which export: `nfs_server "192.168.1.106:/srv/nfs/vc707" "/nfs"`;
+  the default export is `/srv/nfs/vc707` (`nfs_root "/other"` changes it).
+* anything else is the RAM disk, on a core that has one (spec24 has none: such names fail).
 
-    nfs_server "192.168.1.106"
-    write_file "nfs(0,0)bytecode/hello.txt" "hello from the board"
-    read_file "nfs(0,0)bytecode/hello.txt"
-    run_file "sd(0,0)comp.ml"
+The older spellings `nfs(U,P)path` and `sd(U,P)name` still work (U on NFS is the server's host number on the board's network, 0 meaning the
+`nfs_server` address).  The loader's boot prompt keeps its own `device(unit,part)file` form: that is a different thing, typed at the machine at reset.
+A script on the host runner, which cannot call builtins, uses the directive `#nfs 192.168.1.106 /nfs`.
 
-The point is capacity: a file read this way takes no space on the 512 KiB RAM disk, which a compile of `io/comp.ml` (240 KB of source and
-a 280 KB image) otherwise fills.  The SD driver and FAT reader are part of the compiler (spliced from `io/sd.ml` and `io/fat.ml`), and
-the same files are still there to `run_file` for the manual functions.
+    nfs_server "192.168.1.106" "/nfs"
+    write_file "/nfs/bytecode/hello.txt" "hello from the board"
+    read_file "/nfs/bytecode/hello.txt"
+    run_file "/sd/comp.ml"
+    #image /nfs/bytecode/out.img /nfs/bytecode/comp.ml
+
+* **NFS.**  Reading looks the file up and keeps its handle; the channel then fetches 512 bytes at a time as they are wanted (two blocks are
+  kept, so a reader that looks a few bytes ahead does not fetch twice).  Nothing is copied to the RAM disk: `run_file "/nfs/maths.ml"` compiles the
+  source where it lies.  Writing creates the file when the channel is opened (mode 0644, an existing one is truncated) and sends what is written in
+  1 KiB FILE_SYNC WRITEs as a buffer fills and on `flush` and `close_out`; an output channel on the server is sequential.  The calls wait for the replies
+  inside the call, which is only safe in a UART session (the TX window holds a network session's reply and the receive window its command), so in a telnet
+  or UDP session they raise `Sys_error`; `nfs_fetch` still works there.  Writes are made as uid 0: the export needs `no_root_squash`.
+* **SD.**  Reading follows the file's cluster chain 512 bytes at a time as for NFS and works in any session.  Writing to the card from the language is not
+  done yet (`fat_store` overwrites an existing file in place).
+
+The point is capacity: a file read this way takes no space on a RAM disk, and a compile of `io/comp.ml` (260 KB of source and a 316 KB image) needs none.
+The SD driver and FAT reader are part of the compiler (spliced from `io/sd.ml` and `io/fat.ml`), and the same files are still there to `run_file` for
+the manual functions.
 
 Checked on the board: `read_file "nfs(0,0)maths.ml"` returns the file (2028 bytes, 28 ms) and `run_file "nfs(0,0)maths.ml"` compiles it in
 place from the server through the 512-byte channel blocks.  `write_file "nfs(0,0)bytecode/hello.txt" "hello from the board"` created the file on the server.  Not yet run on the board: `sd(0,0)`
