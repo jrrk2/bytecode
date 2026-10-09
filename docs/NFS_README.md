@@ -120,3 +120,21 @@ or NFS (hold a button to skip it).  So
     python3 tools/preload.py --bit L.bit --slices out/ram_slices.txt --out P.bit stage=stage.bin disk=disk.img
 
 gives a bitstream that starts the compiler, with its source files on the RAM disk, from power-up.
+
+## NFS files by name
+
+From a session on the UART the channel functions take `nfs(U,P)path` as a file name: `open_in`, `open_out`, `read_file`,
+`write_file`, `run_file`.  U is the server's host number on the board's network (0: the address `nfs_server` set), P is
+ignored, and the path is below the export `nfs_root` names (default `/srv/nfs/vc707`).
+
+    nfs_server "192.168.1.106"
+    write_file "nfs(0,0)bytecode/hello.txt" "hello from the board"
+    read_file "nfs(0,0)bytecode/hello.txt"
+
+Reading fetches the whole file into the RAM disk under its last component (at most 24 characters) and opens that, so the
+file is a copy: a second `open_in` of the same name fetches it again.  Writing goes to a scratch file of that name on the
+RAM disk and `close_out` creates the file on the server (mode 0644, an existing one is truncated) and sends it, in 1 KiB WRITEs,
+FILE_SYNC; `flush` alone sends nothing.  The calls wait for the replies, which is only safe in a UART session (the TX window
+holds a network session's reply and the receive window its command), so in a telnet or UDP session they raise `Sys_error`;
+`nfs_fetch` still works there.  The writes are made as uid 0, so the export needs `no_root_squash` (or the directory to be
+writable by whoever it maps root to).

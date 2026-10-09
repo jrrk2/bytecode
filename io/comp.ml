@@ -97,6 +97,9 @@ let mac i = int_of_char (string_get my_mac i)
 (* ---- output: to the UART, or into a UDP reply ---- *)
 let net_max = 1400
 let to_net = ref false
+(* the loader's serial boot leaves 0x4E in the RAM disk's last byte: then the network is not touched at all, so that
+   what the compiler allocates cannot depend on what frames arrive *)
+let net_on = ref true
 let net_out = create_bytes net_max
 let net_len = ref 0
 
@@ -1519,6 +1522,13 @@ and env = (string * value) list
 
 (* set once the disk and the evaluator are both in scope *)
 let fs_put = ref (fun (_ : string) (_ : string) -> 0)
+(* names of the form nfs(U,P)path are files on an NFS server: the hooks below (set where the NFS client is) turn one into a
+   file of the RAM disk -- fetched for reading, or the scratch file whose contents close_out sends -- and hand back its name *)
+let nfs_in_hook = ref (fun (nm : string) -> nm)
+let nfs_out_hook = ref (fun (nm : string) -> nm)
+let nfs_close_hook = ref (fun (_u : int) -> ())
+let nfs_out_cand = ref ""        (* what nfs_out_hook decided: the path to create on close, or "" *)
+let nfs_out_target = ref ""      (* the same, once the file is open *)
 let fs_get = ref (fun (_ : string) -> Err "no filing system")
 let fs_run = ref (fun (_ : string) -> 0)
 let fs_ls = ref (fun (_ : int) -> 0)
@@ -3817,6 +3827,7 @@ let out_pos = ref 0                             (* where the next byte goes, fro
 let out_len = ref 0                             (* how far the file reaches *)
 
 let open_in (nm : string) =
+  let nm = (!nfs_in_hook) nm in
   let _ = rfs_ready () in
   let k = rfs_find nm in
   if k < 0 then raise (Sys_error (nm ^^ ": No such file or directory"))
@@ -3880,6 +3891,7 @@ let seek_in (h : int) (p : int) =
   else array_set in_pos h p
 
 let open_out (nm : string) =
+  let nm = (!nfs_out_hook) nm in
   let _ = rfs_ready () in
   let n = string_length nm in
   if !out_live then raise (Sys_error "Too many open output files")
@@ -3896,6 +3908,7 @@ let open_out (nm : string) =
        else begin out_ent := cnt; out_at := at end
      end);
     out_pos := 0; out_len := 0; out_live := true;
+    nfs_out_target := !nfs_out_cand;
     1
   end
 
@@ -3923,12 +3936,13 @@ let flush (h : int) =
   d32_set (rfs_dir + !out_ent * rfs_ent + rfs_name_max + 4) !out_len;
   d32_set 8 (rfs_next !out_at !out_len)
 
-let close_out (h : int) = flush h; out_live := false
+let close_out (h : int) = flush h; out_live := false; (!nfs_close_hook) 0
 
 (* give a file up unwritten: its entry goes, and the space with it *)
 let discard_out (h : int) =
   out_chk h;
   d32_set 4 !out_ent; d32_set 8 !out_at;
+  nfs_out_target := "";
   out_live := false
 
 let seek_out (h : int) (p : int) =
@@ -4313,6 +4327,8 @@ let nfs_mounting = 3
 let nfs_pmap_nfs = 4
 let nfs_looking = 5
 let nfs_reading = 6
+let nfs_creating = 7
+let nfs_writing = 8
 
 let nfs_state = ref nfs_idle
 let nfs_deadline = ref 0
@@ -4325,6 +4341,12 @@ let nfs_path = ref ""            (* "dir/dir/file" below the export *)
 let nfs_cs = ref 0               (* the component being looked up: nfs_path from nfs_cs to nfs_ce *)
 let nfs_ce = ref 0
 let nfs_result = ref (0 - 1)     (* -1 running, -2 failed, else the length *)
+(* writing a file: nfs_launch_write creates the leaf of the path (the part after the last '/') in the directory the rest names
+   and writes nfs_src_len bytes, nfs_src_get i being byte i of them *)
+let nfs_mode = ref 0             (* 0 read, 1 write *)
+let nfs_leaf = ref 0             (* where the leaf name starts in nfs_path *)
+let nfs_src_len = ref 0
+let nfs_src_get = ref (fun (_i : int) -> 0)
 
 let nfs_find_end () =
   let e = ref !nfs_cs in
@@ -4346,6 +4368,30 @@ let send_lookup () =
   rpc_call rpc_nfs 3 3;
   xfh fh_root !fh_root_len;
   xname !nfs_path !nfs_cs !nfs_ce;
+  nfs_send !nfsd_port
+
+(* CREATE of the leaf, UNCHECKED (an existing file is truncated to nothing), mode 0644, as uid 0 *)
+let send_create () =
+  rpc_call rpc_nfs 3 8;
+  xfh fh_root !fh_root_len;
+  xname !nfs_path !nfs_leaf (string_length !nfs_path);
+  x32 0;                                       (* createmode3 UNCHECKED *)
+  x32 1; x32 420;                              (* sattr3: mode 0644 *)
+  x32 0; x32 0;                                (* uid, gid: unchanged *)
+  x32 1; x32 0; x32 0;                         (* size 0 *)
+  x32 0; x32 0;                                (* atime, mtime: unchanged *)
+  nfs_send !nfsd_port
+
+(* WRITE of the next piece at nfs_off, FILE_SYNC *)
+let send_write () =
+  let n = if !nfs_src_len - !nfs_off > nfs_chunk then nfs_chunk else !nfs_src_len - !nfs_off in
+  rpc_call rpc_nfs 3 7;
+  xfh fh_file !fh_file_len;
+  x32 0; x32 !nfs_off;
+  x32 n; x32 2;
+  x32 n;
+  for i = 0 to n - 1 do tx (!xp + i) ((!nfs_src_get) (!nfs_off + i)) done;
+  xpad n;
   nfs_send !nfsd_port
 
 let send_read () =
@@ -4394,13 +4440,20 @@ let nfs_reply len =
   else if !nfs_state = nfs_pmap_nfs then begin
     let p = r32 () in
     nfsd_port := (if p = 0 then 2049 else p);
-    nfs_state := nfs_looking; send_lookup (); nfs_step ()
+    if !nfs_mode = 1 && !nfs_leaf = 0 then begin nfs_state := nfs_creating; send_create (); nfs_step () end
+    else begin nfs_state := nfs_looking; send_lookup (); nfs_step () end
   end
   else if !nfs_state = nfs_looking then begin
     if r32 () <> 0 then nfs_fail "no such file"
     else begin
       fh_file_len := take_fh fh_file;
       if !fh_file_len = 0 then nfs_fail "bad handle"
+      else if !nfs_mode = 1 then begin
+        for i = 0 to 63 do bytes_set fh_root i (bytes_get fh_file i) done;
+        fh_root_len := !fh_file_len;
+        if !nfs_ce + 1 >= !nfs_leaf then begin nfs_state := nfs_creating; send_create (); nfs_step () end
+        else begin nfs_cs := !nfs_ce + 1; nfs_find_end (); send_lookup (); nfs_step () end
+      end
       else if !nfs_ce < string_length !nfs_path then begin
         (* a directory on the way: it becomes the one to look in, and the next component is looked up *)
         for i = 0 to 63 do bytes_set fh_root i (bytes_get fh_file i) done;
@@ -4441,6 +4494,33 @@ let nfs_reply len =
       end
     end
   end
+  else if !nfs_state = nfs_creating then begin
+    if r32 () <> 0 then nfs_fail "create refused"
+    else if r32 () = 0 then nfs_fail "no handle for the new file"
+    else begin
+      fh_file_len := take_fh fh_file;
+      nfs_off := 0;
+      if !fh_file_len = 0 then nfs_fail "bad handle"
+      else if !nfs_src_len = 0 then begin nfs_state := nfs_idle; nfs_result := 0 end
+      else begin nfs_state := nfs_writing; send_write (); nfs_step () end
+    end
+  end
+  else if !nfs_state = nfs_writing then begin
+    if r32 () <> 0 then nfs_fail "write refused"
+    else begin
+      (if r32 () = 1 then rp := !rp + 24);         (* wcc_data: pre_op_attr, then post_op_attr *)
+      skip_attr ();
+      let count = r32 () in
+      if count = 0 then nfs_fail "short write"
+      else begin
+        nfs_off := !nfs_off + count;
+        if !nfs_off >= !nfs_src_len then begin
+          nfs_state := nfs_idle; nfs_result := !nfs_off;
+          uart_puts "nfs: "; uart_dec !nfs_off; uart_puts " bytes written\n"
+        end else begin send_write (); nfs_step () end
+      end
+    end
+  end
 
 let nfs_tick () =
   if !nfs_state <> nfs_idle && now () > !nfs_deadline then begin
@@ -4452,6 +4532,8 @@ let nfs_tick () =
        else if !nfs_state = nfs_mounting then send_mnt ()
        else if !nfs_state = nfs_pmap_nfs then send_getport rpc_nfs 3
        else if !nfs_state = nfs_looking then send_lookup ()
+       else if !nfs_state = nfs_creating then send_create ()
+       else if !nfs_state = nfs_writing then send_write ()
        else send_read ());
       nfs_deadline := now () + 1500
     end
@@ -4469,6 +4551,19 @@ let nfs_arp_reply len =
 
 (* start fetching export + path, the server being nfs_ip; the host has checked it can *)
 let nfs_launch export path =
+  nfs_mode := 0;
+  nfs_export := export; nfs_path := path;
+  nfs_cs := 0; nfs_find_end ();
+  nfs_result := 0 - 1;
+  nfs_state := nfs_arping;
+  nfs_arp_request ();
+  nfs_step ()
+
+(* the same, to create path (truncating it) and write nfs_src_len bytes from nfs_src_get *)
+let nfs_launch_write export path =
+  let leaf = ref 0 in
+  for i = 0 to string_length path - 1 do if string_get path i = '/' then leaf := i + 1 done;
+  nfs_mode := 1; nfs_leaf := !leaf;
   nfs_export := export; nfs_path := path;
   nfs_cs := 0; nfs_find_end ();
   nfs_result := 0 - 1;
@@ -4479,12 +4574,13 @@ let nfs_launch export path =
 
 (* the file goes to the RAM disk, as a file of that name *)
 let nfs_at = ref 0               (* where its bytes are going on the disk *)
+let nfs_name = ref ""             (* and the name it is to have there *)
 let () =
   nfs_dest_begin := (fun (_u : int) -> nfs_at := rfs_free ());
   nfs_dest_room := (fun (_u : int) -> io_read disk_size_reg - !nfs_at);
   (* straight to the disk: no copy in staging, and nothing to move afterwards -- the bytes are already where the file will live *)
   nfs_dest_put := (fun (o : int) (v : int) -> db_set (!nfs_at + o) v);
-  nfs_dest_finish := (fun (n : int) -> rfs_commit !nfs_path !nfs_at n >= 0)
+  nfs_dest_finish := (fun (n : int) -> rfs_commit !nfs_name !nfs_at n >= 0)
 
 (* what the language sees *)
 (* "192.168.1.106" as one argument: the compiler applies at most two at a
@@ -4515,9 +4611,121 @@ let nfs_start export f =
   else if string_length f > rfs_name_max then 0
   else begin
     let _ = rfs_ready () in
+    nfs_name := f;
     nfs_launch export f;
     1
   end
+
+(* ---- NFS files by name: nfs(U,P)dir/file ----
+   U is the server's host number on this network (0: the address nfs_server gave), P is ignored; the path is below the
+   export nfs_root names.  open_in fetches the file into the RAM disk, under its last component, and opens that; open_out
+   writes a scratch file of that name and close_out creates the file on the server and sends it.  The wait is for the replies
+   in this very call, so it is only done in a session on the UART: in a network session the TX window holds the reply being
+   built and the receive window the command being run. *)
+let nfs_unit = ref 0
+let nfs_rel = ref ""
+let nfs_root = ref "/srv/nfs/vc707"
+
+let nfs_digit (nm : string) (i : int) =
+  i < string_length nm && int_of_char (string_get nm i) >= 48 && int_of_char (string_get nm i) <= 57
+
+let nfs_parse (nm : string) =
+  let n = string_length nm in
+  if n < 7 || string_get nm 0 <> 'n' || string_get nm 1 <> 'f' || string_get nm 2 <> 's' || string_get nm 3 <> '(' then false
+  else begin
+    let i = ref 4 and u = ref 0 in
+    while nfs_digit nm !i do u := !u * 10 + (int_of_char (string_get nm !i) - 48); i := !i + 1 done;
+    if !i >= n || string_get nm !i <> ',' then false
+    else begin
+      i := !i + 1;
+      while nfs_digit nm !i do i := !i + 1 done;
+      if !i >= n || string_get nm !i <> ')' then false
+      else begin
+        i := !i + 1;
+        let r = create_bytes (n - !i) in
+        for k = !i to n - 1 do bytes_set r (k - !i) (string_get nm k) done;
+        nfs_unit := !u; nfs_rel := bytes_to_string r;
+        true
+      end
+    end
+  end
+
+(* the last component, which names the file on the RAM disk *)
+let nfs_base (path : string) =
+  let n = string_length path in
+  let b = ref 0 in
+  for i = 0 to n - 1 do if string_get path i = '/' then b := i + 1 done;
+  let r = create_bytes (n - !b) in
+  for k = !b to n - 1 do bytes_set r (k - !b) (string_get path k) done;
+  bytes_to_string r
+
+(* frames until the transfer in hand ends *)
+let nfs_pump () =
+  while !nfs_state <> nfs_idle do
+    nfs_tick ();
+    if io_read eth_status land eth_rx_valid <> 0 then begin
+      let len = io_read eth_rxlen land 0x7FF in
+      if rx 12 = 0x08 && rx 13 = 0x06 then begin handle_arp len; nfs_arp_reply len end
+      else if rx 12 = 0x08 && rx 13 = 0x00 && len >= 42 then begin
+        let ihl = (rx 14 land 0x0F) * 4 in
+        let dport = (rx (14 + ihl + 2) lsl 8) lor rx (14 + ihl + 3) in
+        if rx 23 = 1 then handle_icmp len ihl
+        else if rx 23 = 17 && dport = 68 then handle_dhcp len
+        else if rx 23 = 17 && dport = nfs_lport then nfs_reply len
+      end;
+      io_write eth_rxlen 0
+    end
+  done
+
+let nfs_ready (nm : string) =
+  if not_b !net_on then raise (Sys_error (nm ^^ ": the network is off"))
+  else if not_b (bound ()) then raise (Sys_error (nm ^^ ": no address yet"))
+  else if !to_net then raise (Sys_error (nm ^^ ": NFS files need a session on the UART"))
+  else if !nfs_state <> nfs_idle then raise (Sys_error (nm ^^ ": an NFS transfer is running"))
+  else begin
+    (if !nfs_unit > 0 then begin
+       for i = 0 to 2 do array_set nfs_ip i (ip i) done;
+       array_set nfs_ip 3 !nfs_unit;
+       for i = 0 to 5 do array_set nfs_mac i 0 done
+     end);
+    if array_get nfs_ip 0 = 0 then raise (Sys_error (nm ^^ ": no server (nfs_server, or nfs(N,0))"))
+  end
+
+let () =
+  nfs_in_hook := (fun (nm : string) ->
+    if not_b (nfs_parse nm) then nm
+    else begin
+      nfs_ready nm;
+      let base = nfs_base !nfs_rel in
+      if string_length base = 0 || string_length base > rfs_name_max then raise (Sys_error (nm ^^ ": Invalid argument"))
+      else begin
+        let _ = rfs_ready () in
+        nfs_name := base;
+        nfs_launch !nfs_root !nfs_rel;
+        nfs_pump ();
+        if !nfs_result < 0 then raise (Sys_error (nm ^^ ": No such file or directory"))
+        else base
+      end
+    end);
+  nfs_out_hook := (fun (nm : string) ->
+    nfs_out_cand := "";
+    if not_b (nfs_parse nm) then nm
+    else begin
+      nfs_ready nm;
+      let base = nfs_base !nfs_rel in
+      if string_length base = 0 || string_length base > rfs_name_max then raise (Sys_error (nm ^^ ": Invalid argument"))
+      else begin nfs_out_cand := !nfs_rel; base end
+    end);
+  nfs_close_hook := (fun (_u : int) ->
+    if string_length !nfs_out_target > 0 then begin
+      let path = !nfs_out_target in
+      nfs_out_target := "";
+      nfs_src_len := !out_len;
+      nfs_src_get := (fun (i : int) -> db (!out_at + i));
+      nfs_launch_write !nfs_root path;
+      nfs_pump ();
+      if !nfs_result < 0 then raise (Sys_error (path ^^ ": could not be written over NFS"))
+    end)
 
 (* ---- evaluating a line, whichever way it came ---- *)
 (* Printing a double, without caml_format_float -- which this processor does
@@ -4646,6 +4854,7 @@ let builtins =
     ("run_file", 1, TArrow (TString, TInt));
     ("files", 1, TArrow (TInt, TInt));
     ("nfs_server", 1, TArrow (TString, TInt));
+    ("nfs_root", 1, TArrow (TString, TInt));
     ("nfs_fetch", 2, TArrow (TString, TArrow (TString, TInt)));
     ("nfs_done", 1, TArrow (TInt, TInt));
     ("boot_file", 1, TArrow (TString, TInt));
@@ -5570,10 +5779,6 @@ let packets = ref 0
 
 
 
-(* the loader's serial boot leaves 0x4E in the RAM disk's last byte: then the network is not touched at all, so that
-   what the compiler allocates cannot depend on what frames arrive *)
-let net_on = ref true
-
 let poll () =
   uart_poll ();
   if !net_on then begin
@@ -5661,6 +5866,7 @@ let () =
     install_fn "nfs_server" (magic (fun (a : string) -> nfs_set_server a));
     install_fn "nfs_fetch"
       (magic (fun (e : string) (f : string) -> nfs_start e f));
+    install_fn "nfs_root" (magic (fun (a : string) -> nfs_root := a; 1));
     install_fn "nfs_done" (magic (fun (_n : int) -> !nfs_result));
     install_fn "boot_file" (magic (fun (a : string) -> boot_file a));
     install_fn "open_in" (magic (fun (a : string) -> open_in a));
@@ -5689,7 +5895,7 @@ let () =
     install_fn "disk_set" (magic (fun (i : int) (v : int) -> disk_set i v; 0));
     install_fn "image_begin" (magic (fun (a : string) -> img_begin a));
     install_fn "image_end" (magic (fun (n : int) -> img_end n));
-    predefine "let help = \"mini-ML on the OCaml processor: type an expression or a let and press Enter (;; ends a phrase early).\\n  1 + 2        let sq x = x * x        sq 12        let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\\nFiles live on the RAM disk and survive a chain load:  files 0   read_file \\\"a.ml\\\"   write_file \\\"a.ml\\\" \\\"text\\\"   run_file \\\"a.ml\\\"\\nFrom the network:  nfs_server \\\"192.168.1.106\\\"   nfs_fetch \\\"/srv/nfs/vc707\\\" \\\"maths.ml\\\"   nfs_done 0   (then run_file \\\"maths.ml\\\")\\nThe SD card:  run_file \\\"sd.ml\\\"   run_file \\\"fat.ml\\\"   sd_init ()   fat_mount ()   fat_ls !fat_root   fat_load \\\"COMP    BC \\\" 0\\nMore on the board: telnet to its address (port 23) or UDP 7777.  After a reset the loader asks boot: and takes\\n  sd(0,0)vm.img   nfs(0,0)path   tftp(0,0)file   mem(0,0)   or nothing for the default; ? lists them.  help prints this again.\""
+    predefine "let help = \"mini-ML on the OCaml processor: type an expression or a let and press Enter (;; ends a phrase early).\\n  1 + 2        let sq x = x * x        sq 12        let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\\nFiles live on the RAM disk and survive a chain load:  files 0   read_file \\\"a.ml\\\"   write_file \\\"a.ml\\\" \\\"text\\\"   run_file \\\"a.ml\\\"\\nOn an NFS server (from the UART session):  nfs_server \\\"192.168.1.106\\\"   nfs_root \\\"/srv/nfs/vc707\\\"   then names nfs(0,0)dir/a.ml\\n  work with open_in, open_out, read_file, write_file and run_file; reading fetches the file, close_out sends it.  Or nfs_fetch / nfs_done.\\nThe SD card:  run_file \\\"sd.ml\\\"   run_file \\\"fat.ml\\\"   sd_init ()   fat_mount ()   fat_ls !fat_root   fat_load \\\"COMP    BC \\\" 0\\nMore on the board: telnet to its address (port 23) or UDP 7777.  After a reset the loader asks boot: and takes\\n  sd(0,0)vm.img   nfs(0,0)path   tftp(0,0)file   mem(0,0)   or nothing for the default; ? lists them.  help prints this again.\""
   end;
   puts "OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build ";
   uart_build ();
