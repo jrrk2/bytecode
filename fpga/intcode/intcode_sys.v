@@ -78,6 +78,8 @@ module intcode_sys #(
 	reg [15:0] nwords = 16'd0, wcnt = 16'd0;
 	reg [31:0] hc = 32'd0, hp = 32'd0, hg = 32'd0;
 	reg        have = 1'b0;
+	reg        hasname = 1'b0;                     // the program's header carries the name of its standard input (magic INTD)
+	reg [31:0] sname0 = 32'h05535444, sname1 = 32'h494E0000, sname2 = 32'd0, sname3 = 32'd0, sname4 = 32'd0, sname5 = 32'd0;     // STDIN unless it says otherwise
 	reg        w_open = 1'b0;                      // a file is open for writing in the flash file system
 	// micro-operations for the file system, asked for by the I/O state machine below with a toggle (f_req_t != f_ack_t) once the boot copy is done:
 	// 0 start a READ (0x03) at f_addr, 1 read a 32-bit word into f_data (little-endian), 2 read a byte, 3 end (chip select high),
@@ -99,7 +101,8 @@ module intcode_sys #(
 	always @(posedge clk) begin
 		ld_we <= 1'b0; xdone <= 1'b0;
 		if (sys_rst || warm) begin
-			bst <= B_R1; boot_run <= 1'b1; cs_q <= 1'b1; sck_q <= 1'b0; xfer <= 1'b0; gap <= 16'd0; have <= 1'b0; widx <= 4'd0; f_ack_t <= 1'b0; fbusy <= 1'b0;
+			bst <= B_R1; boot_run <= 1'b1; cs_q <= 1'b1; sck_q <= 1'b0; xfer <= 1'b0; gap <= 16'd0; have <= 1'b0; widx <= 4'd0; f_ack_t <= 1'b0; fbusy <= 1'b0; hasname <= 1'b0;
+			sname0 <= 32'h05535444; sname1 <= 32'h494E0000; sname2 <= 32'd0; sname3 <= 32'd0; sname4 <= 32'd0; sname5 <= 32'd0;
 		end else begin
 			// the bit engine: nbits bits out of txsh (MSB first) and into rxsh, SPI mode 0
 			if (xfer) begin
@@ -124,11 +127,17 @@ module intcode_sys #(
 					if (!xfer && !xdone) begin txsh <= 32'd0; nbits <= 6'd32; xfer <= 1'b1; ph <= 4'd0; end
 					else if (xdone) begin
 						case (widx)
-							4'd0: if (flash_word != 32'h494E5443) bst <= B_DONE; else widx <= 4'd1;
+							4'd0: if (flash_word != 32'h494E5443 && flash_word != 32'h494E5444) bst <= B_DONE; else begin hasname <= (flash_word == 32'h494E5444); widx <= 4'd1; end
 							4'd1: begin nwords <= flash_word[15:0]; if (flash_word > 32'd32765) bst <= B_DONE; else widx <= 4'd2; end
 							4'd2: begin hc <= flash_word; widx <= 4'd3; end
 							4'd3: begin hp <= flash_word; widx <= 4'd4; end
-							4'd4: begin hg <= flash_word; widx <= 4'd5; wcnt <= 16'd0; have <= 1'b1; if (nwords == 16'd0) bst <= B_SKIP; end
+							4'd4: begin hg <= flash_word; widx <= hasname ? 4'd5 : 4'd11; wcnt <= 16'd0; have <= 1'b1; if (nwords == 16'd0 && !hasname) bst <= B_SKIP; end
+							4'd5: begin sname0 <= flash_word; widx <= 4'd6; end
+							4'd6: begin sname1 <= flash_word; widx <= 4'd7; end
+							4'd7: begin sname2 <= flash_word; widx <= 4'd8; end
+							4'd8: begin sname3 <= flash_word; widx <= 4'd9; end
+							4'd9: begin sname4 <= flash_word; widx <= 4'd10; end
+							4'd10: begin sname5 <= flash_word; widx <= 4'd11; if (nwords == 16'd0) bst <= B_SKIP; end
 							default: begin
 								ld_we <= 1'b1; ld_addr <= wcnt[14:0]; ld_data <= flash_word[WIDTH-1:0];
 								wcnt <= wcnt + 16'd1;
@@ -273,7 +282,7 @@ module intcode_sys #(
 			IDLE: if (io_req) begin
 					op <= io_op;
 					if (FS_WRITE != 0 && WIDTH == 32 && !stdin_chk) begin                // first request: is there a file STDIN?
-						stdin_scan <= 1'b1; kname <= 1'b1; isw <= 1'b0; nlen <= 8'd5; nmw <= 3'd2; ei <= 3'd0; ecount <= 12'd0; match <= 1'b1; found <= 1'b0;
+						stdin_scan <= 1'b1; kname <= 1'b1; isw <= 1'b0; nlen <= sname0[31:24]; nmw <= sname0[31:26] + 3'd1; ei <= 3'd0; ecount <= 12'd0; match <= 1'b1; found <= 1'b0;
 						cur <= FS_AT; f_op <= 3'd0; f_addr <= FS_AT; f_req_t <= ~f_req_t; fret <= FE_W; st <= FW;
 					end else st <= GOT;
 				end
@@ -322,7 +331,7 @@ module intcode_sys #(
 				else begin nm_cur <= {WIDTH{1'b0}}; st <= FE_R; end
 			end
 			FE_N0: st <= FE_N1;
-			FE_N1: begin nm_cur <= kname ? (ei == 3'd0 ? 32'h05535444 : ei == 3'd1 ? 32'h494E0000 : 32'd0) : m_rdata_w; st <= inhdr ? WO2 : FE_R; end      // STDIN, or the name from the store
+			FE_N1: begin nm_cur <= kname ? (ei == 3'd0 ? sname0 : ei == 3'd1 ? sname1 : ei == 3'd2 ? sname2 : ei == 3'd3 ? sname3 : ei == 3'd4 ? sname4 : sname5) : m_rdata_w; st <= inhdr ? WO2 : FE_R; end      // STDIN, or the name from the store
 			FE_R: `FOP(3'd1, FE_C)
 			FE_C: begin
 				if (ei == 3'd0 && (f_data == 32'd0 || f_data == 32'hffffffff)) begin          // a blank header: the end of the chain
