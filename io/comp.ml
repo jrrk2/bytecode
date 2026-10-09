@@ -2131,7 +2131,7 @@ and infer_pats env ps ts = match ps, ts with
    running program write; locals live on the stack, and a name is looked up
    at compile time rather than at run time, which is where the speed comes
    from.  Nothing is reclaimed: the code pointer only goes up. *)
-let code_win = 0x60000
+let code_win = 0x200000
 let prog_words_reg = 0x100c
 
 let op_acc = 8
@@ -4670,7 +4670,7 @@ let boot_file (nm : string) =
     let o = rfs_offset k in
     let code = d32 (o + 8) and heap = d32 (o + 12) and globals = d32 (o + 16) in
     if rfs_length k < 32 || o land 3 <> 0 || db o <> 0x4F || db (o + 1) <> 0x43 || db (o + 2) <> 0x56 || db (o + 3) <> 0x4D
-       || code > 65535 || heap > 24576 || globals > 8192
+       || code > 131071 || heap > 24576 || globals > 8192
        || 32 + 4 * (code + heap + globals) > rfs_length k then 0 - 2
     else begin
       let w = (o + 32) / 4 in

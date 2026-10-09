@@ -32,7 +32,10 @@
 //              words, then where each starts in the staging RAM, in words
 //              (the loader writes these, then BOOT; an OCVM image or a raw
 //              bytecode executable stripped where it lies)
-//   0x100d  r  the RAM disk's size in bytes
+//   0x1016  w  the program's code is already in the code RAM (the loader wrote it there through
+//              0x200000..): the value is its length in words; the code length in 0x1010 is then 0
+//              and BOOT copies only the heap and globals.  Cleared by the boot.
+//   0x100d  r  the RAM disk's size in bytes: 0, this build has none
 //   0x100f  w  the program is finished: once its output has left, restart the resident program (the
 //              loader); the RAM disk is kept
 //   0x100e  w  boot an image from the RAM disk: the description in 0x1010..0x1015 (word indices from
@@ -41,7 +44,7 @@
 //              it is lost at power off, but the sequencer never touches it
 //              and the VM's reset does not reach it: it outlives a chain
 //              load, which is what makes it worth having a filesystem on.
-//   0x60000..0x9FFFF  the program's code, a byte per address, readable and
+//   0x200000..0x27FFFF  the program's code (128K words), a byte per address, readable and
 //              writable while it runs: a compiler on this machine appends
 //              closures to the program it is itself part of, and reads it
 //              back to find the places it must patch
@@ -170,8 +173,9 @@ module ethmin_vm_core #(
 	// part has 853 RAMB36 spare of 1030, and PCW is 24 bits, so nothing
 	// but that number stood in the way.  Doubling it costs about 33 tiles
 	// and turns 3941 free words into some 37000.
-	localparam integer DISK_WORDS  = 131072;  // the RAM disk: 512 KiB
-	localparam integer PROG_WORDS  = 65536;
+	localparam integer DISK_WORDS  = 0;       // the RAM disk: none (it was 131072 words, 512 KiB); 0x100d reads 0 and the software copes
+	localparam integer DISK_ALLOC  = DISK_WORDS > 0 ? DISK_WORDS : 1;
+	localparam integer PROG_WORDS  = 131072;  // the program code RAM: 512 KiB (it was 65536 words)
 	localparam integer STAGE_WORDS = 65536;   // staging RAM: 256 KiB, 0x10000..0x4FFFF
 	// 64K words, two 32K semi-spaces (it was 32K words: a compiler's phrases
 	// outgrew 16K).  It was briefly four times the 32K, to
@@ -199,11 +203,11 @@ module ethmin_vm_core #(
 	wire [31:0] rom_q;
 	reg [31:0] prog_code [0:PROG_WORDS-1];
 	reg [31:0] stage_ram [0:STAGE_WORDS-1];
-	reg [31:0] disk_ram  [0:DISK_WORDS-1];
+	reg [31:0] disk_ram  [0:DISK_ALLOC-1];
 
 	wire [23:0] pc /*verilator public_flat_rd*/;
 	reg         code_bank /*verilator public_flat_rd*/;  // 0: the resident program, 1: the loaded one
-	reg  [16:0] prog_words /*verilator public_flat_rd*/;   // 17 bits: 65536 does not fit in 16
+	reg  [17:0] prog_words /*verilator public_flat_rd*/;   // 18 bits: 131072 does not fit in 17
 
 	// The staged image is described by the loader, not by a header the sequencer
 	// reads: 0x1010..0x1015 take the lengths and the staging word index of the code,
@@ -216,8 +220,10 @@ module ethmin_vm_core #(
 	reg [2:0]  seq_state /*verilator public_flat_rd*/;
 	reg        seq_from_stage;         // copying the staged image (else the resident one)
 	reg        seq_data_ready;         // the word read last cycle is in seq_q
-	reg [15:0] seq_i, seq_n;           // word index within the current section, its length
-	reg [15:0] stage_code, stage_heap, stage_globals;   // section lengths in words, set by the loader
+	reg [16:0] seq_i, seq_n;           // word index within the current section, its length
+	reg [16:0] stage_code, stage_heap, stage_globals;   // section lengths in words, set by the loader
+	reg        code_inplace;           // the loader wrote the code into the code RAM itself: nothing to copy, prog_words from inplace_words
+	reg [17:0] inplace_words;
 	reg [16:0] base_code, base_heap, base_globals;      // where each starts in the staging RAM or the RAM disk, in words
 	reg [2:0]  rh_i;                                        // reading the ROM's description
 	reg [15:0] res_heap, res_glob, res_prog;                // the resident program's sizes, from the ROM
@@ -239,8 +245,8 @@ module ethmin_vm_core #(
 	reg        set_pw;            // 0x100c: raise prog_words
 	reg        desc_we;           // 0x1010..0x1015: one field of the staged image's description
 	reg [2:0]  desc_sel;
-	reg [16:0] desc_val;
-	reg [16:0] set_pw_val;
+	reg [17:0] desc_val;
+	reg [17:0] set_pw_val;
 	integer    code_lane;
 
 	// The word read this cycle, available next cycle in rom_q (the resident
@@ -252,7 +258,7 @@ module ethmin_vm_core #(
 	reg  [31:0] disk_q;
 	wire seq_disk_rd = seq_from_disk && (seq_state == SEQ_CODE || seq_state == SEQ_HEAP || seq_state == SEQ_GLOBALS);
 	wire [31:0] seq_word = seq_from_disk ? disk_q : seq_q;
-	wire [16:0] seq_addr = {1'b0, seq_i} + ((seq_state == SEQ_CODE) ? base_code
+	wire [16:0] seq_addr = seq_i + ((seq_state == SEQ_CODE) ? base_code
 	                              : (seq_state == SEQ_HEAP) ? base_heap : base_globals);
 	always @(posedge clk_sys) begin
 		seq_q <= stage_ram[seq_addr[15:0]];
@@ -262,27 +268,29 @@ module ethmin_vm_core #(
 		load_we <= 1'b0;
 		if (set_pw) prog_words <= set_pw_val;
 		if (desc_we) case (desc_sel)
-			3'd0: stage_code    <= desc_val[15:0];
-			3'd1: stage_heap    <= desc_val[15:0];
-			3'd2: stage_globals <= desc_val[15:0];
-			3'd3: base_code     <= desc_val;
-			3'd4: base_heap     <= desc_val;
-			3'd5: base_globals  <= desc_val;
+			3'd0: stage_code    <= desc_val[16:0];
+			3'd1: stage_heap    <= desc_val[16:0];
+			3'd2: stage_globals <= desc_val[16:0];
+			3'd3: base_code     <= desc_val[16:0];
+			3'd4: base_heap     <= desc_val[16:0];
+			3'd5: base_globals  <= desc_val[16:0];
+			3'd6: begin inplace_words <= desc_val; code_inplace <= 1'b1; end   // 0x1016: the code is already in the code RAM
 			default: ;
 		endcase
 		if (!resetn) begin
 			seq_state <= SEQ_RESIDENT;
 			seq_from_stage <= 1'b0;
-			seq_i <= 16'd0;
+			seq_i <= 17'd0;
 			seq_data_ready <= 1'b0;
 			vm_hold <= 1'b1;
 			code_bank <= 1'b0;
 			seq_from_disk <= 1'b0;
 			resident_pending <= 1'b0;
+			code_inplace <= 1'b0;
 		end else case (seq_state)
 			SEQ_RESIDENT: begin             // the ROM's three-word description, then the heap copy
 				rh_i <= 3'd0;
-				seq_i <= 16'd0;
+				seq_i <= 17'd0;
 				seq_data_ready <= 1'b0;
 				seq_state <= SEQ_RHDR;
 			end
@@ -294,7 +302,7 @@ module ethmin_vm_core #(
 					3'd3: begin
 						res_prog <= rom_q[15:0];
 						seq_n    <= res_heap;
-						seq_i    <= 16'd0;
+						seq_i    <= 17'd0;
 						seq_data_ready <= 1'b0;
 						seq_state <= SEQ_HEAP;
 					end
@@ -314,15 +322,15 @@ module ethmin_vm_core #(
 					end
 				end
 				if (seq_i < seq_n) begin              // seq_addr reads word seq_i this cycle
-					seq_i <= seq_i + 16'd1;
+					seq_i <= seq_i + 17'd1;
 					seq_data_ready <= 1'b1;
 				end else begin                  // section done: the next
-					seq_i <= 16'd0;
+					seq_i <= 17'd0;
 					seq_data_ready <= 1'b0;
 					case (seq_state)
 						SEQ_CODE: begin seq_n <= stage_heap; seq_state <= SEQ_HEAP; end
 						SEQ_HEAP: begin   // every global slot: no stale pointers for the GC
-							seq_n <= 16'd1 << GLOBALS_AW;   // every slot, so the GC never scans garbage
+							seq_n <= 17'd1 << GLOBALS_AW;   // every slot, so the GC never scans garbage
 							glob_count <= seq_from_stage ? stage_globals : res_glob;
 							seq_state <= SEQ_GLOBALS;
 						end
@@ -337,7 +345,8 @@ module ethmin_vm_core #(
 				// wider than 16 bits
 				image_words <= seq_from_stage ? stage_heap : res_heap;
 				code_bank   <= seq_from_stage;
-				prog_words  <= {1'b0, stage_code[15:0]};
+				prog_words  <= code_inplace ? inplace_words : {1'b0, stage_code};
+				code_inplace <= 1'b0;
 				seq_state   <= SEQ_RUN;         // the VM leaves reset next cycle
 			end
 			SEQ_RUN: begin
@@ -349,7 +358,7 @@ module ethmin_vm_core #(
 					seq_from_stage <= 1'b0;
 					seq_from_disk <= 1'b0;
 					code_bank <= 1'b0;
-					seq_i <= 16'd0;
+					seq_i <= 17'd0;
 					seq_data_ready <= 1'b0;
 					seq_state <= SEQ_RESIDENT;
 				end else if (boot_req || boot_disk_req) begin
@@ -357,7 +366,7 @@ module ethmin_vm_core #(
 					seq_from_stage <= 1'b1;
 					seq_from_disk <= boot_disk_req;
 					seq_n <= stage_code;
-					seq_i <= 16'd0;
+					seq_i <= 17'd0;
 					seq_data_ready <= 1'b0;
 					seq_state <= SEQ_CODE;
 				end
@@ -385,8 +394,8 @@ module ethmin_vm_core #(
 		.clk(clk_sys), .en(1'b1), .addr(fetch_pc[14:0]), .dout(code_rom_q_w));
 
 	always @(posedge clk_sys) begin
-		code_prog_q <= prog_code[fetch_pc[15:0]];
-		fetch_in_range <= code_bank ? (fetch_pc < {7'd0, prog_words})
+		code_prog_q <= prog_code[fetch_pc[16:0]];
+		fetch_in_range <= code_bank ? (fetch_pc < {6'd0, prog_words})
 		                            : (fetch_pc < {8'd0, res_prog});
 		code_q_pc <= fetch_pc;
 		// a new program invalidates what was fetched, and so does writing
@@ -576,13 +585,13 @@ module ethmin_vm_core #(
 	// Base-relative: the boot sequencer reads the image from word 0.  The old
 	// [15:2] did that by accident, dropping bit 16 of a window that was one
 	// bit wide; over 128 KiB the offset has to be taken properly.
-	wire [15:0] stage_idx = (io_addr - 32'h10000) >> 2;
+	wire [15:0] stage_idx = (io_addr - 32'h10000) >> 2;      // the staging RAM: 256 KiB at 0x10000
 
 	// Code memory while the VM runs.  The sequencer's write port is idle
 	// then, so the two share it; they cannot collide, because the VM is
 	// held in reset for the whole of a load and io_new needs !vm_reset.
-	wire io_is_code = io_addr >= 32'h60000 && io_addr < 32'hA0000;
-	wire [15:0] code_idx = (io_addr - 32'h60000) >> 2;
+	wire io_is_code = io_addr >= 32'h200000 && io_addr < 32'h280000;      // 512 KiB, a byte per address
+	wire [16:0] code_idx = (io_addr - 32'h200000) >> 2;
 	wire code_wr = io_new && io_is_code && io_write;
 
 	// The RAM disk, written and read a byte at a time as the staging RAM is.
@@ -622,7 +631,7 @@ module ethmin_vm_core #(
 	// with byte writes over two blocks is not.
 	wire        pc_load  = (seq_state == SEQ_CODE) && seq_data_ready;
 	// all 16 bits of seq_i: a program longer than 32K words wrapped onto its own start
-	wire [15:0] pc_paddr = pc_load ? (seq_i - 16'd1) : code_idx;
+	wire [16:0] pc_paddr = pc_load ? (seq_i - 17'd1) : code_idx;
 	wire [31:0] pc_pdata = pc_load ? seq_word : {4{trap_arg1[7:0]}};
 	wire [ 3:0] pc_pbe   = pc_load ? 4'b1111
 	                     : (code_wr ? (4'b0001 << io_addr[1:0]) : 4'b0000);
@@ -638,13 +647,17 @@ module ethmin_vm_core #(
 	// the VM is held in reset, as the code RAM's second port is shared with it.
 	integer disk_lane;
 	wire [16:0] disk_ra = seq_disk_rd ? seq_addr : disk_idx;
-	always @(posedge clk_sys) begin
-		if (io_new && io_is_disk && io_write)
-			for (disk_lane = 0; disk_lane < 4; disk_lane = disk_lane + 1)
-				if (io_addr[1:0] == disk_lane)
-					disk_ram[disk_idx][8*disk_lane +: 8] <= trap_arg1[7:0];
-		if ((io_new && io_is_disk) || seq_disk_rd) disk_q <= disk_ram[disk_ra];
-	end
+	generate if (DISK_WORDS > 0) begin : g_disk
+		always @(posedge clk_sys) begin
+			if (io_new && io_is_disk && io_write)
+				for (disk_lane = 0; disk_lane < 4; disk_lane = disk_lane + 1)
+					if (io_addr[1:0] == disk_lane)
+						disk_ram[disk_idx][8*disk_lane +: 8] <= trap_arg1[7:0];
+			if ((io_new && io_is_disk) || seq_disk_rd) disk_q <= disk_ram[disk_ra];
+		end
+	end else begin : g_nodisk
+		always @(posedge clk_sys) disk_q <= 32'd0;       // no RAM disk: reads give 0, writes go nowhere
+	end endgenerate
 
 	// The staging RAM's program side: a byte per address, as the packet RAM.
 	reg [31:0] stage_q;
@@ -719,7 +732,7 @@ module ethmin_vm_core #(
 						32'h100b: trap_result <= {27'd0, btn_sync[1]}; // the push buttons
 						// the program's length: read to find where its code
 						// ends, written to admit what was appended
-						32'h100c: trap_result <= {15'd0, prog_words};
+						32'h100c: trap_result <= {14'd0, prog_words};
 						// the disk's size, so nothing has to assume it
 						32'h100d: trap_result <= DISK_WORDS * 4;
 						32'h1008: begin                               // a received byte, or -1
@@ -735,9 +748,9 @@ module ethmin_vm_core #(
 						32'h1007: boot_req <= 1'b1;                   // boot the staged image
 						32'h100e: boot_disk_req <= 1'b1;              // boot the image in the RAM disk
 						32'h100f: resident_req <= 1'b1;               // back to the loader (the program is finished)
-						32'h100c: begin set_pw <= 1'b1; set_pw_val <= trap_arg1[16:0]; end
-						32'h1010, 32'h1011, 32'h1012, 32'h1013, 32'h1014, 32'h1015: begin
-							desc_we <= 1'b1; desc_sel <= io_addr[2:0]; desc_val <= trap_arg1[16:0];
+						32'h100c: begin set_pw <= 1'b1; set_pw_val <= trap_arg1[17:0]; end
+						32'h1010, 32'h1011, 32'h1012, 32'h1013, 32'h1014, 32'h1015, 32'h1016: begin
+							desc_we <= 1'b1; desc_sel <= io_addr[2:0]; desc_val <= trap_arg1[17:0];
 						end
 						default: ;
 					endcase

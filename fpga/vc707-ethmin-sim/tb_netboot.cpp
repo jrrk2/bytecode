@@ -23,6 +23,7 @@ static int uart_state = -1, uart_cnt, uart_byte, uart_last = 1, lines_after_boot
 static unsigned char tx_buf[2048];
 // typing at the UART: the next byte's bits, sent LSB first at 115200 8N1
 static FILE *uart_in;
+static FILE *boot_in;          // $TB_BOOT_INPUT: typed from 25 ms after reset, at the loader's boot prompt
 static int typing = 0, type_bit = -1, type_cnt, type_byte, typed_all;
 static uint64_t last_output_tick;
 extern uint64_t ticks_now();
@@ -30,7 +31,9 @@ static int tx_len;
 
 static void type_step() {           // at each clk_sys edge
   const int bit = 25000000 / 115200;
-  if (!typing || typed_all) return;
+  if (boot_in && ticks_now() < 6250000ULL) return;
+  FILE *src = boot_in ? boot_in : uart_in;
+  if (!src || (!boot_in && !typing) || typed_all) return;
   if (type_bit < 0) {                  // idle: two bit times, then the next byte
     if (--type_cnt > 0) return;
     // a 0x1A in the input is "wait until the console has been quiet", so that a Ctrl-T can follow a hang
@@ -40,8 +43,9 @@ static void type_step() {           // at each clk_sys edge
       if (ticks_now() - last_output_tick > pause_quiet) waiting = false;
       else return;
     }
-    int c = fgetc(uart_in);
+    int c = fgetc(src);
     if (c == 0x1A) { waiting = true; return; }
+    if (c == EOF && boot_in) { fclose(boot_in); boot_in = nullptr; top->UART_RX = 1; return; }
     if (c == EOF) { typed_all = 1; top->UART_RX = 1; return; }
     type_byte = c; type_bit = 0; type_cnt = bit;
     top->UART_RX = 0;                  // start bit
@@ -112,6 +116,7 @@ int main(int argc, char **argv) {
   top->UART_RX = 1;
   top->DIP = getenv("TB_DIP") ? atoi(getenv("TB_DIP")) : 106;   // the netboot host's address, 192.168.1.106
   if (getenv("TB_UART_INPUT")) uart_in = fopen(getenv("TB_UART_INPUT"), "rb");
+  if (getenv("TB_BOOT_INPUT")) boot_in = fopen(getenv("TB_BOOT_INPUT"), "rb");
   top->resetn = 0; top->eth_rst = 1;
   for (int i = 0; i < 200; i++) step();
   top->resetn = 1; top->eth_rst = 0;

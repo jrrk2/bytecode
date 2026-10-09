@@ -347,12 +347,12 @@ int main(int argc, char** argv) {
         if (top->trap_valid && !trap_answered &&
             (top->trap_prim == 1 || top->trap_prim == 2)) {
             uint32_t a = (uint32_t)top->trap_arg0;
-            if (a >= 0x60000 && a < 0xA0000) {
+            if (a >= 0x200000 && a < 0x280000) {
                 // Code memory while the program runs, a byte per address:
-                // fpga/vc707-ethmin/ethmin_vm_core.v decodes 0x60000..0x9FFFF
-                // (64K words) this way, and modelling it here is what lets a compiler
+                // fpga/vc707-ethmin/ethmin_vm_core.v decodes 0x200000..0x27FFFF
+                // (128K words) this way, and modelling it here is what lets a compiler
                 // that writes its own code be simulated at all.
-                uint32_t w = (a - 0x60000) >> 2, lane = a & 3;
+                uint32_t w = (a - 0x200000) >> 2, lane = a & 3;
                 if (top->trap_prim == 2) {
                     code_rom[w] = (code_rom[w] & ~(0xFFu << (8 * lane)))
                                 | (((uint32_t)top->trap_arg1 & 0xFF) << (8 * lane));

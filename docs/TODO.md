@@ -76,6 +76,29 @@ place.  To finish:
 * Then shrink the RAM disk to a scratch size (or none) and spend the tiles: code RAM to 128K words (64 more tiles), a bigger heap, deeper
   stack, URAM-style big cache for the DDR3 disk.  Keep a small RAM disk for the preloaded-bitstream case (`tools/preload.py`).
 
+## Fewer memories
+A design with many special-purpose RAMs is hard to reason about: each one needs deciding whether it is necessary, and each is a special case in the
+software.  In the spec23 build (675 RAMB36 tiles): heap 288 (two semispaces), RAM disk 128, program code 64, staging 64, stack 36, loader code ROM 32
+and data ROM 32, trace 17, globals 9, and about 9 more of device buffers (packet RAMs, Ethernet, SD, UART FIFO) -- some fifteen memories.
+**Rule:** a memory exists for a port requirement, not for a purpose.  The VM needs a fetch port and a data port at the same time, and the devices
+need their own buffer ports; everything else is a region of a RAM.  Any new RAM has to say which port requirement it answers.
+**Target:** a code RAM (fetch), a data RAM holding the heap, stack and globals as regions with its second port for I/O and loading, and the device
+buffers inside their devices.  Steps: the RAM disk (done in spec24; files live on the card and the network); staging, by loading code in place (done for
+NFS and the card) and then into the live heap (above); the loader ROMs, by making the loader an ordinary image that is copied into the code and data RAMs at
+reset (the loader is not special once chain loading exists); trace made a build option, off by default; stack and globals into the data RAM.  Also: have the
+build report list the memories and their tile counts, so growth shows.
+
+## Load a program into the live heap (no staging)
+Today the loader stages an image and the sequencer copies its heap and globals into the VM's RAMs with the VM held in reset.  A program
+could instead be loaded into the running machine's own heap: write its blocks into the free area of the current semispace (relocated
+by the base address as they are written, as `strip_and_boot` already unmarshals to a heap image), install its globals, switch the code
+bank and start it with a fresh stack.  The old program's heap data is unreachable from then on and the next collection drops it, so no
+reset is needed and any program can load another.  Needs: an I/O window onto the heap RAM and one onto the globals (a second port, or
+arbitration with the VM's accesses), a "start program" command (code bank, program length, pc, clear stack and accumulator, heap pointer
+past the new blocks), and care that the loader's stack and registers hold nothing that points into the new blocks.  Gains: no sequencer copy
+states, the 64 staging tiles (once TFTP, serial and preload have another route), dynamic loading.  Do it after the 128K-word build has
+been checked on the board.
+
 ## Code RAM: 128K words
 **Why.**  The compiler compiled by itself no longer fits.  `io/comp.ml` self-compiled (host runner, `#image`) is 67,532 code
 words against a code RAM of 65,535, and the REPL needs room above the image for the phrases it compiles.  By commit of `io/comp.ml`:

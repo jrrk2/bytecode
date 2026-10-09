@@ -976,13 +976,36 @@ let nfs_root = "/srv/nfs/vc707"
 let nfs_image = ref "bytecode/02:00:00:4d:47:33/vm.img"        (* boot: nfs(0,0)path replaces it *)
 let nfs_disk_file = ref "bytecode/02:00:00:4d:47:33/disk.img"
 
-(* where the fetched file goes: the staging RAM, or the RAM disk *)
+(* An OCVM image (tools/mkvmimage.py's layout: a 32-byte header, then the code, heap and globals) can be longer than the staging RAM, which
+   only needs the header, the heap and the globals: the code goes straight into the code RAM through its window as it arrives, the heap
+   and globals follow the header in the staging RAM, and the sequencer is told the code is in place (0x1016).  img_put does the routing for
+   a file fetched by byte offset; a file that is not an OCVM image goes to the staging RAM as it is.  img_start says a new file begins. *)
+let code_win = 0x200000
+let img_ocvm = ref false         (* the file begins "OCVM" *)
+let img_code = ref 0             (* its code section in words, once the header has come *)
+let img_over = ref false         (* something did not fit in the staging RAM *)
+let stage_limit = 0x40000        (* the staging RAM: 256 KiB *)
+let img_start () = img_ocvm := false; img_code := 0; img_over := false
+let img_put (o : int) (v : int) =
+  if o < 32 then begin
+    io_write (0x10000 + o) v;
+    (if o = 3 then img_ocvm := (io_read 0x10000 = 0x4F && io_read 0x10001 = 0x43 && io_read 0x10002 = 0x56 && io_read 0x10003 = 0x4D));
+    if o = 10 then img_code := (if !img_ocvm then io_read 0x10008 lor (io_read 0x10009 lsl 8) lor (io_read 0x1000A lsl 16) else 0)
+  end
+  else if !img_ocvm && o < 32 + 4 * !img_code then io_write (code_win + (o - 32)) v
+  else begin
+    let so = if !img_ocvm then o - 4 * !img_code else o in
+    if so < stage_limit then io_write (0x10000 + so) v else img_over := true
+  end
+
+(* where the fetched file goes: the staging RAM (by img_put), or the RAM disk *)
 let nfs_base = ref 0x10000
 let nfs_limit = ref 0x40000
+let nfs_to_stage = ref true
 let () =
   nfs_dest_begin := (fun (_u : int) -> ());
   nfs_dest_room := (fun (_u : int) -> !nfs_limit);
-  nfs_dest_put := (fun (o : int) (v : int) -> io_write (!nfs_base + o) v);
+  nfs_dest_put := (fun (o : int) (v : int) -> if !nfs_to_stage then img_put o v else io_write (!nfs_base + o) v);
   nfs_dest_finish := (fun (_n : int) -> true)
 
 (* ---- TFTP into the staging RAM, then boot ---- *)
@@ -1054,6 +1077,7 @@ let send_ack block =
   udp_to_server !server_port 4
 
 let start_boot () =
+  img_start ();
   uart_puts "boot: arp for ";
   uart_ip server_ip;
   uart_putc '\n';
@@ -1066,6 +1090,8 @@ let nfs_begin file base limit =
   for i = 0 to 3 do array_set nfs_ip i (array_get server_ip i) done;
   for i = 0 to 5 do array_set nfs_mac i 0 done;
   nfs_base := base; nfs_limit := limit;
+  nfs_to_stage := (base = stage);
+  (if base = stage then begin img_start (); nfs_limit := 0x100000 end);
   uart_puts "boot: nfs "; uart_ip server_ip; uart_putc ':'; uart_puts nfs_root; uart_putc '/'; uart_puts file; uart_putc '\n';
   nfs_launch nfs_root file
 
@@ -1091,20 +1117,31 @@ let server_arp_reply len =
 (* ---- the image: tools/mkvmimage.py's header, then code, heap, globals ---- *)
 let byte i = io_read (stage + i)
 let small i = byte i lor (byte (i + 1) lsl 8) lor (byte (i + 2) lsl 16)   (* a word < 2^24 *)
-let code_max = 65535         (* the program code RAM, in words *)
+let code_max = 131071        (* the program code RAM, in words *)
 let heap_max = 24576         (* heap image words: a semi-space is 32768, and the program has to live in it *)
 let globals_max = 8192
 let prims_digest = [| 0x21; 0xad; 0xa2; 0x86 |]   (* mkvmimage.py: this VM's primitives *)
 
+(* CRC-16-CCITT (0x1021, from 0xFFFF), a byte at a time from a table of 256 sixteen-bit entries: the loop over a 300 KB image is
+   one lookup a byte instead of eight bit steps *)
+let crc_tab = create_bytes 512
+let () =
+  for n = 0 to 255 do
+    let c = ref (n lsl 8) in
+    for _bit = 1 to 8 do
+      c := (if !c land 0x8000 <> 0 then ((!c lsl 1) lxor 0x1021) land 0xFFFF else (!c lsl 1) land 0xFFFF)
+    done;
+    bytes_set crc_tab (2 * n) (char_of_int (!c land 0xFF));
+    bytes_set crc_tab (2 * n + 1) (char_of_int (!c lsr 8))
+  done
+
+let crc16_step crc b =
+  let k = 2 * ((crc lsr 8) lxor b) in
+  (((crc lsl 8) land 0xFFFF) lxor (int_of_char (bytes_get crc_tab k) lor (int_of_char (bytes_get crc_tab (k + 1)) lsl 8)))
+
 let crc16 from upto =
   let crc = ref 0xFFFF in
-  for i = from to upto - 1 do
-    crc := !crc lxor (byte i lsl 8);
-    for _bit = 1 to 8 do
-      if !crc land 0x8000 <> 0 then crc := ((!crc lsl 1) lxor 0x1021) land 0xFFFF
-      else crc := (!crc lsl 1) land 0xFFFF
-    done
-  done;
+  for i = from to upto - 1 do crc := crc16_step !crc (byte i) done;
   !crc
 
 let reject why = uart_puts "boot: image rejected: "; uart_puts why; uart_putc '\n'
@@ -1294,20 +1331,34 @@ let strip_and_boot () =
     end
   end
 
+(* the CRC of an image whose code went into the code RAM: the code from there, then the heap and globals from after the header *)
+let crc16_inplace code tail =
+  let crc = ref 0xFFFF in
+  for i = 0 to 4 * code - 1 do crc := crc16_step !crc (io_read (code_win + i)) done;
+  for i = 32 to 32 + tail - 1 do crc := crc16_step !crc (byte i) done;
+  !crc
+
 let check_and_boot () =
   let code = small 8 and heap = small 12 and globals = small 16 in
-  if !img_len >= 4 && not (byte 0 = 0x4f && byte 1 = 0x43 && byte 2 = 0x56 && byte 3 = 0x4d) then strip_and_boot ()
+  let inplace = !img_ocvm && !img_code > 0 && not !img_over in
+  if !img_over then reject "needs more staging RAM than there is"
+  else if !img_len >= 4 && not (byte 0 = 0x4f && byte 1 = 0x43 && byte 2 = 0x56 && byte 3 = 0x4d) then strip_and_boot ()
   else if !img_len < 32 then reject "short"
   else if byte 0 <> 0x4f || byte 1 <> 0x43 || byte 2 <> 0x56 || byte 3 <> 0x4d then reject "magic"
   else if byte 4 <> 1 || small 5 <> 0 then reject "version"
   else if byte 11 <> 0 || byte 15 <> 0 || byte 19 <> 0
           || code > code_max || heap > heap_max || globals > globals_max then reject "too large"
   else if 32 + 4 * (code + heap + globals) <> !img_len then reject "length"
-  else if byte 20 <> array_get prims_digest 0 || byte 21 <> array_get prims_digest 1
-          || byte 22 <> array_get prims_digest 2 || byte 23 <> array_get prims_digest 3 then
+  else if not ((byte 20 = 0 && byte 21 = 0 && byte 22 = 0 && byte 23 = 0)       (* 0: the runtime's own, as comp.ml writes it *)
+               || (byte 20 = array_get prims_digest 0 && byte 21 = array_get prims_digest 1
+                   && byte 22 = array_get prims_digest 2 && byte 23 = array_get prims_digest 3)) then
     reject "built for other primitives"
-  else if crc16 32 !img_len <> (byte 24 lor (byte 25 lsl 8)) then reject "checksum"
-  else begin
+  else if (if inplace then crc16_inplace code (4 * (heap + globals)) else crc16 32 !img_len) <> (byte 24 lor (byte 25 lsl 8)) then reject "checksum"
+  else if inplace then begin
+    describe 0 heap globals 0 8 (8 + heap);        (* nothing to copy for the code: the heap and globals follow the header in staging *)
+    io_write 0x1016 code;
+    start_it code heap globals
+  end else begin
     describe code heap globals 8 (8 + code) (8 + code + heap);
     start_it code heap globals
   end
@@ -1353,7 +1404,7 @@ let tftp_data len =
             uart_dec !received;
             uart_puts " bytes\n";
             img_len := !received;
-            if disk_formatted () then begin
+            if io_read 0x100d = 0 || disk_formatted () then begin
               (* back from a program that ran: the disk has its files, which a fetch would replace *)
               uart_puts "boot: RAM disk kept\n";
               boot_state := Checking
@@ -1398,8 +1449,8 @@ let boot_tick () =
     | NfsImage ->
       if !nfs_result >= 0 then begin
         img_len := !nfs_result; received := !nfs_result;
-        if disk_formatted () then begin
-          uart_puts "boot: RAM disk kept\n";
+        if io_read 0x100d = 0 || disk_formatted () then begin
+          (if io_read 0x100d <> 0 then uart_puts "boot: RAM disk kept\n");
           boot_state := Checking
         end else begin
           nfs_begin !nfs_disk_file disk_ram (io_read 0x100d);
@@ -1513,6 +1564,7 @@ let serial_len () =
   if a < 0 || b < 0 || c < 0 || d < 0 then 0 - 1 else a lor (b lsl 8) lor (c lsl 16) lor (d lsl 24)
 
 let serial_boot () =
+  img_start ();
   uart_puts "serial boot: program length?\n";
   let n1 = serial_len () in
   if n1 <= 0 || n1 > stage_size then uart_puts "serial boot: bad program length\n"
@@ -1681,13 +1733,15 @@ let boot_sd unit pt file =
     if r <> 0 then begin uart_puts "sd: no FAT volume in partition "; uart_dec pt; uart_putc '\n' end
     else begin
       let f = if string_length file = 0 then "vm.img" else file in
-      fat_put := stage_put; fat_limit := stage_size;
+      img_start ();
+      fat_put := img_put; fat_limit := 0x100000;
       let n = fat_read_by (fun (i : int) -> fat_user_char f (fat_dot f) i) in
       if n < 0 then begin uart_puts "sd: no "; uart_puts f; uart_puts (if n = 0 - 2 then " (too big)\n" else "\n") end
       else begin
         uart_puts "sd: "; uart_puts f; uart_putc ' '; uart_dec n; uart_puts " bytes\n";
         img_len := n; received := n;
-        if disk_formatted () then uart_puts "boot: RAM disk kept\n"
+        if io_read 0x100d = 0 then ()
+        else if disk_formatted () then uart_puts "boot: RAM disk kept\n"
         else begin
           fat_put := disk_put; fat_limit := io_read 0x100d;
           let m = fat_read_by (fun (i : int) -> int_of_char (string_get "DISK    RFS" i)) in

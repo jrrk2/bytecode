@@ -56,3 +56,12 @@ server once; the header goes last.  A patch that would reach back past the ring 
 GETPORT, MNT, LOOKUP, READ, CREATE, WRITE over the directory `$ETHMODEL_NFS_ROOT`), the compiler reads `comp.ml` from it and writes the image back, and
 the result is compared with the conventional build: they are byte-for-byte the same.  `image_begin "stm:name"` is the test path for the same code with
 a RAM-disk file as the sink.
+
+## The code RAM and a core with no RAM disk (spec24)
+
+The program code RAM is 128K words, its window at 0x200000..0x27FFFF (it was 64K words at 0x60000..0x9FFFF); the staging RAM is still 256 KiB at
+0x10000.  This core has no RAM disk: 0x100d reads 0, and `comp.ml` copes (plain RFS names have nowhere to go, the image builder's window goes
+in the heap).  The loader writes the code section of an OCVM image from NFS or the card straight into the code RAM as it arrives, keeps the header, heap and
+globals in the staging RAM and tells the sequencer so with 0x1016 (the code length in words; the code length in 0x1010 is then 0), so an image
+may be longer than the staging RAM: a 75,064-word test program (300,724 bytes, `fpga/vc707-ethmin-sim/run_nfs.sh`) boots over NFS and runs code past word
+65,535.  Images that arrive by TFTP, serial, preload or as a raw `ocamlc` file still have to fit in the staging RAM.

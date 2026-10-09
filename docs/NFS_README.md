@@ -87,7 +87,7 @@ whichever interface is up -- `ip -4 -brief addr` rather than memory.
 
 ## Limits
 
-The RAM disk is 512 KiB of block RAM at 0x100000, holding at most 64 files
+The RAM disk was 512 KiB of block RAM at 0x100000 (spec23 and earlier; spec24's core has none, 0x100d reads 0 and plain file names have nowhere to live), holding at most 64 files
 with names up to 24 characters.  It survives a chain load, because neither
 the sequencer nor the VM's reset reaches it, but not power off.
 
