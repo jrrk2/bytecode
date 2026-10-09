@@ -179,6 +179,7 @@
     S_OFFSETCLOSURE_ADD,
     S_GC_CHECK,
     S_GC_VERIFY,
+    S_MAKEVECT,
     // Unknown state for debugging
     S_UNKNOWN
 } state_t;

@@ -379,6 +379,7 @@ module ocaml4142_vm_rtl #(
   logic [4:0]  chk_seen;
   logic        ver_seen;        // a copied word differed from its original (letter X, once per collection)
   logic [31:0] gc_need, alloc_need;
+  logic [VALUEW-1:0] vec_init;   // caml_make_vect's initial value, kept while the fields are written
   // MULINT's pipeline: operands, then product (see the MULINT arm)
   logic signed [VALUEW-1:0] mul_a, mul_b;
   logic signed [2*VALUEW-1:0] mul_p;
@@ -912,6 +913,8 @@ module ocaml4142_vm_rtl #(
       MAKEBLOCK2: alloc_need = 3;
       MAKEBLOCK3: alloc_need = 4;
       MAKEBLOCK: alloc_need = alloc_wosize + 1;
+      // ATOMs: a zero-size block of its own -- one header word (see the collector: an empty block is copied each time)
+      ATOM0, ATOM, PUSHATOM0, PUSHATOM: alloc_need = 1;
       CLOSURE: alloc_need = 3 + nvars;
       CLOSUREREC: alloc_need = 3 * imm + nvars;  // header + 3f - 1 + nvars
       GRAB: alloc_need = (extra_args < imm) ? 5 + extra_args : 0;
@@ -919,7 +922,9 @@ module ocaml4142_vm_rtl #(
       C_CALL1: alloc_need = (imm == 16'h052) ? (Int_val(accu) >> 2) + 2
                           : (imm == 16'h12f || imm == 16'h000 ||
                              imm == 16'h157 || imm == 16'h077) ? 3 : 0;
-      C_CALL2: alloc_need = (imm == 16'h003 || imm == 16'h166 ||
+      // caml_make_vect len init: a header and len fields; a length outside 0..65535 raises before anything is allocated
+      C_CALL2: alloc_need = (imm == 16'h0f1) ? ((Int_val(accu) < 0 || Int_val(accu) > 65535) ? 0 : Int_val(accu) + 1)
+                          : (imm == 16'h003 || imm == 16'h166 ||
                              imm == 16'h118 || imm == 16'h054) ? 3 : 0;
       default: alloc_need = 0;
     endcase
@@ -2438,6 +2443,21 @@ module ocaml4142_vm_rtl #(
                   state <= S_HEAP_READ;
                   next_state_after_mem <= S_ARRBOUND_GET;
                 end
+                16'h0f1: begin  // caml_make_vect len init: Atom(0) for 0, else len fields all init; a length outside 0..65535 raises Invalid_argument
+                  if (Int_val(accu) < 0 || Int_val(accu) > 65535) state <= S_BOUND_ERROR;
+                  else if (Int_val(accu) == 0) begin
+                    alloc_wosize <= '0; alloc_tag <= '0; alloc_prefix <= 0; alloc_nfuncs <= 0; alloc_use_accu <= 1'b0;
+                    alloc_push_result <= 1'b0; alloc_then_return <= 1'b0;
+                    state <= S_ALLOC_HDR;
+                  end else begin
+                    vec_init     <= st_rd_a;
+                    alloc_base   <= hp;
+                    alloc_wosize <= Int_val(accu);
+                    heap_write(hp, Make_header(Int_val(accu), 0));
+                    alloc_i <= 0;
+                    state <= S_MAKEVECT;
+                  end
+                end
                 16'h15b, 16'h03a: caml_string_get();  // caml_string_get, caml_bytes_get
                 16'h15a, 16'h163: begin  // caml_string_equal, caml_string_notequal
                   temp_heap_addr <= Heap_index_of_ptr(accu);
@@ -2524,7 +2544,23 @@ module ocaml4142_vm_rtl #(
               sp += imm;
             end
 
-            ATOM0: begin
+            // ATOM n, ATOM0 and the PUSH forms: an empty block of tag n.  The runtime's Atom(n) is one shared static block; here it is a
+            // fresh header-only block each time (nothing is static in this heap), which is as good as long as nothing compares them by address.
+            ATOM0, ATOM, PUSHATOM0, PUSHATOM: begin
+              logic [31:0] old_sp;
+              old_sp = sp;
+              if (opcode == PUSHATOM0 || opcode == PUSHATOM) begin
+                sp <= sp - 1;
+                stack_write(old_sp - 1, accu);
+              end
+              alloc_wosize <= '0;
+              alloc_tag    <= (opcode == ATOM || opcode == PUSHATOM) ? imm : '0;
+              alloc_prefix <= 0;
+              alloc_nfuncs <= 0;
+              alloc_use_accu <= 1'b0;
+              alloc_push_result <= 1'b0;
+              alloc_then_return <= 1'b0;
+              state <= S_ALLOC_HDR;
             end
 
             // CLOSURE nvars,ofs and CLOSUREREC 1,nvars,ofs: a closure block
@@ -2749,11 +2785,14 @@ module ocaml4142_vm_rtl #(
         // Leave a forwarding header (and pointer in field 0) in from-space.
         S_GC_MARK:
         if (!gc_mark_second) begin
-          heap_write(gc_obj, {gc_hdr[31:16], GC_FORWARDED, gc_hdr[7:0]});
-          gc_mark_second <= 1'b1;
-          if (gc_size == 0) begin  // nowhere for a forward pointer: an empty block is copied each time
+          if (gc_size == 0) begin
+            // nowhere for a forward pointer, and a header marked forwarded would send a second reference to the next header
+            // word as if it were one: an empty block is copied every time it is reached, and left unmarked
             gc_free <= gc_free + 1;
             state <= gc_return_to_scan ? S_GC_SCAN_WB : S_GC_ROOT_WB;
+          end else begin
+            heap_write(gc_obj, {gc_hdr[31:16], GC_FORWARDED, gc_hdr[7:0]});
+            gc_mark_second <= 1'b1;
           end
         end else begin
           heap_write(gc_obj + 1, Ptr_of_heap_index(gc_new_idx));  // the block's new address
@@ -3101,6 +3140,17 @@ module ocaml4142_vm_rtl #(
         end else begin
           heap_write(alloc_base + 1 + alloc_i,
                      (alloc_i == alloc_wosize - 1) ? {8'(4 * alloc_wosize - 1 - temp_index), 24'd0} : '0);
+          alloc_i <= alloc_i + 1;
+        end
+
+        // caml_make_vect: the header is written; now the fields, each the initial value
+        S_MAKEVECT:
+        if (alloc_i == alloc_wosize) begin
+          hp <= alloc_base + 1 + alloc_wosize;
+          accu <= Ptr_of_heap_index(alloc_base);
+          state <= S_DONE;
+        end else begin
+          heap_write(alloc_base + 1 + alloc_i, vec_init);
           alloc_i <= alloc_i + 1;
         end
 

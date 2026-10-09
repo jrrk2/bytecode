@@ -46,12 +46,14 @@ NFS directories (the server model in `ethmodel.c`, READDIR3 in the shared client
     # Sys.readdir "/nfs/nosuchdir"
     error: exception Sys_error "nosuchdir: No such file or directory"
 
-## What it exposed
+## What it exposed (and what was done about it)
 
-* **No `Array.make`.**  The VM has no `caml_make_vect`, so an array whose length is known only at run time cannot be built.  `Sys.readdir` picks a literal array of
-  the right length from a ladder (`mk_str_array`, 1 to 64 entries) and fills it, and cuts a directory at 64 names.  The proper fix is the primitive in the VM (or a
-  MAKEBLOCK with a run-time count); with it `Array.make`, `Array.sub`, `Array.of_list` and a real `Sys.readdir` follow.
-* **No empty array.**  `ATOM0` is a no-op in the VM, so `[||]` has no value to give: it is a compile error, and `Sys.readdir` of an empty directory raises
-  `Sys_error`.  The fix is a shared zero-size block (a header word in the heap image, a global that holds its pointer, `ATOM0` compiled as a load of it).
+* **No `Array.make`; no empty array.**  Both are now in the VM (spec25): `caml_make_vect len init` (primitive 0x0f1; a length outside 0..65535 raises `Invalid_argument`,
+  as the header's size field is 16 bits) and `ATOM0`/`ATOM`/`PUSHATOM0`/`PUSHATOM` (an empty block).  The OCaml runtime's `Atom(0)` is one shared static block; here it is a
+  fresh one-word header each time, and the collector copies an empty block each time it is reached rather than marking it forwarded (there is no field to hold the forward
+  pointer, and a header marked forwarded would send a second reference to the next block's header).  `[||]` now compiles; `Array.make n x` is predefined; `Sys.readdir` uses it,
+  with no cap and an empty array for an empty directory.  Tested in the VM simulator (`/tmp/bc/mv/mv.ml`: 15 collections with empty arrays and a vector of them alive) and in the
+  self-compiled compiler.  Latent bug fixed on the way: the emitter's operand table (`nops`) counted an operand for ATOM0 and none for PUSHATOM.
+* **NFS directories** are read (READDIR3); see above.
 * **The compiler's own parser** (which compiles `comp.ml` itself) does not accept a string literal in a pattern, `(expr : type)`, or a record-style `when`
   without care: the code uses `when string_equal ...` and a helper with an annotated parameter, as the rest of the file does.
