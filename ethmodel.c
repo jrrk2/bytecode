@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 enum {
   RX_BASE = 0x0000, TX_BASE = 0x0800, WINDOW = 0x0800,
@@ -402,6 +403,27 @@ static void nfs_server(const uint8_t *b, int len) {
     n += wr32(r + n, done < 0 ? 5 : 0); n += wr32(r + n, 0); n += wr32(r + n, 0);
     n += wr32(r + n, done < 0 ? 0 : done); n += wr32(r + n, 2); n += wr32(r + n, 0); n += wr32(r + n, 0);
     printf("eth: NFS write %s %ld+%d\n", nfs_names[k], off, cnt);
+  } else if (prog == 100003 && proc == 16) {         // READDIR dir, cookie, verifier, count
+    int k = rd32(args + 8); long cookie = ((long)rd32(args + 12) << 32) | rd32(args + 16);
+    struct dirent **list = NULL;
+    nfs_full(k, path, sizeof path);
+    int total = scandir(path, &list, NULL, alphasort);
+    printf("eth: NFS readdir %s from %ld\n", nfs_names[k], cookie);
+    n += wr32(r + n, total < 0 ? 20 : 0); n += wr32(r + n, 0);        // status (NOTDIR if it is not one), no dir attributes
+    if (total >= 0) {
+      n += wr32(r + n, 0); n += wr32(r + n, 0);                       // cookieverf
+      int i = (int)cookie, full = 0;
+      for (; i < total && !full; i++) {
+        int nl = (int)strlen(list[i]->d_name), need = 4 + 8 + 4 + ((nl + 3) & ~3) + 8;
+        if (n + need + 8 > 1000) { full = 1; break; }                  // keep to the count the client asked for
+        n += wr32(r + n, 1); n += wr32(r + n, 0); n += wr32(r + n, (uint32_t)list[i]->d_ino);
+        n += wr32(r + n, nl); memcpy(r + n, list[i]->d_name, nl); memset(r + n + nl, 0, (4 - (nl & 3)) & 3); n += (nl + 3) & ~3;
+        n += wr32(r + n, 0); n += wr32(r + n, i + 1);                  // its cookie: the index after it
+      }
+      n += wr32(r + n, 0); n += wr32(r + n, i >= total);              // no more entries in this reply; eof
+      for (int j = 0; j < total; j++) free(list[j]);
+      free(list);
+    }
   } else if (prog == 100003 && proc == 8) {          // CREATE dir, name, ...
     int dir = rd32(args + 8), nl = rd32(args + 12);
     char name[200]; snprintf(name, sizeof name, "%.*s", nl < 199 ? nl : 199, (const char *)args + 16);

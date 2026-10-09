@@ -4909,6 +4909,7 @@ let nfs_looking = 5
 let nfs_reading = 6
 let nfs_creating = 7
 let nfs_writing = 8
+let nfs_readdiring = 9
 
 let nfs_state = ref nfs_idle
 let nfs_deadline = ref 0
@@ -4927,6 +4928,13 @@ let nfs_mode = ref 0             (* 0 read the file, 1 write it, 2 read one piec
 let nfs_count = ref nfs_chunk    (* bytes asked for by each READ *)
 let nfs_size = ref 0             (* a file's size, from the LOOKUP that opened it *)
 let nfs_keep = ref false         (* a streamed write: stop after the CREATE (keeping the handle), and after each piece *)
+(* reading a directory: nfs_launch_openroot / nfs_launch_open leave the directory's handle in fh_file; nfs_launch_readdir asks for the entries after a
+   cookie, each name goes to nfs_dir_name, and when it ends nfs_result is how many came, nfs_eof says whether that was the last of them and the
+   cookie of the last entry is in nfs_cookie_hi / nfs_cookie_lo for the next call *)
+let nfs_dir_name = ref (fun (_s : string) -> ())
+let nfs_cookie_hi = ref 0
+let nfs_cookie_lo = ref 0
+let nfs_eof = ref false
 let nfs_leaf = ref 0             (* where the leaf name starts in nfs_path *)
 let nfs_src_len = ref 0
 let nfs_src_get = ref (fun (_i : int) -> 0)
@@ -4977,6 +4985,14 @@ let send_write () =
   xpad n;
   nfs_send !nfsd_port
 
+let send_readdir () =
+  rpc_call rpc_nfs 3 16;
+  xfh fh_file !fh_file_len;
+  x32 !nfs_cookie_hi; x32 !nfs_cookie_lo;       (* the cookie, 64 bits *)
+  x32 0; x32 0;                                 (* the cookie verifier *)
+  x32 1000;                                     (* room for the reply *)
+  nfs_send !nfsd_port
+
 let send_read () =
   rpc_call rpc_nfs 3 6;
   xfh fh_file !fh_file_len;
@@ -5023,7 +5039,12 @@ let nfs_reply len =
   else if !nfs_state = nfs_pmap_nfs then begin
     let p = r32 () in
     nfsd_port := (if p = 0 then 2049 else p);
-    if !nfs_mode = 1 && !nfs_leaf = 0 then begin nfs_state := nfs_creating; send_create (); nfs_step () end
+    if !nfs_mode = 5 then begin
+      for i = 0 to 63 do bytes_set fh_file i (bytes_get fh_root i) done;
+      fh_file_len := !fh_root_len;
+      nfs_state := nfs_idle; nfs_result := 0
+    end
+    else if !nfs_mode = 1 && !nfs_leaf = 0 then begin nfs_state := nfs_creating; send_create (); nfs_step () end
     else begin nfs_state := nfs_looking; send_lookup (); nfs_step () end
   end
   else if !nfs_state = nfs_looking then begin
@@ -5082,6 +5103,29 @@ let nfs_reply len =
       end
     end
   end
+  else if !nfs_state = nfs_readdiring then begin
+    if r32 () <> 0 then nfs_fail "readdir refused"
+    else begin
+      skip_attr ();
+      rp := !rp + 8;                                (* cookieverf *)
+      let cnt = ref 0 and more = ref (r32 ()) in
+      while !more <> 0 do
+        let _fid_hi = r32 () in
+        let _fid_lo = r32 () in
+        let nl = r32 () in
+        let b = create_bytes nl in
+        for i = 0 to nl - 1 do bytes_set b i (char_of_int (rx (!rp + i))) done;
+        rp := !rp + ((nl + 3) / 4) * 4;
+        nfs_cookie_hi := r32 ();
+        nfs_cookie_lo := r32 ();
+        (!nfs_dir_name) (bytes_to_string b);
+        cnt := !cnt + 1;
+        more := r32 ()
+      done;
+      nfs_eof := (r32 () <> 0);
+      nfs_state := nfs_idle; nfs_result := !cnt
+    end
+  end
   else if !nfs_state = nfs_creating then begin
     if r32 () <> 0 then nfs_fail "create refused"
     else if r32 () = 0 then nfs_fail "no handle for the new file"
@@ -5123,6 +5167,7 @@ let nfs_tick () =
        else if !nfs_state = nfs_looking then send_lookup ()
        else if !nfs_state = nfs_creating then send_create ()
        else if !nfs_state = nfs_writing then send_write ()
+       else if !nfs_state = nfs_readdiring then send_readdir ()
        else send_read ());
       nfs_deadline := now () + 1500
     end
@@ -5191,6 +5236,21 @@ let nfs_launch_wpiece (fh : bytes) (n : int) (off : int) (len : int) (get : int 
   nfs_result := 0 - 1;
   nfs_state := nfs_writing;
   send_write ();
+  nfs_step ()
+
+(* the export's root as the directory to read (fh_file after the mount) *)
+let nfs_launch_openroot export =
+  nfs_launch export "";
+  nfs_mode := 5
+
+(* the entries of the directory whose handle is fh (n bytes) after the cookie hi/lo (0 0 for the first) *)
+let nfs_launch_readdir (fh : bytes) (n : int) (hi : int) (lo : int) =
+  for i = 0 to 63 do bytes_set fh_file i (bytes_get fh i) done;
+  fh_file_len := n;
+  nfs_cookie_hi := hi; nfs_cookie_lo := lo;
+  nfs_result := 0 - 1;
+  nfs_state := nfs_readdiring;
+  send_readdir ();
   nfs_step ()
 (* <<< io/nfs.ml *)
 
@@ -5507,8 +5567,33 @@ let fat_names () =
   done;
   !r
 
+(* the entries of a directory on the NFS server, "" being the export's root; "." and ".." are left out; last entry first *)
+let nfs_names (rel : string) : string list =
+  nfs_ready rel;
+  (if string_length rel = 0 then nfs_launch_openroot !nfs_root else nfs_launch_open !nfs_root rel);
+  nfs_pump ();
+  if !nfs_result < 0 then raise (Sys_error (rel ^^ ": No such file or directory"))
+  else begin
+    let fh = create_bytes 64 in
+    for i = 0 to 63 do bytes_set fh i (bytes_get fh_file i) done;
+    let fhlen = !fh_file_len in
+    let names = ref [] and fin = ref false and hi = ref 0 and lo = ref 0 in
+    nfs_dir_name := (fun (s : string) ->
+      if not_b (string_equal s "." || string_equal s "..") then names := s :: !names);
+    while not_b !fin do
+      nfs_launch_readdir fh fhlen !hi !lo;
+      nfs_pump ();
+      (if !nfs_result < 0 then begin nfs_dir_name := (fun (_s : string) -> ()); raise (Sys_error (rel ^^ ": cannot be read")) end);
+      hi := !nfs_cookie_hi; lo := !nfs_cookie_lo;
+      (if !nfs_eof || !nfs_result = 0 then fin := true)
+    done;
+    nfs_dir_name := (fun (_s : string) -> ());
+    !names
+  end
+
 let sys_readdir (path : string) : string array =
   let n = string_length path in
+  let m = string_length !nfs_mount in
   if n = 0 || (n = 1 && string_get path 0 = '.') then str_array (rfs_names ())
   else if n = 1 && string_get path 0 = '/' then str_array [after !nfs_mount 1; "sd"]
   else if string_equal path "/sd" || string_equal path "/sd/" then begin
@@ -5520,7 +5605,14 @@ let sys_readdir (path : string) : string array =
     if fat_mount () <> 0 then raise (Sys_error (path ^^ ": no FAT volume"))
     else str_array (fat_names ())
   end
-  else raise (Sys_error (path ^^ ": cannot list this (NFS directories are not read yet)"))
+  else if has_prefix path !nfs_mount && (n = m || string_get path m = '/') then begin
+    (* /nfs, /nfs/ or /nfs/dir/dir: below the export; a trailing slash is not part of the name *)
+    let rel = if n <= m + 1 then "" else after path (m + 1) in
+    let rl = string_length rel in
+    let rel = if rl > 0 && string_get rel (rl - 1) = '/' then (let b = create_bytes (rl - 1) in for i = 0 to rl - 2 do bytes_set b i (string_get rel i) done; bytes_to_string b) else rel in
+    str_array (nfs_names rel)
+  end
+  else raise (Sys_error (path ^^ ": cannot list this"))
 
 (* ---- evaluating a line, whichever way it came ---- *)
 (* Printing a double, without caml_format_float -- which this processor does
