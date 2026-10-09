@@ -47,6 +47,23 @@ truncated, which does not run.
 Where the 16-bit core's LUTs go (by removing each in turn): the two shifters 142, getbyte/putbyte 91, the six compares 34; the rest, about 870, is the adders and address
 multiplexers of a plain state machine.  A microcoded design with one shared adder and a serial shifter would be well under half of this; that has not been tried.
 
+## The Sonata ONE (lowRISC, Artix-7 xc7a50t) -- 2026-10-09
+
+`intcode_sys.v` is the whole system (core, 32K-word block-RAM store holding an assembled program, console on the UART with PicoSoC's `simpleuart`);
+`intcode_arty.v` and `intcode_sonata.v` are board tops (100 MHz / 25 MHz clocks, UART divider 868 / 217, four / eight LEDs); `intcode_sonata.xdc` has the pins
+(25 MHz oscillator P15, the UART header C17 tx and D18 rx, eight LEDs, as in litex-boards' `lowrisc_sonata.py`).  LEDs on the Sonata: 0 running, 1 halted,
+2 result not zero, 3 a character received, 4 heartbeat (about 1 Hz), 5, 6, 7 toggle at each stream request, character received, character sent.
+Stream operations are the console only: `rdch` and `wrch` are the UART, `input()` and `output()` are streams 1 and 2, `findinput` and `findoutput` return the
+console (so a program that opens files, such as the compiler, does not run here yet).
+
+* Simulated (`tb_sys.cpp`, a UART model on the pins; build with `-GDIV=217`): `msg.int` prints `Hello STA 5 START` exactly as `icint` does, and an echo program
+  compiled with the kit's own compiler (`echo.b`) turns `hello sonata` typed at the console into `HELLO SONATA`.  Two bugs found there, not in the core: simpleuart
+  holds the bus (`wait`) while it is busy, so the write strobe has to be held until accepted, not pulsed; and its bit period is the divider plus 2 clocks.
+* Open flow: `sonata_build.sh prog.int` (yosys, nextpnr-himbaechel, prjxray, the UF2 writer): 32-bit system 2,070 LUTs, 476 flip-flops, 176 CARRY4, 32 RAMB36 of 75;
+  `router2` routes it and meets 25 MHz (105.9 MHz post-route); the Sonata example's README says the 25 MHz clock path needs `router1`, which was still running when this
+  was written.  The UF2 for slot 1 is 4.4 MB (8,564 blocks); other slots are the same bits at 0x10000000 and 0x20000000.  Not yet loaded on a board.
+* At 25 MHz and 5.6 clocks an instruction the machine does about 4.5 MIPS; the bootstrap's 25.6 M instructions would take about 6 s a generation.
+
 ## Not done
 
 * WIDTH 16.  The shipped INTCODE has the 32-bit word baked in (four characters to a word in `C` constants and in the library's byte routines; `WORDSIZE 32`
