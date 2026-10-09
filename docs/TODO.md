@@ -142,7 +142,12 @@ Target: a bitstream at 100 MHz with the heap at 256K words and the code RAM at 1
 * Code density: the self-compiled `comp.ml` is 67,532 words against ocamlc's ~46K (see Code RAM above).  Where it goes is unmeasured:
   count code words per top-level phrase in `#image` mode and look at the largest, and at closure creation and field access sequences.
 * Move the NFS client out of the resident compiler into a library loaded with `run_file` (about 4K words), if the code RAM is not widened.
-* Gate the `DEBUG_TRACE` letters (G D S O H P Q F a e h s g, X) off by default; they show in the console output.
+* The `DEBUG_TRACE` letters (G and D at each collection's start and end, S O H for stack, out-of-memory and heap-bound events, and P Q F X a e h s
+  from the collector's self-checks) are written to the UART by the hardware (ocaml4142_vm_rtl.sv, parameter DEBUG_TRACE, default on).  They are
+  useful as it stands: a long compile shows a `GD` for each collection, which says the machine is alive.  Later: an I/O register that gates the
+  routine G/D (the self-checks and their error letters stay), and/or a heartbeat on the LEDs driven from the hardware (a counter that moves on each
+  collection, a blink on every N instructions or phrases, a distinct pattern for an error letter) so that a long run can be watched without the
+  console, or with the console quiet.
 * Stage 3: compile the board-built compiler with itself and compare, once the RAM disk can hold three 265 KB images.
 
 ## Memory
