@@ -78,6 +78,7 @@ module vc707_ethmin_vm (
 	end
 	wire resetn = rst_sys_n && (&button_hold);
 	wire [7:0] core_led;
+	wire gc_beat, gc_err;
 
 	wire eth_clk, rx_clk;
 	wire eth_rst = ~resetn;
@@ -134,7 +135,7 @@ module vc707_ethmin_vm (
 		.tx_axis_tlast(tx_tlast), .tx_axis_tready(tx_tready),
 		.tx_axis_tuser(tx_tuser),
 		.pcspma_status(pcspma_status),
-		.LED(core_led), .DIP(GPIO_DIP_SW), .BTN(GPIO_SW), .UART_RX(UART_RX), .UART_TX(UART_TX),
+		.LED(core_led), .gc_beat(gc_beat), .gc_err(gc_err), .DIP(GPIO_DIP_SW), .BTN(GPIO_SW), .UART_RX(UART_RX), .UART_TX(UART_TX),
 		.sd_sclk(sd_sclk), .sd_cmd(sd_cmd), .sd_dat(sd_dat), .sd_detect(sd_detect));
 
 	// Hardware heartbeat on LED7, independent of the VM.  The LEDs are otherwise
@@ -159,7 +160,9 @@ module vc707_ethmin_vm (
 	reg [25:0] hb_cnt = 26'd0;
 	always @(posedge clk_sys) hb_cnt <= hb_cnt + 26'd1;
 	wire hb = resetn ? hb_cnt[25] : hb_cnt[23];
-	assign LED = {core_led[7] | hb, core_led[6:0]};
+	// LED7 the heartbeat, LED6 toggles at the end of each garbage collection, LED5 goes on (until reset) when the collector's self-checks or the VM
+	// report something (the letters S O H P Q F X a e h s of ocaml4142_vm_rtl.sv, which are no longer printed); LEDs 4:0 are the program's (the loader: 0 alive, 1 bound, 4:2 packets)
+	assign LED = {hb, gc_beat, gc_err, core_led[4:0]};
 `endif
 endmodule
 `default_nettype wire

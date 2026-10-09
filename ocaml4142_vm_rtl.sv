@@ -10,6 +10,8 @@ module ocaml4142_vm_rtl #(
     // a character on the UART at the events that end a run or change what it is doing: G a collection starts, D it
     // is done, S stack overflow, O out of memory, H halted on an uncaught exception (bring-up: where a silent board is)
     parameter bit DEBUG_TRACE = 1'b1,
+    // print the collector's trace letters (G D S O H P Q F X a e h s) through putc; off, they drive dbg_gc_* instead (the LEDs on the board)
+    parameter bit DEBUG_LETTERS = 1'b0,
     parameter int STACK_AW   = 15,
     parameter int HEAP_AW    = 18,
     parameter int GLOBALS_AW = 13,
@@ -74,6 +76,11 @@ module ocaml4142_vm_rtl #(
     // caml_ml_output_char: one-cycle strobe with the character written
     output logic                putc_valid,
     output logic [         7:0] putc_char,
+    // the same events as LEDs: a collection is running; a collection has just ended (toggles); something the letters report as wrong or notable
+    // happened since reset (S O H P Q F X a e h s)
+    output logic                dbg_gc_active,
+    output logic                dbg_gc_beat,
+    output logic                dbg_err,
 
     // Load port: while reset is held, load_we writes load_data to
     // heap_mem[load_addr] (or globals_mem[load_addr] with load_globals).
@@ -955,6 +962,9 @@ module ocaml4142_vm_rtl #(
 
     if (reset) begin
       putc_char    <= '0;
+      dbg_gc_active <= 1'b0;
+      dbg_gc_beat  <= 1'b0;
+      dbg_err      <= 1'b0;
       fp_op        <= '0;
       fp_unary     <= 1'b0;
       fp_from_int  <= 1'b0;
@@ -2626,7 +2636,7 @@ module ocaml4142_vm_rtl #(
         // ---- GC: roots, then Cheney scan of to-space ----
         S_GC_START: begin
           ver_seen <= 1'b0;
-          if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "G"; end
+          if (DEBUG_TRACE) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "G"; end dbg_gc_active <= 1'b1; end end
           to_lo <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
           gc_free <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
           gc_scan <= (from_lo == heap_lo) ? heap_lo + gc_semi : heap_lo;
@@ -2673,7 +2683,7 @@ module ocaml4142_vm_rtl #(
 
         S_GC_ROOT_WB: begin  // store the forwarded root
           if (DEBUG_TRACE && !gc_new[0] && (gc_new[HEAP_AW+1:2] < to_lo || gc_new[HEAP_AW+1:2] > gc_free)) begin
-            putc_valid <= 1'b1; putc_char <= "P";            // a root forwarded to somewhere other than to-space
+            begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "P"; end dbg_err <= 1'b1; end            // a root forwarded to somewhere other than to-space
           end
           gc_infix_off <= 0;
           case (gc_phase)
@@ -2700,7 +2710,7 @@ module ocaml4142_vm_rtl #(
           gc_infix_off <= gc_infix_off + hm_rd_a[31:16];
         end else if (hm_rd_a[15:8] == GC_FORWARDED) begin
           if (DEBUG_TRACE && (hm_rd_b[HEAP_AW+1:2] < to_lo || hm_rd_b[HEAP_AW+1:2] >= gc_free)) begin
-            putc_valid <= 1'b1; putc_char <= "F";            // a forwarding pointer that does not point into to-space
+            begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "F"; end dbg_err <= 1'b1; end            // a forwarding pointer that does not point into to-space
           end
           gc_new <= hm_rd_b + {gc_infix_off, 2'b00};
           state <= gc_return_to_scan ? S_GC_SCAN_WB : S_GC_ROOT_WB;
@@ -2783,7 +2793,7 @@ module ocaml4142_vm_rtl #(
 
         S_GC_SCAN_WB: begin
           if (DEBUG_TRACE && !gc_new[0] && (gc_new[HEAP_AW+1:2] < to_lo || gc_new[HEAP_AW+1:2] > gc_free)) begin
-            putc_valid <= 1'b1; putc_char <= "Q";            // a field forwarded to somewhere other than to-space
+            begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "Q"; end dbg_err <= 1'b1; end            // a field forwarded to somewhere other than to-space
           end
           gc_infix_off <= 0;
           heap_write(gc_scan + 1 + gc_j, gc_new);
@@ -2802,18 +2812,18 @@ module ocaml4142_vm_rtl #(
           heap_read_b(gc_obj + HEAP_AW'(chk_f));
           hold_for_read();
         end else begin
-          if (hm_rd_a != hm_rd_b && !ver_seen) begin putc_valid <= 1'b1; putc_char <= "X"; ver_seen <= 1'b1; end
+          if (hm_rd_a != hm_rd_b && !ver_seen) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "X"; end dbg_err <= 1'b1; end ver_seen <= 1'b1; end
           chk_f <= chk_f + 1;
         end
 
         S_GC_CHECK:
         case (chk_ph)
           3'd0: begin
-            if (gc_points_to_from(accu) && !chk_seen[0]) begin putc_valid <= 1'b1; putc_char <= "a"; chk_seen[0] <= 1'b1; end
+            if (gc_points_to_from(accu) && !chk_seen[0]) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "a"; end dbg_err <= 1'b1; end chk_seen[0] <= 1'b1; end
             chk_ph <= 3'd1;
           end
           3'd1: begin
-            if (gc_points_to_from(env) && !chk_seen[1]) begin putc_valid <= 1'b1; putc_char <= "e"; chk_seen[1] <= 1'b1; end
+            if (gc_points_to_from(env) && !chk_seen[1]) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "e"; end dbg_err <= 1'b1; end chk_seen[1] <= 1'b1; end
             chk_ph <= 3'd2;
           end
           3'd2:
@@ -2824,7 +2834,7 @@ module ocaml4142_vm_rtl #(
             if (hm_rd_a[7:0] >= NO_SCAN_TAG || hm_rd_a[31:16] == 0) chk_idx <= chk_idx + 1 + hm_rd_a[31:16];
             else chk_f <= 1;
           end else begin
-            if (gc_points_to_from(hm_rd_a) && !chk_seen[2]) begin putc_valid <= 1'b1; putc_char <= "h"; chk_seen[2] <= 1'b1; end
+            if (gc_points_to_from(hm_rd_a) && !chk_seen[2]) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "h"; end dbg_err <= 1'b1; end chk_seen[2] <= 1'b1; end
             if (chk_f == chk_size) begin chk_idx <= chk_idx + 1 + chk_size; chk_f <= 0; end
             else chk_f <= chk_f + 1;
           end
@@ -2832,7 +2842,7 @@ module ocaml4142_vm_rtl #(
           if (chk_i >= (1 << STACK_AW) - 1) begin chk_ph <= 3'd4; chk_i <= 0; end
           else if (!rd_phase) begin stack_read_a(chk_i[STACK_AW-1:0]); hold_for_read(); end
           else begin
-            if (gc_points_to_from(st_rd_a) && !chk_seen[3]) begin putc_valid <= 1'b1; putc_char <= "s"; chk_seen[3] <= 1'b1; end
+            if (gc_points_to_from(st_rd_a) && !chk_seen[3]) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "s"; end dbg_err <= 1'b1; end chk_seen[3] <= 1'b1; end
             chk_i <= chk_i + 1;
           end
           3'd4:
@@ -2846,7 +2856,7 @@ module ocaml4142_vm_rtl #(
         endcase
 
         S_GC_DONE: begin
-          if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "D"; end
+          if (DEBUG_TRACE) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "D"; end dbg_gc_active <= 1'b0; dbg_gc_beat <= ~dbg_gc_beat; end end
 `ifndef SYNTHESIS
           gc_check_to_space();
 `endif
@@ -3387,7 +3397,7 @@ module ocaml4142_vm_rtl #(
         // time, so this walks out rather than spinning.
         S_STACK_OVERFLOW:
         if (!rd_phase) begin
-          if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "S"; end
+          if (DEBUG_TRACE) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "S"; end dbg_err <= 1'b1; end end
           globals_read_a(STACK_OVERFLOW_EXN[GLOBALS_AW-1:0]);
           hold_for_read();
         end else begin
@@ -3504,7 +3514,7 @@ module ocaml4142_vm_rtl #(
         // everything between is what lets the next collection succeed.
         S_OUT_OF_MEMORY:
         if (!rd_phase) begin
-          if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "O"; end
+          if (DEBUG_TRACE) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "O"; end dbg_err <= 1'b1; end end
           globals_read_a(OUT_OF_MEMORY_EXN[GLOBALS_AW-1:0]);
           hold_for_read();
         end else begin
@@ -3515,7 +3525,7 @@ module ocaml4142_vm_rtl #(
         S_RAISE_ENTER: begin
           if (trapsp == {STACK_AW{1'b1}}) begin
             uncaught_exn <= 1'b1;   // no handler left: stop, as STOP does
-            if (DEBUG_TRACE) begin putc_valid <= 1'b1; putc_char <= "H"; end
+            if (DEBUG_TRACE) begin begin if (DEBUG_LETTERS) begin putc_valid <= 1'b1; putc_char <= "H"; end dbg_err <= 1'b1; end end
             state        <= S_DONE;
           end else begin
             sp    <= trapsp;

@@ -81,6 +81,8 @@ module ethmin_vm_core #(
 
 	input  wire [15:0] pcspma_status,
 	output wire [7:0]  LED,
+	output wire        gc_beat,       // the VM's collector: toggles at the end of each collection
+	output wire        gc_err,        // ...and goes high, until reset, when a self-check fails or the VM meets a stack, memory or heap event
 	input  wire        UART_RX,
 	output wire        UART_TX,
 	// the SD card slot (sd_wrap.v)
@@ -443,6 +445,7 @@ module ethmin_vm_core #(
 		.alloc_wosize(), .alloc_base(), .alloc_tag(), .closure_codeptr(),
 		.closure_nvars(), .closure_i(), .opcode_out(vm_opcode), .tos(), .halted(vm_halted), .oob_hit(vm_oob_hit), .dbg_accu(vm_accu), .dbg_env(vm_env), .dbg_hp(vm_hp), .dbg_pc(vm_dpc), .gc_start(vm_gc_start),
 		.putc_valid(putc_valid), .putc_char(putc_char),
+		.dbg_gc_active(), .dbg_gc_beat(gc_beat), .dbg_err(gc_err),
 		.load_we(load_we), .load_globals(load_globals), .load_addr(load_addr),
 		.load_data(load_data), .image_heap_words(image_words));
 

@@ -1841,6 +1841,6 @@ let () =
       end;
       io_write eth_rxlen 0;
       pkts := !pkts + 1;
-      io_write leds ((if bound () then 2 else 0) lor ((!pkts land 0x3F) lsl 2))
+      io_write leds ((if bound () then 2 else 0) lor ((!pkts land 0x7) lsl 2))
     end
   done
