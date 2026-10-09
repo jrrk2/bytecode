@@ -2234,6 +2234,7 @@ let ctor_layout c = match find_ctor !constructors c with
    at 0x100000 (bytes), and a 32-bit word is written a byte at a time since an
    int here has only 31 bits. *)
 let img_mode = ref false
+let quiet = ref false          (* a phrase run at start-up says nothing: predefine *)
 let img_at = ref 0
 
 let img_put4 off b0 b1 b2 b3 =
@@ -4888,9 +4889,9 @@ let evaluate_line_unsafe () =
            (match top_let, e with
             | true, Let (_, name, _, Var _) ->
               type_session := (bound_name, sc) :: !type_session;
-              if not !img_mode then begin puts "val "; puts name; puts " : "; puts (type_name ty); puts " = " end
-            | _ -> if not !img_mode then begin puts "- : "; puts (type_name ty); puts " = " end);
-           if not !img_mode then begin
+              if not_b (!img_mode || !quiet) then begin puts "val "; puts name; puts " : "; puts (type_name ty); puts " = " end
+            | _ -> if not_b (!img_mode || !quiet) then begin puts "- : "; puts (type_name ty); puts " = " end);
+           if not_b (!img_mode || !quiet) then begin
              print_compiled ty v;
              (if elapsed > 0 then begin puts "   ("; put_int elapsed; puts " ms)" end);
              newline ()
@@ -5630,6 +5631,19 @@ let uart_build () =
   uart_puts " btn=";
   uart_putc (string_get digits (io_read buttons land 0x1F))
 
+(* A phrase compiled at start-up as if it had been typed, and its value not announced.  Used for the names every session
+   should have; the text is in the image, so it does not depend on what is on the RAM disk. *)
+let predefine (src : string) =
+  let small = !line in
+  let n = string_length src in
+  let b = create_bytes n in
+  for k = 0 to n - 1 do bytes_set b k (string_get src k) done;
+  line := b; line_len := n;
+  quiet := true;
+  evaluate_line ();
+  quiet := false;
+  line := small; line_len := 0
+
 (* ==== MAIN ==== *)
 let () =
   io_write leds 1;
@@ -5674,7 +5688,8 @@ let () =
     install_fn "disk_get" (magic (fun (i : int) -> disk_get i));
     install_fn "disk_set" (magic (fun (i : int) (v : int) -> disk_set i v; 0));
     install_fn "image_begin" (magic (fun (a : string) -> img_begin a));
-    install_fn "image_end" (magic (fun (n : int) -> img_end n))
+    install_fn "image_end" (magic (fun (n : int) -> img_end n));
+    predefine "let help = \"mini-ML on the OCaml processor: type an expression or a let and press Enter (;; ends a phrase early).\\n  1 + 2        let sq x = x * x        sq 12        let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\\nFiles live on the RAM disk and survive a chain load:  files 0   read_file \\\"a.ml\\\"   write_file \\\"a.ml\\\" \\\"text\\\"   run_file \\\"a.ml\\\"\\nFrom the network:  nfs_server \\\"192.168.1.106\\\"   nfs_fetch \\\"/srv/nfs/vc707\\\" \\\"maths.ml\\\"   nfs_done 0   (then run_file \\\"maths.ml\\\")\\nThe SD card:  run_file \\\"sd.ml\\\"   run_file \\\"fat.ml\\\"   sd_init ()   fat_mount ()   fat_ls !fat_root   fat_load \\\"COMP    BC \\\" 0\\nMore on the board: telnet to its address (port 23) or UDP 7777.  After a reset the loader asks boot: and takes\\n  sd(0,0)vm.img   nfs(0,0)path   tftp(0,0)file   mem(0,0)   or nothing for the default; ? lists them.  help prints this again.\""
   end;
   puts "OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build ";
   uart_build ();
