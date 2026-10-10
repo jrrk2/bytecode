@@ -146,33 +146,48 @@ module sd_wrap (
 	wire [7:0]  rx_wr = rx_wr_en ? (sd_xfr_addr[0] ? 8'hF0 : 8'h0F) : 8'h00;
 	assign data_out_tx = xfr_prev ? {douta[39:32], douta[47:40], douta[55:48], douta[63:56]}
 	                              : {douta[7:0], douta[15:8], douta[23:16], douta[31:24]};
-	// inferred block RAM: the buffer holds scratch data only, nothing that a bitstream patch would ever replace
-	(* ram_style = "block" *) reg [63:0] bufmem [0:511];
-	reg [63:0] douta_q;
-	always @(negedge sd_clk) begin : porta
-		integer b;
-		if (tx_rd | rx_wr_en) begin
-			for (b = 0; b < 8; b = b + 1)
-				if (rx_wr[b]) bufmem[sd_xfr_addr[9:1]][8*b +: 8] <= dina[8*b +: 8];
-			douta_q <= bufmem[sd_xfr_addr[9:1]];
-		end
-	end
-	assign douta = douta_q;
-	reg [63:0] doutb_q;
+	// Explicit RAMB36E1, as the retarget wrappers (Vivado's RAMB36.v) build them: two true-dual-port blocks at x36 (32 data bits, the
+	// parity bits unused), the low and high halves of each 64-bit word, 512 of the 1024 words.  The buffer holds scratch data only,
+	// nothing that a bitstream patch would ever replace.  Port A is the SD side, on the falling edge of the SD clock (the block
+	// inverts its clock); port B is the processor side.  Both READ_FIRST with registered output, which is what the always blocks
+	// this replaces did.  Inference could not do it: yosys finds no mapping for a true-dual-port RAM whose ports are on two clocks
+	// (unless the write/read collision check is waived), and a byte-write-enabled one is two blocks wide anyway.
+	wire [63:0] doutb_w;
 	reg [2:0]  lane_q;
 	wire [7:0] web = (buf_en && buf_write) ? (8'd1 << buf_addr[2:0]) : 8'd0;
 	wire [63:0] dinb = {8{buf_wdata}};
-	always @(posedge clk) begin : portb
-		integer b;
-		if (buf_en) begin
-			for (b = 0; b < 8; b = b + 1)
-				if (web[b]) bufmem[buf_addr[11:3]][8*b +: 8] <= dinb[8*b +: 8];
-			doutb_q <= bufmem[buf_addr[11:3]];
-			lane_q  <= buf_addr[2:0];
-		end
-	end
-	assign doutb = doutb_q;
-	assign buf_rdata = doutb_q[8*lane_q +: 8];
+	wire [8:0]  addra = sd_xfr_addr[9:1], addrb = buf_addr[11:3];
+	wire        ena = tx_rd | rx_wr_en;
+	genvar half;
+	generate for (half = 0; half < 2; half = half + 1) begin : bufmem
+		wire [3:0] dpa, dpb;
+		RAMB36E1 #(
+			.RAM_MODE("TDP"),
+			.READ_WIDTH_A(36), .READ_WIDTH_B(36), .WRITE_WIDTH_A(36), .WRITE_WIDTH_B(36),
+			.WRITE_MODE_A("READ_FIRST"), .WRITE_MODE_B("READ_FIRST"),
+			.DOA_REG(0), .DOB_REG(0),
+			.IS_CLKARDCLK_INVERTED(1'b1),
+			.SIM_DEVICE("7SERIES")
+		) ram (
+			.CLKARDCLK(sd_clk), .CLKBWRCLK(clk),
+			.ENARDEN(ena), .ENBWREN(buf_en),
+			.REGCEAREGCE(1'b0), .REGCEB(1'b0),
+			.RSTRAMARSTRAM(1'b0), .RSTRAMB(1'b0), .RSTREGARSTREG(1'b0), .RSTREGB(1'b0),
+			// x36: the word address is bits [14:5]; the low five are unused
+			.ADDRARDADDR({1'b0, 1'b0, addra, 5'b00000}),
+			.ADDRBWRADDR({1'b0, 1'b0, addrb, 5'b00000}),
+			.WEA(rx_wr[4*half +: 4]), .WEBWE({4'b0000, web[4*half +: 4]}),
+			.DIADI(dina[32*half +: 32]), .DIPADIP(4'b0000),
+			.DIBDI(dinb[32*half +: 32]), .DIPBDIP(4'b0000),
+			.DOADO(douta[32*half +: 32]), .DOPADOP(dpa),
+			.DOBDO(doutb_w[32*half +: 32]), .DOPBDOP(dpb),
+			.CASCADEINA(1'b0), .CASCADEINB(1'b0), .CASCADEOUTA(), .CASCADEOUTB(),
+			.INJECTSBITERR(1'b0), .INJECTDBITERR(1'b0),
+			.DBITERR(), .SBITERR(), .ECCPARITY(), .RDADDRECC());
+	end endgenerate
+	always @(posedge clk) if (buf_en) lane_q <= buf_addr[2:0];
+	assign doutb = doutb_w;
+	assign buf_rdata = doutb_w[8*lane_q +: 8];
 
 	// ---- status and responses back into clk ----
 	reg [31:0] q_resp0, q_resp1, q_resp2, q_resp3, q_wait, q_status, q_pk0, q_pk1, q_dwait, q_cnt;

@@ -22,7 +22,7 @@ read_verilog [list $fpu/fpu_hardfloat.v $fpu/recode64.v $fpu/hardfloat.v]
 set sdl $repo/fpga/sd-lowrisc
 read_verilog -sv [list $sdl/sd_top.sv $sdl/sd_data_serial_host.sv]
 read_verilog [list $sdl/sd_cmd_serial_host.v $sdl/sd_crc_7.v $sdl/sd_crc_16.v $sdl/sd_clock_divider.v $here/sd_wrap.v]
-read_verilog [list $here/program_bram.v $here/data_bram.v $here/vm_trace.v $here/ethmin_vm_core.v $here/vc707_ethmin_vm.v $eth/simpleuart.v $eth/liteeth_sgmii_phy.v]
+read_verilog [list $here/program_bram.v $here/data_bram.v $here/vm_trace.v $here/tdp_ram32.v $here/ethmin_vm_core.v $here/vc707_ethmin_vm.v $eth/simpleuart.v $eth/liteeth_sgmii_phy.v]
 read_verilog -sv [list $eth/eth_mac_1g.sv $eth/axis_gmii_rx.sv $eth/axis_gmii_tx.sv $eth/rgmii_lfsr.sv \
     $eth/eth_lutram_fifo.sv $eth/eth_stream_dma.sv $eth/eth_gmii_retime256.sv $eth/eth_pkt_buf256.sv \
     $eth/sgmii_soc_liteeth.sv $eth/clkgen_vc707.sv]

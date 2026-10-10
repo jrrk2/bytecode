@@ -23,7 +23,7 @@ ROM
 cd "$PROJ"
 verilator --cc --exe --build -j 8 -Wno-fatal -Wno-lint -Wno-style --top-module ethmin_vm_core \
   -I"$REPO" -I"$PROJ" -I"$REPO/fpga/sd-lowrisc" -CFLAGS -I"$REPO" -Mdir "$OBJ" \
-  "$REPO/ocaml4142_vm_rtl.sv" "$OBJ.rom.v" "$HERE/unisim_sd_stubs.v" "$REPO/fpga/sd-lowrisc/sd_top.sv" "$REPO/fpga/sd-lowrisc/sd_data_serial_host.sv" "$REPO/fpga/sd-lowrisc/sd_cmd_serial_host.v" "$REPO/fpga/sd-lowrisc/sd_crc_7.v" "$REPO/fpga/sd-lowrisc/sd_crc_16.v" "$REPO/fpga/sd-lowrisc/sd_clock_divider.v" sd_wrap.v vm_trace.v ethmin_vm_core.v "$REPO/fpga/fpu-rtl/fpu_hardfloat.v" "$REPO/fpga/fpu-rtl/recode64.v" "$REPO/fpga/fpu-rtl/hardfloat.v" "$ETH/eth_stream_dma.sv" "$ETH/simpleuart.v" \
+  "$REPO/ocaml4142_vm_rtl.sv" "$OBJ.rom.v" "$HERE/unisim_sd_stubs.v" "$REPO/fpga/sd-lowrisc/sd_top.sv" "$REPO/fpga/sd-lowrisc/sd_data_serial_host.sv" "$REPO/fpga/sd-lowrisc/sd_cmd_serial_host.v" "$REPO/fpga/sd-lowrisc/sd_crc_7.v" "$REPO/fpga/sd-lowrisc/sd_crc_16.v" "$REPO/fpga/sd-lowrisc/sd_clock_divider.v" sd_wrap.v vm_trace.v tdp_ram32.v ethmin_vm_core.v "$REPO/fpga/fpu-rtl/fpu_hardfloat.v" "$REPO/fpga/fpu-rtl/recode64.v" "$REPO/fpga/fpu-rtl/hardfloat.v" "$ETH/eth_stream_dma.sv" "$ETH/simpleuart.v" \
   "$HERE/tb.cpp" "$REPO/ethmodel.c" > "$OBJ.log" 2>&1 || { tail -20 "$OBJ.log"; exit 1; }
 "$OBJ/Vethmin_vm_core" | grep -E '^(eth|uart|tb):' | tee "$OBJ.out"
 python3 "$REPO/tools/check_frames.py" "$OBJ.out"

@@ -203,8 +203,6 @@ module ethmin_vm_core #(
 	// globals, explicit block RAMs like the code (tools/gen_rom_bram.py): placed where the
 	// bitstream's contents can be replaced without a rebuild.
 	wire [31:0] rom_q;
-	reg [31:0] prog_code [0:PROG_WORDS-1];
-	reg [31:0] stage_ram [0:STAGE_WORDS-1];
 	reg [31:0] disk_ram  [0:DISK_ALLOC-1];
 
 	wire [23:0] pc /*verilator public_flat_rd*/;
@@ -231,7 +229,6 @@ module ethmin_vm_core #(
 	reg [15:0] res_heap, res_glob, res_prog;                // the resident program's sizes, from the ROM
 	reg        seq_from_disk;                           // the image is in the RAM disk (BOOT by 0x100e), not the staging RAM
 	reg [15:0] glob_count;             // globals from the image; the rest become Val_int(0)
-	reg [31:0] seq_q;
 	reg        vm_hold;
 	reg        load_we, load_globals;
 	reg [HEAP_AW-1:0] load_addr, image_words;
@@ -249,7 +246,6 @@ module ethmin_vm_core #(
 	reg [2:0]  desc_sel;
 	reg [17:0] desc_val;
 	reg [17:0] set_pw_val;
-	integer    code_lane;
 
 	// The word read this cycle, available next cycle in rom_q (the resident
 	// images) or seq_q (the staged one): header words 2-4, then each section.
@@ -262,10 +258,6 @@ module ethmin_vm_core #(
 	wire [31:0] seq_word = seq_from_disk ? disk_q : seq_q;
 	wire [16:0] seq_addr = seq_i + ((seq_state == SEQ_CODE) ? base_code
 	                              : (seq_state == SEQ_HEAP) ? base_heap : base_globals);
-	always @(posedge clk_sys) begin
-		seq_q <= stage_ram[seq_addr[15:0]];
-	end
-
 	always @(posedge clk_sys) begin
 		load_we <= 1'b0;
 		if (set_pw) prog_words <= set_pw_val;
@@ -385,7 +377,7 @@ module ethmin_vm_core #(
 	// word is prefetched, so running straight through costs no extra cycle
 	// and only a jump pays one.
 	wire [31:0] code_rom_q_w;
-	reg  [31:0] code_prog_q;   // one registered output each: the block RAM's
+	wire [31:0] code_prog_q;   // one registered output each: the block RAM's
 	reg  [23:0] code_q_pc;
 	reg         code_q_valid, fetch_in_range;
 	wire        code_valid = code_q_valid && code_q_pc == pc;
@@ -396,7 +388,6 @@ module ethmin_vm_core #(
 		.clk(clk_sys), .en(1'b1), .addr(fetch_pc[14:0]), .dout(code_rom_q_w));
 
 	always @(posedge clk_sys) begin
-		code_prog_q <= prog_code[fetch_pc[16:0]];
 		fetch_in_range <= code_bank ? (fetch_pc < {6'd0, prog_words})
 		                            : (fetch_pc < {8'd0, res_prog});
 		code_q_pc <= fetch_pc;
@@ -638,13 +629,9 @@ module ethmin_vm_core #(
 	wire [31:0] pc_pdata = pc_load ? seq_word : {4{trap_arg1[7:0]}};
 	wire [ 3:0] pc_pbe   = pc_load ? 4'b1111
 	                     : (code_wr ? (4'b0001 << io_addr[1:0]) : 4'b0000);
-	reg [31:0] code_q;
-	always @(posedge clk_sys) begin
-		for (code_lane = 0; code_lane < 4; code_lane = code_lane + 1)
-			if (pc_pbe[code_lane])
-				prog_code[pc_paddr][8*code_lane +: 8] <= pc_pdata[8*code_lane +: 8];
-		code_q <= prog_code[pc_paddr];
-	end
+	wire [31:0] code_q;
+	tdp_ram32 #(.AW(17)) prog_code (.clk(clk_sys), .a_addr(fetch_pc[16:0]), .a_q(code_prog_q),
+		.b_en(1'b1), .b_addr(pc_paddr), .b_be(pc_pbe), .b_data(pc_pdata), .b_q(code_q));
 
 	// The sequencer reads an image out of the disk through the same read port, which is idle while
 	// the VM is held in reset, as the code RAM's second port is shared with it.
@@ -663,16 +650,11 @@ module ethmin_vm_core #(
 	end endgenerate
 
 	// The staging RAM's program side: a byte per address, as the packet RAM.
-	reg [31:0] stage_q;
-	integer stage_lane;
-	always @(posedge clk_sys)
-		if (io_new && io_is_stage) begin
-			if (io_write)
-				for (stage_lane = 0; stage_lane < 4; stage_lane = stage_lane + 1)
-					if (io_addr[1:0] == stage_lane)
-						stage_ram[stage_idx][8*stage_lane +: 8] <= trap_arg1[7:0];
-			stage_q <= stage_ram[stage_idx];
-		end
+	wire [31:0] stage_q;
+	wire [31:0] seq_q;
+	tdp_ram32 #(.AW(16)) stage_ram (.clk(clk_sys), .a_addr(seq_addr[15:0]), .a_q(seq_q),
+		.b_en(io_new && io_is_stage), .b_addr(stage_idx[15:0]),
+		.b_be(io_write ? (4'b0001 << io_addr[1:0]) : 4'b0000), .b_data({4{trap_arg1[7:0]}}), .b_q(stage_q));
 
 	always @(posedge clk_sys) begin
 		trap_ready <= 1'b0;

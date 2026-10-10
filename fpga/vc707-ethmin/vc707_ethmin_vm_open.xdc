@@ -107,3 +107,13 @@ set_property -dict {PACKAGE_PIN AW40 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get
 set_property -dict {PACKAGE_PIN AP40 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[2]}]
 set_property -dict {PACKAGE_PIN AU38 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[3]}]
 set_property -dict {PACKAGE_PIN AR40 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN} [get_ports {GPIO_SW[4]}]
+
+# The SD card slot (the lowRISC host, sd_wrap.v): the same pins as vc707_ethmin_vm.xdc.  The SD clock is a flip-flop's output
+# (sd_clock_divider) driving a pad, which nextpnr sees as data, so there is no clock to constrain.
+set_property -dict {PACKAGE_PIN AN30 IOSTANDARD LVCMOS18 SLEW FAST} [get_ports sd_sclk]
+set_property -dict {PACKAGE_PIN AP30 IOSTANDARD LVCMOS18 SLEW FAST PULLTYPE PULLUP} [get_ports sd_cmd]
+set_property -dict {PACKAGE_PIN AR30 IOSTANDARD LVCMOS18 SLEW FAST PULLTYPE PULLUP} [get_ports {sd_dat[0]}]
+set_property -dict {PACKAGE_PIN AU31 IOSTANDARD LVCMOS18 SLEW FAST PULLTYPE PULLUP} [get_ports {sd_dat[1]}]
+set_property -dict {PACKAGE_PIN AV31 IOSTANDARD LVCMOS18 SLEW FAST PULLTYPE PULLUP} [get_ports {sd_dat[2]}]
+set_property -dict {PACKAGE_PIN AT30 IOSTANDARD LVCMOS18 SLEW FAST PULLTYPE PULLUP} [get_ports {sd_dat[3]}]
+set_property -dict {PACKAGE_PIN AP32 IOSTANDARD LVCMOS18} [get_ports sd_detect]

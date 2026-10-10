@@ -36,7 +36,8 @@ PART=${PART:-xc7vx485tffg1761-2}
 TOP=vc707_ethmin_vm
 YOSYS=${YOSYS:-$XC7BT/yosys-install/bin/yosys}
 NEXTPNR=${NEXTPNR:-$XC7BT/build/nextpnr-himbaechel}   # the Makefile's NEXTPNR_BUILD, with the xc7vx485t chipdb
-PRJXRAY_DB=${PRJXRAY_DB:-$XC7BT/.deps/prjxray-db}
+# the working copy has the LIOB18 STEPDOWN fix (bit-free there); the copy under .deps is older and collides with INT_L PIPs
+PRJXRAY_DB=${PRJXRAY_DB:-$( [ -d "$HOME/prjxray/database/virtex7" ] && echo "$HOME/prjxray/database" || echo "$XC7BT/.deps/prjxray-db")}
 PYTHON=${PYTHON:-$XC7BT/.venv/bin/python}   # the flow's venv: fasm, and what convert.py imports
 mkdir -p "$WORK"
 
@@ -56,7 +57,9 @@ YOSYS_DEFS="${YOSYS_DEFS:-} -DBUILD_ID=$build_id"
 echo "== build id $build_id (commit $commit, dirty $dirty, open flow)"
 
 FPU=$REPO/fpga/fpu-rtl
-SRCS="vm_sv2v.v program_bram.v data_bram.v vm_trace.v ethmin_vm_core.v vc707_ethmin_vm.v \
+SDL=$REPO/fpga/sd-lowrisc
+SRCS="vm_sv2v.v program_bram.v data_bram.v vm_trace.v tdp_ram32.v ethmin_vm_core.v vc707_ethmin_vm.v sd_wrap.v \
+  $SDL/sd_top.sv $SDL/sd_data_serial_host.sv $SDL/sd_cmd_serial_host.v $SDL/sd_crc_7.v $SDL/sd_crc_16.v $SDL/sd_clock_divider.v \
   $FPU/fpu_hardfloat.v $FPU/recode64.v $FPU/hardfloat.v \
   $ETH/simpleuart.v $ETH/liteeth_sgmii_phy.v $ETH/eth_mac_1g.sv \
   $ETH/axis_gmii_rx.sv $ETH/axis_gmii_tx.sv $ETH/rgmii_lfsr.sv \
@@ -69,7 +72,7 @@ if [ -n "${SKIP_SYNTH:-}" ] && [ -s "$TOP.json" ]; then
 else
     echo "== yosys"
     "$YOSYS" -q -l yosys.log -p \
-      "read_verilog -sv -I. ${YOSYS_DEFS:-} $SRCS; synth_xilinx -flatten -abc9 -arch xc7 ${SYNTH_OPTS:-} -top $TOP; write_json $TOP.json"
+      "read_verilog -sv -I. -I$SDL ${YOSYS_DEFS:-} $SRCS; synth_xilinx -flatten -abc9 -arch xc7 ${SYNTH_OPTS:-} -top $TOP; write_json $TOP.json"
 fi
 
 echo "== nextpnr"
