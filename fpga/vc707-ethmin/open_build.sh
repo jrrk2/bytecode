@@ -36,6 +36,14 @@ PART=${PART:-xc7vx485tffg1761-2}
 TOP=vc707_ethmin_vm
 YOSYS=${YOSYS:-$XC7BT/yosys-install/bin/yosys}
 NEXTPNR=${NEXTPNR:-$XC7BT/build/nextpnr-himbaechel}   # the Makefile's NEXTPNR_BUILD, with the xc7vx485t chipdb
+# nextpnr's HeAP placer solves with Eigen, and the version decides the placement: against 3.4.0 this design's Ethernet works, against
+# 5.0.1 the same netlist boots and then never transmits (openXC7/nextpnr .github/workflows/demos.yml documents the same).  Build nextpnr with
+# -DEigen3_DIR=/usr/share/eigen3/cmake (the system 3.4.0) and keep a conda Eigen off the prefix path.  --placer-heap-timingweight 60 is the
+# CI's flag, without it eth_tx_clk can land a hair over 125 MHz.  Both only matter for the next run of nextpnr, not for yosys.
+NEXTPNR_FLAGS=${NEXTPNR_FLAGS---placer-heap-timingweight 60}
+_nb=$(dirname "$NEXTPNR"); _ed=$(grep -m1 '^Eigen3_DIR' "$_nb/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
+_ev=$(grep -h 'set(PACKAGE_VERSION ' "$_ed/Eigen3ConfigVersion.cmake" 2>/dev/null | head -1 | cut -d'"' -f2)
+[ "$_ev" = "3.4.0" ] || echo "WARNING: $NEXTPNR was built against Eigen ${_ev:-unknown} ($_ed), not 3.4.0: the placement may differ from the one proved on hardware" >&2
 # the working copy has the LIOB18 STEPDOWN fix (bit-free there); the copy under .deps is older and collides with INT_L PIPs
 PRJXRAY_DB=${PRJXRAY_DB:-$( [ -d "$HOME/prjxray/database/virtex7" ] && echo "$HOME/prjxray/database" || echo "$XC7BT/.deps/prjxray-db")}
 PYTHON=${PYTHON:-$XC7BT/.venv/bin/python}   # the flow's venv: fasm, and what convert.py imports
@@ -92,7 +100,8 @@ echo "built $OUT"
 {
   echo "built:      $(date -u +%FT%TZ)"
   echo "repo:       $(git -C "$REPO" rev-parse --short=12 HEAD 2>/dev/null) dirty=$dirty build_id=$build_id"
-  echo "defines:    ${YOSYS_DEFS:-}  SYNTH_OPTS=${SYNTH_OPTS:-}  NEXTPNR_FLAGS=${NEXTPNR_FLAGS:-}"
+  if [ -n "${SKIP_SYNTH:-}" ]; then echo "defines:    (netlist reused, SKIP_SYNTH: the defines and build_id above were NOT applied to it)  NEXTPNR_FLAGS=${NEXTPNR_FLAGS:-}"
+  else echo "defines:    ${YOSYS_DEFS:-}  SYNTH_OPTS=${SYNTH_OPTS:-}  NEXTPNR_FLAGS=${NEXTPNR_FLAGS:-}"; fi
   echo "yosys:      $YOSYS: $("$YOSYS" -V 2>&1 | head -1)"
   echo "sv2v:       $(command -v "${SV2V:-sv2v}"): $("${SV2V:-sv2v}" --version 2>&1 | head -1)"
   nb=$(dirname "$NEXTPNR")
