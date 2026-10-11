@@ -85,3 +85,25 @@ echo "== fasm -> bitstream"
 "$PYTHON" "$XC7BT/scripts/convert.py" --arch xilinx --family xc7 --part "$PART" \
   --db "$PRJXRAY_DB" --fasm "$TOP.fasm" --output "$OUT"
 echo "built $OUT"
+
+# What went into this bitstream, so two builds can be compared without remembering: tool versions (and the compiler yosys was built
+# with, and the Eigen nextpnr's placer was built against, both of which change the result), the database, the defines, and the hashes
+# of the netlist, FASM and bitstream.
+{
+  echo "built:      $(date -u +%FT%TZ)"
+  echo "repo:       $(git -C "$REPO" rev-parse --short=12 HEAD 2>/dev/null) dirty=$dirty build_id=$build_id"
+  echo "defines:    ${YOSYS_DEFS:-}  SYNTH_OPTS=${SYNTH_OPTS:-}  NEXTPNR_FLAGS=${NEXTPNR_FLAGS:-}"
+  echo "yosys:      $YOSYS: $("$YOSYS" -V 2>&1 | head -1)"
+  echo "sv2v:       $(command -v "${SV2V:-sv2v}"): $("${SV2V:-sv2v}" --version 2>&1 | head -1)"
+  nb=$(dirname "$NEXTPNR")
+  echo "nextpnr:    $NEXTPNR sha256=$(sha256sum "$NEXTPNR" | cut -c1-16)"
+  echo "  source:   $(grep -m1 CMAKE_HOME_DIRECTORY "$nb/CMakeCache.txt" 2>/dev/null | cut -d= -f2) @ $(git -C "$(grep -m1 CMAKE_HOME_DIRECTORY "$nb/CMakeCache.txt" 2>/dev/null | cut -d= -f2)" rev-parse --short=8 HEAD 2>/dev/null)"
+  ed=$(grep -m1 '^Eigen3_DIR' "$nb/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
+  echo "  eigen:    $ed version $(grep -h 'set(PACKAGE_VERSION ' "$ed/Eigen3ConfigVersion.cmake" 2>/dev/null | head -1 | cut -d'"' -f2)"
+  echo "  chipdb:   $(grep -m1 HIMBAECHEL_PRJXRAY_DB "$nb/CMakeCache.txt" 2>/dev/null | cut -d= -f2)"
+  echo "database:   $PRJXRAY_DB/virtex7 @ $(git -C "$PRJXRAY_DB/virtex7" rev-parse --short=8 HEAD 2>/dev/null)"
+  echo "netlist:    sha256=$(sha256sum "$TOP.json" | cut -c1-16)"
+  echo "fasm:       sha256=$(sha256sum "$TOP.fasm" | cut -c1-16)"
+  echo "bitstream:  sha256=$(sha256sum "$OUT" | cut -c1-16)"
+} > "$WORK/provenance.txt"
+cat "$WORK/provenance.txt"
