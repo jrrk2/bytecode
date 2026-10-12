@@ -32,7 +32,7 @@ After configuration the resident loader prints a banner on the UART, leases an a
 ## Reproduce
 
 nextpnr must be linked against the system Eigen 3.4.0 (check `grep Eigen3_DIR CMakeCache.txt`; a conda Eigen on the prefix path is picked up
-silently), and its chipdb generated from prjxray-db `bdab7fe` (openXC7/database-virtex7; not on a remote branch when this was written).
+silently), and its chipdb generated from prjxray-db `bdab7fe` (openXC7/database-virtex7, branch `ethmin-open-flow-fixes`: https://github.com/openXC7/database-virtex7/tree/ethmin-open-flow-fixes).
 
     cmake -S nextpnr -B build -DARCH=himbaechel -DHIMBAECHEL_UARCH=xilinx -DBUILD_GUI=OFF -DBUILD_PYTHON=OFF \
           -DHIMBAECHEL_XILINX_DEVICES=xc7vx485t -DHIMBAECHEL_PRJXRAY_DB=<db> -DEigen3_DIR=/usr/share/eigen3/cmake
@@ -43,7 +43,7 @@ silently), and its chipdb generated from prjxray-db `bdab7fe` (openXC7/database-
           --placer-heap-timingweight 60 --seed 1
     # then prjxray fasm2frames/xc7frames2bit (xc7-bitstream-tools/scripts/convert.py does both), and load over JTAG
 
-`main` + `.IN` at `--seed 1` and `--seed 4` fail on the board; `--seed 2` and `--seed 3` pass.  The database is one commit on `openXC7/database-virtex7` (`database-virtex7-bdab7fe.patch`, plus `database-virtex7-bdab7fe-tilegrid.md` for its one `tilegrid.json` tile).  `HASHES.txt` has the sha256 of each bitstream
+`main` + `.IN` at `--seed 1` and `--seed 4` fail on the board; `--seed 2` and `--seed 3` pass.  The database is one commit on `openXC7/database-virtex7`, branch `ethmin-open-flow-fixes` (also here as `database-virtex7-bdab7fe.patch`, plus `database-virtex7-bdab7fe-tilegrid.md` for its one `tilegrid.json` tile).  `HASHES.txt` has the sha256 of each bitstream
 and FASM that was tested, so a run of yours can be compared with ours.  `sweep.py` is the loader and classifier (it needs `openFPGALoader`
 and a serial port; its paths are this machine's).  The repository's `open_build.sh` runs yosys and nextpnr end to end and writes a
 `provenance.txt` with tool versions, the Eigen version, and the hashes.

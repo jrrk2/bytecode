@@ -17,7 +17,7 @@ prints a warning if the nextpnr it is given was not built against 3.4.0.
 | yosys | 0.63+173 (git 66306a8ca), from xc7-bitstream-tools `yosys-install`, built with g++ 11.5.0; the same commit in oss-cad-suite (clang++ 18.1.8) gives the same netlist |
 | sv2v | v0.0.13-11-g6662fa5 |
 | nextpnr-himbaechel | openXC7/nextpnr `e558304b` (branch `bram-cascade-cluster`; PR openXC7/nextpnr#87 is its upstreamable part), built for xc7vx485t only against **system Eigen 3.4.0**, its chipdb generated from the database below |
-| prjxray database | openXC7/database-virtex7 `bdab7fe`, as `~/prjxray/database/virtex7` (not on a remote branch when this was written) |
+| prjxray database | openXC7/database-virtex7 `bdab7fe`, branch `ethmin-open-flow-fixes` (https://github.com/openXC7/database-virtex7/tree/ethmin-open-flow-fixes), checked out as `~/prjxray/database/virtex7`; one commit on top of that repo's `main` (`cf39b5a`) |
 | prjxray tools / `convert.py` | xc7-bitstream-tools `61d60e4` |
 | defines | `SYS_DIV=20.000 CLK_HZ=50000000` (50 MHz), `ROUTER=router2`, `-o hold-fix`, `--placer-heap-timingweight 60` |
 | result | router2 15 iterations, `clk_sys` 51.01 MHz (passes at 50), `eth_tx_clk` 282 MHz |

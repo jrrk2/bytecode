@@ -1,7 +1,7 @@
 # The `xc7vx485t/tilegrid.json` part of database-virtex7 `bdab7fe`
 
 `database-virtex7-bdab7fe.patch` has the other three files of that commit (`FIXES.md`, `ppips_liob18.db`, `segbits_liob18.db`).  The commit is
-one local commit on `openXC7/database-virtex7` `main` (`cf39b5a`); it is not on any remote branch.  `tilegrid.json` is a single
+one commit on top of `openXC7/database-virtex7` `main` (`cf39b5a`), published as the branch `ethmin-open-flow-fixes` (https://github.com/openXC7/database-virtex7/tree/ethmin-open-flow-fixes); this note and the patch are the same change in a form that does not need that repository.  `tilegrid.json` is a single
 30 MB line, so its change is given here as the one tile that differs.
 
 `bdab7fe` changes exactly one tile of `xc7vx485t/tilegrid.json`, `BRAM_L_X114Y0`, which had an empty `bits` and so no frame addresses:
