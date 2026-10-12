@@ -1,0 +1,230 @@
+[
+ [
+  "e558304b-s1",
+  "e558304b",
+  "1 (default)",
+  "11",
+  "51.59",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": true,
+   "bound": true,
+   "nfs": true,
+   "repl": true,
+   "fp": true,
+   "bytes": 746,
+   "pass": true
+  },
+  ""
+ ],
+ [
+  "e558304b-s2",
+  "e558304b",
+  "2",
+  "13",
+  "54.12",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": true,
+   "bound": true,
+   "nfs": true,
+   "repl": true,
+   "fp": true,
+   "bytes": 746,
+   "pass": true
+  },
+  ""
+ ],
+ [
+  "e558304b-s3",
+  "e558304b",
+  "3",
+  "36",
+  "54.11",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": true,
+   "bound": true,
+   "nfs": true,
+   "repl": true,
+   "fp": true,
+   "bytes": 746,
+   "pass": true
+  },
+  ""
+ ],
+ [
+  "e558304b-s4",
+  "e558304b",
+  "4",
+  "14",
+  "51.74",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": true,
+   "bound": true,
+   "nfs": true,
+   "repl": true,
+   "fp": true,
+   "bytes": 746,
+   "pass": true
+  },
+  ""
+ ],
+ [
+  "main-s1",
+  "main + .IN fix",
+  "1 (default)",
+  "20",
+  "54.97",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": false,
+   "bound": false,
+   "nfs": false,
+   "repl": false,
+   "fp": false,
+   "bytes": 634,
+   "pass": false
+  },
+  ""
+ ],
+ [
+  "main-s2",
+  "main + .IN fix",
+  "2",
+  "16",
+  "56.03",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": true,
+   "bound": true,
+   "nfs": true,
+   "repl": true,
+   "fp": true,
+   "bytes": 746,
+   "pass": true
+  },
+  ""
+ ],
+ [
+  "main-s3",
+  "main + .IN fix",
+  "3",
+  "12",
+  "55.20",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": true,
+   "bound": true,
+   "nfs": true,
+   "repl": true,
+   "fp": true,
+   "bytes": 746,
+   "pass": true
+  },
+  ""
+ ],
+ [
+  "main-s4",
+  "main + .IN fix",
+  "4",
+  "17",
+  "52.74",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": false,
+   "bound": false,
+   "nfs": false,
+   "repl": false,
+   "fp": false,
+   "bytes": 634,
+   "pass": false
+  },
+  ""
+ ],
+ [
+  "main-revert81",
+  "main + .IN fix, a17bd29c reverted",
+  "1 (default)",
+  "13",
+  "54.15",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": true,
+   "bound": true,
+   "nfs": true,
+   "repl": true,
+   "fp": true,
+   "bytes": 746,
+   "pass": true
+  },
+  ""
+ ],
+ [
+  "main-oldmmcm",
+  "main + .IN fix, old MMCM bits patched in",
+  "1 (default)",
+  "?",
+  "?",
+  {
+   "loaded": true,
+   "banner": "d249787+",
+   "first_try": false,
+   "bound": false,
+   "nfs": false,
+   "repl": false,
+   "fp": false,
+   "bytes": 634,
+   "pass": false
+  },
+  "FASM edit of main-s1"
+ ],
+ [
+  "e558304b-freshnetlist",
+  "e558304b",
+  "1 (default)",
+  "15",
+  "51.01",
+  {
+   "loaded": true,
+   "banner": "a8fbc3e",
+   "first_try": true,
+   "bound": true,
+   "nfs": true,
+   "repl": true,
+   "fp": true,
+   "bytes": 745,
+   "pass": true
+  },
+  "fresh netlist 1f3cd55a"
+ ],
+ [
+  "main-no-IN",
+  "main + width-marker commit only (no .IN fix)",
+  "1 (default)",
+  "20",
+  "54.97",
+  {
+   "loaded": true,
+   "banner": null,
+   "first_try": false,
+   "bound": false,
+   "nfs": false,
+   "repl": false,
+   "fp": false,
+   "bytes": 0,
+   "pass": false
+  },
+  "expected: stuck reset"
+ ]
+]

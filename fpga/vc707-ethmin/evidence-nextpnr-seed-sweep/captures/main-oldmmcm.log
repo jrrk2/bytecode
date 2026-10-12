@@ -1,0 +1,36 @@
+netboot (OCaml processor): build d249787+ open dip=6d btn=0 phy=0802
+boot [sd(0,0)vm.img] (sd nfs tftp mem, ? for help): 
+sd: no FAT volume in partition 0
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover
+dhcp: timeout
+dhcp: discover

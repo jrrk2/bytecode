@@ -1,0 +1,17 @@
+netboot (OCaml processor): build a8fbc3e open dip=6d btn=0 phy=0802
+boot [sd(0,0)vm.img] (sd nfs tftp mem, ? for help): 
+sd: no FAT volume in partition 0
+dhcp: discover
+dhcp: request 192.168.1.233
+dhcp: bound 192.168.1.233 (dip 109: boot server 192.168.1.109) lease 86400 s from 192.168.1.254
+boot: nfs 192.168.1.109:/srv/nfs/vc707/bytecode/02:00:00:4d:47:33/vm.img
+nfs: 327988 bytes
+boot: 78477 code, 2363 heap, 1149 globals words: starting it
+compiler: doorway at 30784, emitting from 78477
+OCaml processor mini-ML (UART, UDP 7777, telnet 23) -- build a8fbc3e open dip=6d btn=0
+# dhcp: discover
+dhcp: request 192.168.1.233
+dhcp: bound 192.168.1.233 (dip 109) lease 86400 s from 192.168.1.254
+355. /. 113.
+- : float = 3.141593   (1 ms)
+# 

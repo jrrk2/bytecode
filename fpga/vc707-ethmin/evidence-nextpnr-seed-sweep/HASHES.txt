@@ -1,0 +1,13 @@
+# sha256 (first 16) of each bitstream and FASM that was loaded on the board, and the netlist they came from
+e558304b-s1              bit 1eafbfb2cd41b350  fasm bd2401b5dc8bcb96
+e558304b-s2              bit 035e7afc25607391  fasm 17942697d902f8e6
+e558304b-s3              bit 29ad4ce114a625a5  fasm 61dc27ed4deee6f4
+e558304b-s4              bit 7ee2555579ddee81  fasm 53c525517f35b7ba
+e558304b-freshnetlist    bit bff3627c72d27faf  fasm b760040ced85ad08
+main-s1                  bit 074ba567e5f4fc55  fasm 2d978d5680bd3497
+main-s2                  bit dee6c5d7a5f85ef1  fasm 2b4123d81d27be90
+main-s3                  bit 0528045ff8cee2a0  fasm 753f0375aa54e17e
+main-s4                  bit ce69f2fbd721b0db  fasm aa86650536bcfd44
+main-revert81            bit f6255d9b16a848bc  fasm 669ba5059fa4ace1
+main-oldmmcm             bit 1b0998998bccea0d  fasm 580f3794e48f3683
+netlist (uncompressed) 903d8425fd46f6ac   (e558304b-freshnetlist used netlist 1f3cd55a, not included)
