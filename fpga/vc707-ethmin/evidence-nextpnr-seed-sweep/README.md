@@ -43,7 +43,7 @@ silently), and its chipdb generated from prjxray-db `bdab7fe` (openXC7/database-
           --placer-heap-timingweight 60 --seed 1
     # then prjxray fasm2frames/xc7frames2bit (xc7-bitstream-tools/scripts/convert.py does both), and load over JTAG
 
-`main` + `.IN` at `--seed 1` and `--seed 4` fail on the board; `--seed 2` and `--seed 3` pass.  `HASHES.txt` has the sha256 of each bitstream
+`main` + `.IN` at `--seed 1` and `--seed 4` fail on the board; `--seed 2` and `--seed 3` pass.  The database is one commit on `openXC7/database-virtex7` (`database-virtex7-bdab7fe.patch`, plus `database-virtex7-bdab7fe-tilegrid.md` for its one `tilegrid.json` tile).  `HASHES.txt` has the sha256 of each bitstream
 and FASM that was tested, so a run of yours can be compared with ours.  `sweep.py` is the loader and classifier (it needs `openFPGALoader`
 and a serial port; its paths are this machine's).  The repository's `open_build.sh` runs yosys and nextpnr end to end and writes a
 `provenance.txt` with tool versions, the Eigen version, and the hashes.
