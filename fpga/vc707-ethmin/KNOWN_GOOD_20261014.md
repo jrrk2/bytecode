@@ -67,7 +67,11 @@ An earlier build on the same nextpnr with the same database content but the Arti
 ## Verification tool
 
 The LVS equivalence (`fasm2netlist`, jrrk2/fasm2netlist PR #6, CaDiCaL 3.0.1) proves the extraction of this very layout equivalent to the yosys
-netlist: **63309 comparisons proved, 0 differ, 0 unknown** (5934 registers matched, 670 memories and 21 DSPs paired; 1341 s).  Not compared, and
-so not covered by that statement: clock and register clock polarity, an OBUFT's tri-state enable, the IBUFDS_GTE2, the MMCM and transceiver
-configuration, and the initial contents of the memories beyond what the bitstream rows show.  The same tool on the earlier `vc707-ocaml`
-layout (nextpnr `e558304b`) proved 19250 with 0 differences in 140 s.
+netlist: **63309 comparisons proved, 0 differ, 0 unknown** (1297 s), with 5934 registers matched, 670 memories and 21 DSPs paired.  It also
+holds each register's clock edge against its slice's `CLKINV` bit (5934 compared, 0 differ; a flipped bit is reported) and each used RAMB
+port's clock polarity against `ZINV_CLKARDCLK/CLKBWRCLK`.
+
+Not covered by that statement: which clock *net* drives each register (clocks are assumed common; `--routed-clock` turns that off and has
+not been run on this layout), an OBUFT's tri-state enable, the IBUFDS_GTE2, the MMCM and transceiver configuration, and the initial contents
+of the memories beyond what the bitstream rows show.  The same tool on the earlier `vc707-ocaml` layout (nextpnr `e558304b`) proved 19250 with
+0 differences in 140 s, before the register clock-edge row existed.
