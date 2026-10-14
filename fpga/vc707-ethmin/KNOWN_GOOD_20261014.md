@@ -67,11 +67,13 @@ An earlier build on the same nextpnr with the same database content but the Arti
 ## Verification tool
 
 The LVS equivalence (`fasm2netlist`, jrrk2/fasm2netlist PR #6, CaDiCaL 3.0.1) proves the extraction of this very layout equivalent to the yosys
-netlist: **63309 comparisons proved, 0 differ, 0 unknown** (1297 s), with 5934 registers matched, 670 memories and 21 DSPs paired.  It also
-holds each register's clock edge against its slice's `CLKINV` bit (5934 compared, 0 differ; a flipped bit is reported) and each used RAMB
-port's clock polarity against `ZINV_CLKARDCLK/CLKBWRCLK`.
+netlist: **63309 comparisons proved, 0 differ, 0 unknown** (1330 s), with 5934 registers matched, 670 memories and 21 DSPs paired.  For every
+register it also holds the clock edge against the slice's `CLKINV` bit and **which BUFG clocks it** against the traced clock tree
+(`--routed-clock`: each slice clock followed through the real pips to a BUFGCTRL output): 5934 compared, 0 differ in each.  Each used RAMB
+port's clock polarity is held against `ZINV_CLKARDCLK/CLKBWRCLK`.  The checks catch what they claim: flipping a slice's `CLKINV`, or deleting
+a register tile's clock pips, is reported.
 
-Not covered by that statement: which clock *net* drives each register (clocks are assumed common; `--routed-clock` turns that off and has
-not been run on this layout), an OBUFT's tri-state enable, the IBUFDS_GTE2, the MMCM and transceiver configuration, and the initial contents
-of the memories beyond what the bitstream rows show.  The same tool on the earlier `vc707-ocaml` layout (nextpnr `e558304b`) proved 19250 with
-0 differences in 140 s, before the register clock-edge row existed.
+Not covered by that statement: the clock *source behind* a BUFG (the MMCM output or transceiver clock feeding it) beyond its site, registers not
+clocked by a BUFG, an OBUFT's tri-state enable, the IBUFDS_GTE2, the MMCM and transceiver configuration, and the initial contents of the
+memories beyond what the bitstream rows show.  The same tool on the earlier `vc707-ocaml` layout (nextpnr `e558304b`) proved 19250 with 0
+differences in 140 s, before the register clock-edge and clock-source rows existed.
