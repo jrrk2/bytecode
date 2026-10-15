@@ -66,14 +66,20 @@ An earlier build on the same nextpnr with the same database content but the Arti
 
 ## Verification tool
 
-The LVS equivalence (`fasm2netlist`, jrrk2/fasm2netlist PR #6, CaDiCaL 3.0.1) proves the extraction of this very layout equivalent to the yosys
-netlist: **63309 comparisons proved, 0 differ, 0 unknown** (1330 s), with 5934 registers matched, 670 memories and 21 DSPs paired.  For every
-register it also holds the clock edge against the slice's `CLKINV` bit and **which BUFG clocks it** against the traced clock tree
-(`--routed-clock`: each slice clock followed through the real pips to a BUFGCTRL output): 5934 compared, 0 differ in each.  Each used RAMB
-port's clock polarity is held against `ZINV_CLKARDCLK/CLKBWRCLK`.  The checks catch what they claim: flipping a slice's `CLKINV`, or deleting
-a register tile's clock pips, is reported.
+The LVS equivalence (`fasm2netlist`, jrrk2/fasm2netlist PR #6 at `e2fd138`, CaDiCaL 3.0.1) proves the extraction of this very layout equivalent to the yosys
+netlist: **63309 comparisons proved, 0 differ, 0 unknown** (973 s), with 5934 registers matched, 670 memories and 21 DSPs paired.  The extraction
+traces the clock tree (the default; `--simple-clock` turns it off): for every register it holds the clock edge against the slice's `CLKINV` bit and **which BUFG
+clocks it** against the traced pips to a BUFGCTRL output (5934 compared, 0 differ in each), and for every BUFG **what feeds it**: each of the 9 BUFGCTRL inputs is
+followed back to an MMCM output (6), a transceiver's TXOUTCLK/RXOUTCLK (2) or a slice (the SD clock), and compared with the cell driving it in the synthesis, by tile
+and pin: 9 compared, 0 differ.  Each used RAMB port's clock polarity is held against `ZINV_CLKARDCLK/CLKBWRCLK`.  The checks catch what they claim:
+flipping a slice's `CLKINV`, deleting a register tile's clock pips, or moving one BUFG input to another MMCM output is reported.
 
-Not covered by that statement: the clock *source behind* a BUFG (the MMCM output or transceiver clock feeding it) beyond its site, registers not
-clocked by a BUFG, an OBUFT's tri-state enable, the IBUFDS_GTE2, the MMCM and transceiver configuration, and the initial contents of the
+The same check on the pre-#104 layouts (`vc707-bramtest`, `vc707-ocaml`, built before the cascade pips were in the chipdb) reports 1 and 4 differences: the MMCM
+clock reaches the BUFG through a LUT and long lines (`LOGIC_OUTS` -> `LV` -> `IMUX` -> BUFG), not the dedicated cascade.  That is the routing the maintainer's `reroute` bitstream
+shows kills Ethernet TX, found here from the FASM alone.  A pad-fed BUFG (the Johnson example) is traced to its pad tile and labelled `dedicated` or `fabric`; the latter
+is a NOTE.  Extraction with the clock tree costs about 15% more time and memory (437 s -> 501 s, 3.9 -> 4.6 GB) on this layout.
+
+Not covered by that statement: what feeds the MMCM (its `CLKIN`, the IBUFDS) and its configuration, registers not
+clocked by a BUFG, an OBUFT's tri-state enable, the IBUFDS_GTE2, the transceiver configuration, and the initial contents of the
 memories beyond what the bitstream rows show.  The same tool on the earlier `vc707-ocaml` layout (nextpnr `e558304b`) proved 19250 with 0
 differences in 140 s, before the register clock-edge and clock-source rows existed.
