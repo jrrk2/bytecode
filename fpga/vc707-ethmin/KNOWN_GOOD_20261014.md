@@ -66,7 +66,7 @@ An earlier build on the same nextpnr with the same database content but the Arti
 
 ## Verification tool
 
-The LVS equivalence (`fasm2netlist`, jrrk2/fasm2netlist PR #6 at `e2fd138`, CaDiCaL 3.0.1) proves the extraction of this very layout equivalent to the yosys
+The LVS equivalence (`fasm2netlist`, jrrk2/fasm2netlist `main`, merged from PR #6 (merge `f4b26a7`; this proof ran at its tip `e2fd138`, which is in `main`), CaDiCaL 3.0.1) proves the extraction of this very layout equivalent to the yosys
 netlist: **63309 comparisons proved, 0 differ, 0 unknown** (973 s), with 5934 registers matched, 670 memories and 21 DSPs paired.  The extraction
 traces the clock tree (the default; `--simple-clock` turns it off): for every register it holds the clock edge against the slice's `CLKINV` bit and **which BUFG
 clocks it** against the traced pips to a BUFGCTRL output (5934 compared, 0 differ in each), and for every BUFG **what feeds it**: each of the 9 BUFGCTRL inputs is
